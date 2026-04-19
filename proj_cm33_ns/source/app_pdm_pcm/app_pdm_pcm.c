@@ -50,6 +50,8 @@ static TaskHandle_t pdm_pcm_task_handle = NULL;
  * 这样可以明确每个 block 当前归谁所有。
  */
 static volatile app_pdm_pcm_block_state_t block_state[APP_PDM_PCM_BLOCK_COUNT];
+static uint8_t free_block_stack[APP_PDM_PCM_BLOCK_COUNT];
+static volatile uint8_t free_block_count;
 static volatile uint8_t write_block_index;
 static volatile uint16_t write_sample_index;
 static volatile uint32_t block_sequence;
@@ -59,6 +61,8 @@ static volatile bool capture_paused;
 
 static void app_pdm_pcm_reset_stream_state(void);
 static bool app_pdm_pcm_claim_next_block_from_isr(void);
+static bool app_pdm_pcm_push_free_block(uint8_t block_index);
+static bool app_pdm_pcm_pop_free_block_from_isr(uint8_t *block_index);
 static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_woken);
 static void app_pdm_pcm_discard_fifo_from_isr(void);
 
@@ -126,6 +130,7 @@ void app_pdm_pcm_release_block(uint8_t block_index)
     if (APP_PDM_PCM_BLOCK_READY == block_state[block_index])
     {
         block_state[block_index] = APP_PDM_PCM_BLOCK_FREE;
+        (void)app_pdm_pcm_push_free_block(block_index);
     }
     taskEXIT_CRITICAL();
 }
@@ -145,6 +150,7 @@ static void app_pdm_pcm_reset_stream_state(void)
 
     write_block_index = 0;
     write_sample_index = 0;
+    free_block_count = 0;
     block_sequence = 0;
     dropped_block_count = 0;
     pdm_error_count = 0;
@@ -154,6 +160,11 @@ static void app_pdm_pcm_reset_stream_state(void)
     block_state[write_block_index] = APP_PDM_PCM_BLOCK_FILLING;
     audio_data_ptr = &recorded_data[write_block_index][write_sample_index];
     recorded_data_size = 0;
+
+    for (uint8_t i = APP_PDM_PCM_BLOCK_COUNT; i > 1u; i--)
+    {
+        (void)app_pdm_pcm_push_free_block((uint8_t)(i - 1u));
+    }
 
     if (NULL != pdm_pcm_block_queue)
     {
@@ -167,21 +178,17 @@ static bool app_pdm_pcm_claim_next_block_from_isr(void)
     /* 从当前写入位置向前查找已经被消费者释放的 block。
      * 这样即使推理任务短时间慢于采集，也不会覆盖已经入队的数据。
      */
-    for (uint8_t offset = 1; offset <= APP_PDM_PCM_BLOCK_COUNT; offset++)
-    {
-        uint8_t next_index = (uint8_t)((write_block_index + offset) %
-                                       APP_PDM_PCM_BLOCK_COUNT);
+    uint8_t next_index;
 
-        if (APP_PDM_PCM_BLOCK_FREE == block_state[next_index])
-        {
-            write_block_index = next_index;
-            write_sample_index = 0;
-            block_state[write_block_index] = APP_PDM_PCM_BLOCK_FILLING;
-            audio_data_ptr = &recorded_data[write_block_index][write_sample_index];
-            recorded_data_size = 0;
-            capture_paused = false;
-            return true;
-        }
+    if (app_pdm_pcm_pop_free_block_from_isr(&next_index))
+    {
+        write_block_index = next_index;
+        write_sample_index = 0;
+        block_state[write_block_index] = APP_PDM_PCM_BLOCK_FILLING;
+        audio_data_ptr = &recorded_data[write_block_index][write_sample_index];
+        recorded_data_size = 0;
+        capture_paused = false;
+        return true;
     }
 
     /* 没有可复用 block。
@@ -191,6 +198,31 @@ static bool app_pdm_pcm_claim_next_block_from_isr(void)
     capture_paused = true;
     audio_data_ptr = NULL;
     return false;
+}
+
+static bool app_pdm_pcm_push_free_block(uint8_t block_index)
+{
+    if ((APP_PDM_PCM_BLOCK_COUNT <= block_index) ||
+        (APP_PDM_PCM_BLOCK_COUNT <= free_block_count))
+    {
+        return false;
+    }
+
+    free_block_stack[free_block_count] = block_index;
+    free_block_count++;
+    return true;
+}
+
+static bool app_pdm_pcm_pop_free_block_from_isr(uint8_t *block_index)
+{
+    if ((NULL == block_index) || (0u == free_block_count))
+    {
+        return false;
+    }
+
+    free_block_count--;
+    *block_index = free_block_stack[free_block_count];
+    return true;
 }
 
 static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_woken)
@@ -219,6 +251,7 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
     else
     {
         block_state[completed_index] = APP_PDM_PCM_BLOCK_FREE;
+        (void)app_pdm_pcm_push_free_block(completed_index);
         dropped_block_count++;
     }
 
@@ -512,8 +545,6 @@ void pdm_interrupt_handler(void)
                 recorded_data[write_block_index][write_sample_index++] = (int16_t)(data);
                 data = (int32_t)Cy_PDM_PCM_Channel_ReadFifo(PDM0, RIGHT_CH_INDEX);
                 recorded_data[write_block_index][write_sample_index++] = (int16_t)(data);
-                audio_data_ptr = &recorded_data[write_block_index][write_sample_index];
-                recorded_data_size = write_sample_index;
 
                 /* 一个完整 10 ms block 已经准备好。
                  * 将描述符放入队列，并把 ISR 写指针切到下一个空闲 block。
@@ -527,6 +558,11 @@ void pdm_interrupt_handler(void)
                     }
                 }
             }
+
+            audio_data_ptr = capture_paused ?
+                             NULL :
+                             &recorded_data[write_block_index][write_sample_index];
+            recorded_data_size = write_sample_index;
 
             Cy_PDM_PCM_Channel_ClearInterrupt(PDM0, RIGHT_CH_INDEX,
                                               CY_PDM_PCM_INTR_RX_TRIGGER);

@@ -43,6 +43,7 @@
 * Header Files
 *******************************************************************************/
 #include "app_pdm_pcm.h"
+#include "app_get_data.h"
 #include "retarget_io_init.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -72,6 +73,12 @@ int main(void)
      * after the scheduler starts and publishes 10 ms blocks for inference.
      */
     result = app_pdm_pcm_task_init();
+    handle_app_error(result);
+
+    /* 创建 PDM 数据读取自检任务。
+     * 该任务会消费 PDM block 队列；接入正式推理任务时应关闭或替换它。
+     */
+    result = inference_task_init();
     handle_app_error(result);
 
     /* Enable CM55. Keep this if the multi-core project still uses the CM55 app. */

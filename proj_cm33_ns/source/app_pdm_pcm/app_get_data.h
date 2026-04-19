@@ -25,6 +25,8 @@ extern "C" {
 /*******************************************************************************
 * Macros
 *******************************************************************************/
+#define APP_INFERENCE_TASK_STACK_SIZE       (1024u)
+#define APP_INFERENCE_TASK_PRIORITY         (APP_PDM_PCM_TASK_PRIORITY - 1u)
 
 /*******************************************************************************
 * Global Variables
@@ -33,6 +35,9 @@ extern "C" {
 /*******************************************************************************
 * Functions Prototypes
 *******************************************************************************/
+cy_rslt_t inference_task_init(void);
+void inference_task(void *pvParameters);
+void mic_data_test(void);
 
 
 #ifdef __cplusplus
