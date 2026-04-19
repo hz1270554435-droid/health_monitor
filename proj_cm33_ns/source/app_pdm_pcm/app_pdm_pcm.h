@@ -43,16 +43,18 @@ extern "C" {
 #endif /* __cplusplus */
 
 /*******************************************************************************
-* Header Files
+* 头文件
 *******************************************************************************/
 #include "cy_pdl.h"
 #include "mtb_hal.h"
 #include "cybsp.h"
 #include "app_i2s.h"
+#include "FreeRTOS.h"
+#include "queue.h"
 /*******************************************************************************
 * Macros
 *******************************************************************************/
-/* Number of channels */
+/* 声道数量 */
 #define NUM_CHANNELS                   (2u)
 #define LEFT_CH_INDEX                  (2u)
 #define RIGHT_CH_INDEX                 (3u)
@@ -65,23 +67,34 @@ extern "C" {
 /* PDM Half FIFO Size */
 #define PDM_HALF_FIFO_SIZE             (PDM_HW_FIFO_SIZE/2)
 
-/* Recording time in seconds */
+/* 录音缓存时长，单位：秒 */
 #define RECORDING_DURATION_SEC         (4u)
-/* Size of the recorded buffer */
+/* 旧版线性录音缓存大小，保留给兼容代码使用 */
 #define BUFFER_SIZE                    (RECORDING_DURATION_SEC * SAMPLE_RATE_HZ)
 
-/* Number of samples to ignore in the beginning of a recording */
+/* 录音开始阶段需要忽略的采样点数量 */
 #define IGNORED_SAMPLES                (PDM_HW_FIFO_SIZE)
 
 /* PDM PCM interrupt priority */
 #define PDM_PCM_ISR_PRIORITY            (7u)
 
-/* Gain range for EVK kit PDM mic */
+/* 面向流式推理的音频块配置。
+ * 16 kHz 采样率下，10 ms 音频等于每声道 160 个采样点。
+ * PCM 数据按双声道交错格式保存：L0, R0, L1, R1, ...
+ */
+#define APP_PDM_PCM_BLOCK_MS                       (10u)
+#define APP_PDM_PCM_BLOCK_COUNT                    (8u)
+#define APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK       ((SAMPLE_RATE_HZ * APP_PDM_PCM_BLOCK_MS) / 1000u)
+#define APP_PDM_PCM_BLOCK_SAMPLES                  (NUM_CHANNELS * APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK)
+#define APP_PDM_PCM_TASK_STACK_SIZE                (1024u)
+#define APP_PDM_PCM_TASK_PRIORITY                  (configMAX_PRIORITIES - 2u)
+
+/* EVK 板载 PDM 麦克风增益范围 */
 #define PDM_PCM_MIN_GAIN                        (-103.0)
 #define PDM_PCM_MAX_GAIN                        (83.0)
 #define PDM_MIC_GAIN_VALUE                      (20)
 
-/* Gain to Scale mapping */
+/* 增益到 PDM scale 的映射 */
 
 #define PDM_PCM_SEL_GAIN_83DB                   (83.0)
 #define PDM_PCM_SEL_GAIN_77DB                   (77.0)
@@ -117,20 +130,46 @@ extern "C" {
 #define PDM_PCM_SEL_GAIN_NEGATIVE_103DB         (-103.0)
 
 /*******************************************************************************
-* Global Variables
+* 全局变量
 *******************************************************************************/
-extern int16_t recorded_data[NUM_CHANNELS * BUFFER_SIZE];
+typedef struct
+{
+    /* 指向 recorded_data 中一个完整 10 ms 双声道音频块。 */
+    const int16_t *data;
+    /* 该块内 int16_t 总数，包含左右两个声道。 */
+    uint16_t sample_count;
+    /* 该块内每个声道的采样点数量。 */
+    uint16_t samples_per_channel;
+    /* 环形缓冲区块索引；推理任务处理完后需要释放这个索引。 */
+    uint8_t block_index;
+    /* 单调递增的块序号，用于检测是否发生跳块。 */
+    uint32_t sequence;
+    /* 发布该块时的丢块计数快照。 */
+    uint32_t dropped_count;
+} app_pdm_pcm_block_t;
+
+/* 共享内存中的环形缓冲区；每一行是一个完整 10 ms 双声道 PCM 块。 */
+extern int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES];
 
 
 /*******************************************************************************
 * Functions Prototypes
 *******************************************************************************/
+cy_rslt_t app_pdm_pcm_task_init(void);
 void app_pdm_pcm_init(void);
 void app_pdm_pcm_activate(void);
 cy_en_pdm_pcm_gain_sel_t convert_db_to_pdm_scale(double db);
 void set_pdm_pcm_gain(cy_en_pdm_pcm_gain_sel_t gain);
 void pdm_interrupt_handler(void);
 void app_pdm_pcm_deactivate(void);
+void app_pdm_pcm_task(void *pvParameters);
+QueueHandle_t app_pdm_pcm_get_queue(void);
+/* 接收一个已准备好的 10 ms 音频块；使用完成后调用者必须释放 block_index。 */
+bool app_pdm_pcm_receive_block(app_pdm_pcm_block_t *block, TickType_t ticks_to_wait);
+/* 将已经消费完成的音频块归还给 ISR 可写的空闲池。 */
+void app_pdm_pcm_release_block(uint8_t block_index);
+/* 因消费者释放不及时而被丢弃的音频块数量。 */
+uint32_t app_pdm_pcm_get_dropped_count(void);
 
 
 #ifdef __cplusplus
