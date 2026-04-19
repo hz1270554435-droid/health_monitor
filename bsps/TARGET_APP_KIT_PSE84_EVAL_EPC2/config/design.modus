@@ -142,6 +142,16 @@
                         <Alias value="CYBSP_CTB_IN_1"/>
                     </Aliases>
                 </Block>
+                <Block location="ioss[0].port[13].pin[1]">
+                    <Aliases>
+                        <Alias value="CYBSP_ETH_MDC"/>
+                    </Aliases>
+                </Block>
+                <Block location="ioss[0].port[13].pin[2]">
+                    <Aliases>
+                        <Alias value="CYBSP_CTB_OUT_0"/>
+                    </Aliases>
+                </Block>
                 <Block location="ioss[0].port[13].pin[3]">
                     <Aliases>
                         <Alias value="CYBSP_CTB_OUT_1"/>
@@ -1503,48 +1513,6 @@
                         <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
                     </Parameters>
                 </Personality>
-                <Personality template="pin" version="3.0" instance="AJ3MYlmJ5ZA">
-                    <Block location="ioss[0].port[13].pin[1]" locked="true">
-                        <Aliases>
-                            <Alias value="CYBSP_ETH_MDC"/>
-                        </Aliases>
-                    </Block>
-                    <Parameters>
-                        <Param id="DriveModes" value="CY_GPIO_DM_HIGHZ"/>
-                        <Param id="driveStrength" value="CY_GPIO_DRIVE_1_2"/>
-                        <Param id="driveStrengthTrim" value="CY_GPIO_DRIVE_STRENGTH_DEFAULT"/>
-                        <Param id="extended_drive_sel" value="false"/>
-                        <Param id="inFlash" value="true"/>
-                        <Param id="initialState" value="1"/>
-                        <Param id="isrTrigger" value="CY_GPIO_INTR_DISABLE"/>
-                        <Param id="nonSec" value="1"/>
-                        <Param id="pullUpRes" value="CY_GPIO_PULLUP_RES_DISABLE"/>
-                        <Param id="sioOutputBuffer" value="true"/>
-                        <Param id="slewRate" value="CY_GPIO_SLEW_FAST"/>
-                        <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
-                    </Parameters>
-                </Personality>
-                <Personality template="pin" version="3.0" instance="ioLNXDEHnfI">
-                    <Block location="ioss[0].port[13].pin[2]" locked="true">
-                        <Aliases>
-                            <Alias value="CYBSP_CTB_OUT_0"/>
-                        </Aliases>
-                    </Block>
-                    <Parameters>
-                        <Param id="DriveModes" value="CY_GPIO_DM_STRONG_IN_OFF"/>
-                        <Param id="driveStrength" value="CY_GPIO_DRIVE_1_2"/>
-                        <Param id="driveStrengthTrim" value="CY_GPIO_DRIVE_STRENGTH_DEFAULT"/>
-                        <Param id="extended_drive_sel" value="false"/>
-                        <Param id="inFlash" value="true"/>
-                        <Param id="initialState" value="1"/>
-                        <Param id="isrTrigger" value="CY_GPIO_INTR_DISABLE"/>
-                        <Param id="nonSec" value="1"/>
-                        <Param id="pullUpRes" value="CY_GPIO_PULLUP_RES_DISABLE"/>
-                        <Param id="sioOutputBuffer" value="true"/>
-                        <Param id="slewRate" value="CY_GPIO_SLEW_FAST"/>
-                        <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
-                    </Parameters>
-                </Personality>
                 <Personality template="pin" version="3.0" instance="3Vo0VoIjswE">
                     <Block location="ioss[0].port[15].pin[1]" locked="true">
                         <Aliases>
@@ -1717,14 +1685,14 @@
                         <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
                     </Parameters>
                 </Personality>
-                <Personality template="pin" version="3.0" instance="bJvo-mnHrEw">
+                <Personality template="pin" version="3.0" instance="40I5lnmNBm8">
                     <Block location="ioss[0].port[17].pin[0]" locked="true">
                         <Aliases>
                             <Alias value="CYBSP_EZ_I2C_SCL"/>
                         </Aliases>
                     </Block>
                     <Parameters>
-                        <Param id="DriveModes" value="CY_GPIO_DM_OD_DRIVESLOW"/>
+                        <Param id="DriveModes" value="CY_GPIO_DM_HIGHZ"/>
                         <Param id="driveStrength" value="CY_GPIO_DRIVE_1_2"/>
                         <Param id="driveStrengthTrim" value="CY_GPIO_DRIVE_STRENGTH_DEFAULT"/>
                         <Param id="extended_drive_sel" value="false"/>
@@ -1738,14 +1706,14 @@
                         <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
                     </Parameters>
                 </Personality>
-                <Personality template="pin" version="3.0" instance="HRi0BF6rmYs">
+                <Personality template="pin" version="3.0" instance="K2goCqo2Klk">
                     <Block location="ioss[0].port[17].pin[1]" locked="true">
                         <Aliases>
                             <Alias value="CYBSP_EZ_I2C_SDA"/>
                         </Aliases>
                     </Block>
                     <Parameters>
-                        <Param id="DriveModes" value="CY_GPIO_DM_OD_DRIVESLOW"/>
+                        <Param id="DriveModes" value="CY_GPIO_DM_STRONG_IN_OFF"/>
                         <Param id="driveStrength" value="CY_GPIO_DRIVE_1_2"/>
                         <Param id="driveStrengthTrim" value="CY_GPIO_DRIVE_STRENGTH_DEFAULT"/>
                         <Param id="extended_drive_sel" value="false"/>
@@ -2786,24 +2754,12 @@
                         <Param id="inFlash" value="true"/>
                     </Parameters>
                 </Personality>
-                <Personality template="ezi2c" version="3.0" instance="VzDToSDijBc">
+                <Personality template="uart" version="3.0" instance="IeK70jpvO2M">
                     <Block location="scb[5]" locked="true">
                         <Aliases>
-                            <Alias value="CYBSP_EZ_I2C_TARGET"/>
+                            <Alias value="Radar_uart"/>
                         </Aliases>
                     </Block>
-                    <Parameters>
-                        <Param id="DataRate" value="400"/>
-                        <Param id="EnableWakeup" value="false"/>
-                        <Param id="NumOfAddr" value="CY_SCB_EZI2C_ONE_ADDRESS"/>
-                        <Param id="SlaveAddress1" value="0x24"/>
-                        <Param id="SlaveAddress2" value="9"/>
-                        <Param id="SubAddrSize" value="CY_SCB_EZI2C_SUB_ADDR8_BITS"/>
-                        <Param id="inFlash" value="true"/>
-                    </Parameters>
-                </Personality>
-                <Personality template="uart" version="3.0" instance="HAq0ATIH57k">
-                    <Block location="scb[7]" locked="true"/>
                     <Parameters>
                         <Param id="ApiMode" value="HIGH_LEVEL"/>
                         <Param id="BaudRate" value="115200"/>
@@ -4122,14 +4078,6 @@
                     <Port name="sdhc[0].card_dat_3to0[3]"/>
                 </Net>
                 <Net>
-                    <Port name="ioss[0].port[13].pin[1].digital_inout[0]"/>
-                    <Port name="scb[7].uart_rx[0]"/>
-                </Net>
-                <Net>
-                    <Port name="ioss[0].port[13].pin[2].digital_inout[0]"/>
-                    <Port name="scb[7].uart_tx[0]"/>
-                </Net>
-                <Net>
                     <Port name="ioss[0].port[15].pin[1].analog[0]"/>
                     <Port name="pass[0].ptc_pads[1]"/>
                 </Net>
@@ -4155,11 +4103,11 @@
                 </Net>
                 <Net>
                     <Port name="ioss[0].port[17].pin[0].digital_inout[0]"/>
-                    <Port name="scb[5].i2c_scl[0]"/>
+                    <Port name="scb[5].uart_rx[0]"/>
                 </Net>
                 <Net>
                     <Port name="ioss[0].port[17].pin[1].digital_inout[0]"/>
-                    <Port name="scb[5].i2c_sda[0]"/>
+                    <Port name="scb[5].uart_tx[0]"/>
                 </Net>
                 <Net>
                     <Port name="ioss[0].port[18].pin[0].analog[0]"/>
@@ -4222,10 +4170,6 @@
                     <Port name="tcpwm[0].group[1].cnt[6].clock_counter_en[0]"/>
                 </Net>
                 <Net>
-                    <Port name="peri[0].group[1].div_8[0].clk[0]"/>
-                    <Port name="scb[5].clock_scb_en[0]"/>
-                </Net>
-                <Net>
                     <Port name="peri[0].group[1].div_8[1].clk[0]"/>
                     <Port name="scb[10].clock_scb_en[0]"/>
                 </Net>
@@ -4281,7 +4225,7 @@
                 <Net>
                     <Port name="peri[0].group[1].div_16_5[0].clk[0]"/>
                     <Port name="scb[4].clock_scb_en[0]"/>
-                    <Port name="scb[7].clock_scb_en[0]"/>
+                    <Port name="scb[5].clock_scb_en[0]"/>
                 </Net>
                 <Net>
                     <Port name="peri[0].group[8].div_16[0].clk_pclk_root[0]"/>
