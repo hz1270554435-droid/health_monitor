@@ -1,1 +1,0 @@
-device,tick_ms,sequence,valid,block_index,sample_index,left,right,sample_count,min,max,peak_abs,mean_abs,frame_id,radar_type,frame_len,data_len,driver_drop,msg_drop,frame_hex,radar_decoded
