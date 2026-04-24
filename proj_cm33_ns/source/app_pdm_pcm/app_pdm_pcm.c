@@ -1,7 +1,10 @@
 /******************************************************************************
 * File Name : app_pdm_pcm.c
 *
-* Description : PDM 转 PCM 采集模块，将音频整理为 10 ms 环形缓冲块供推理任务消费。
+* Description : PDM 转 PCM 采集模块。
+*               ISR 从 PDM/PCM 硬件 FIFO 读取左右声道数据，拼成固定 10 ms
+*               PCM block；推理任务通过队列拿到 block 描述符后再处理数据。
+*               队列不搬运 PCM 本体，只传递指针、长度和 block 索引。
 *
 *******************************************************************************/
 
@@ -13,9 +16,9 @@
 #include "task.h"
 #include "queue.h"
 /*******************************************************************************
-* 全局变量
+* 私有状态与共享缓冲
 *******************************************************************************/
-/* PDM/PCM 中断配置参数 */
+/* PDM/PCM 中断配置参数：这里使用右声道 IRQ 作为左右声道同步读取的触发源。 */
 const cy_stc_sysint_t PDM_IRQ_cfg = {
     .intrSrc = (IRQn_Type)PDM_IRQ,
     .intrPriority = PDM_PCM_ISR_PRIORITY
@@ -23,11 +26,11 @@ const cy_stc_sysint_t PDM_IRQ_cfg = {
 
 typedef enum
 {
-    /* 该块空闲，ISR 可以重新写入。 */
+    /* 该块空闲，已经归还给空闲池，ISR 可以重新写入。 */
     APP_PDM_PCM_BLOCK_FREE = 0,
-    /* ISR 当前正在向该块追加 PCM 采样。 */
+    /* ISR 当前正在向该块追加 PCM 采样，此时消费者不能访问。 */
     APP_PDM_PCM_BLOCK_FILLING,
-    /* 该块已经入队给消费者，释放前不能被覆盖。 */
+    /* 该块已经入队给消费者，消费者 release 前不能被覆盖。 */
     APP_PDM_PCM_BLOCK_READY
 } app_pdm_pcm_block_state_t;
 
@@ -38,6 +41,10 @@ typedef enum
 int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES]
     __attribute__((section(".cy_shared_socmem"))) = {0};
 
+/* 兼容旧调试逻辑的“当前写指针”和“当前 block 已写入长度”。
+ * 新的推理链路不要直接依赖这两个变量，应该通过 app_pdm_pcm_receive_block()
+ * 获取完整 block，避免读到 ISR 正在写入的半成品数据。
+ */
 int32_t recorded_data_size;
 volatile int16_t *audio_data_ptr = NULL;
 
@@ -45,7 +52,12 @@ volatile int16_t *audio_data_ptr = NULL;
 static QueueHandle_t pdm_pcm_block_queue = NULL;
 static TaskHandle_t pdm_pcm_task_handle = NULL;
 
-/* ISR 侧生产者状态。
+/* 采集流状态：
+ * block_state 标记每个 block 的所有权；
+ * free_block_stack 是 O(1) 空闲块池，避免 ISR 每次都扫描整个环形数组；
+ * write_* 指向当前 ISR 正在填充的 block；
+ * dropped_block_count 记录背压导致的丢块，便于在测试日志里观察推理是否跟不上。
+ *
  * 消费者只能通过 app_pdm_pcm_release_block() 归还块，
  * 这样可以明确每个 block 当前归谁所有。
  */
@@ -108,6 +120,9 @@ QueueHandle_t app_pdm_pcm_get_queue(void)
 
 bool app_pdm_pcm_receive_block(app_pdm_pcm_block_t *block, TickType_t ticks_to_wait)
 {
+    /* 推理任务从这里阻塞等待完整 10 ms block。
+     * 这里拿到的是描述符，PCM 数据仍留在 recorded_data 对应行中。
+     */
     if ((NULL == pdm_pcm_block_queue) || (NULL == block))
     {
         return false;
@@ -142,6 +157,9 @@ uint32_t app_pdm_pcm_get_dropped_count(void)
 
 static void app_pdm_pcm_reset_stream_state(void)
 {
+    /* 重新启动采集流时，把状态机恢复到“block0 正在写，其余 block 空闲”。
+     * 注意：队列也要清空，否则消费者可能拿到上一次运行残留的描述符。
+     */
     taskENTER_CRITICAL();
     for (uint8_t i = 0; i < APP_PDM_PCM_BLOCK_COUNT; i++)
     {
@@ -163,6 +181,7 @@ static void app_pdm_pcm_reset_stream_state(void)
 
     for (uint8_t i = APP_PDM_PCM_BLOCK_COUNT; i > 1u; i--)
     {
+        /* 栈是后进先出，这里倒序压入，第一次弹出时会优先得到 block1。 */
         (void)app_pdm_pcm_push_free_block((uint8_t)(i - 1u));
     }
 
@@ -175,8 +194,8 @@ static void app_pdm_pcm_reset_stream_state(void)
 
 static bool app_pdm_pcm_claim_next_block_from_isr(void)
 {
-    /* 从当前写入位置向前查找已经被消费者释放的 block。
-     * 这样即使推理任务短时间慢于采集，也不会覆盖已经入队的数据。
+    /* 从空闲块池申请下一个可写 block。
+     * 成功时 ISR 继续无缝写入；失败时说明所有 block 都在队列中或被消费者占用。
      */
     uint8_t next_index;
 
@@ -202,6 +221,9 @@ static bool app_pdm_pcm_claim_next_block_from_isr(void)
 
 static bool app_pdm_pcm_push_free_block(uint8_t block_index)
 {
+    /* 把消费者已经处理完的 block 放回空闲池。
+     * 该函数会在临界区或 ISR 上下文中被调用，所以内部只做常数时间操作。
+     */
     if ((APP_PDM_PCM_BLOCK_COUNT <= block_index) ||
         (APP_PDM_PCM_BLOCK_COUNT <= free_block_count))
     {
@@ -215,6 +237,7 @@ static bool app_pdm_pcm_push_free_block(uint8_t block_index)
 
 static bool app_pdm_pcm_pop_free_block_from_isr(uint8_t *block_index)
 {
+    /* ISR 申请空闲 block，失败时上层会进入 capture_paused 并丢弃 FIFO 数据。 */
     if ((NULL == block_index) || (0u == free_block_count))
     {
         return false;
@@ -237,9 +260,10 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
         .dropped_count = dropped_block_count
     };
 
-    /* 这里只发布描述符。
+    /* 这里只发布描述符：
      * PCM 数据仍保留在 recorded_data 中，直到 app_pdm_pcm_release_block()
      * 将该 block 归还到空闲池。
+     * 这样 ISR 中的工作量小，也避免每 10 ms 复制一整块 PCM 数据。
      */
     if ((NULL != pdm_pcm_block_queue) &&
         (pdPASS == xQueueSendFromISR(pdm_pcm_block_queue,
@@ -250,6 +274,9 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
     }
     else
     {
+        /* 队列满或尚未创建时，不能把该 block 留在 READY 状态，
+         * 否则空闲池会越来越少。这里直接丢弃该 block 并归还。
+         */
         block_state[completed_index] = APP_PDM_PCM_BLOCK_FREE;
         (void)app_pdm_pcm_push_free_block(completed_index);
         dropped_block_count++;
@@ -257,6 +284,9 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
 
     if (!app_pdm_pcm_claim_next_block_from_isr())
     {
+        /* 没有新的可写 block，说明消费者处理速度低于采集速度。
+         * 后续 ISR 会清空硬件 FIFO 来保护系统实时性。
+         */
         dropped_block_count++;
     }
 }
@@ -289,30 +319,34 @@ void app_pdm_pcm_init(void)
 {
     cy_en_pdm_pcm_gain_sel_t gain_scale = CY_PDM_PCM_SEL_GAIN_NEGATIVE_37DB;
     
-    /* 初始化 PDM PCM 硬件模块 */
+    /* 初始化 PDM PCM 硬件模块，底层配置来自 BSP 生成的 CYBSP_PDM_config。 */
     if(CY_PDM_PCM_SUCCESS != Cy_PDM_PCM_Init(PDM0, &CYBSP_PDM_config))
     {
         CY_ASSERT(0);
     }
 
-    /* 初始化 PDM/PCM 左右声道 */
-    /* 先使能 PDM 通道，后续开始录音时再激活通道 */
+    /* 先使能并初始化 PDM/PCM 左右声道。
+     * Enable/Init 只完成硬件准备，真正开始采集放在 app_pdm_pcm_activate()。
+     */
     Cy_PDM_PCM_Channel_Enable(PDM0, LEFT_CH_INDEX);
     Cy_PDM_PCM_Channel_Enable(PDM0, RIGHT_CH_INDEX);
 
     Cy_PDM_PCM_Channel_Init(PDM0, &LEFT_CH_CONFIG, (uint8_t)LEFT_CH_INDEX);
     Cy_PDM_PCM_Channel_Init(PDM0, &RIGHT_CH_CONFIG, (uint8_t)RIGHT_CH_INDEX);
     
-    /* 设置左右声道增益 */
+    /* 设置左右声道增益，保证两个麦克风通道幅值标尺一致。 */
     
     gain_scale = convert_db_to_pdm_scale((double)PDM_MIC_GAIN_VALUE);
     set_pdm_pcm_gain(gain_scale);
         
-    /* 当前使用右声道中断作为触发源，先清标志再打开中断掩码 */
+    /* 当前使用右声道中断作为触发源。
+     * 右声道 FIFO 到半满阈值时，左声道通常也已经有同样数量的数据，
+     * 因此 ISR 中按“先左后右”的顺序同步读出一组双声道样本。
+     */
     Cy_PDM_PCM_Channel_ClearInterrupt(PDM0, RIGHT_CH_INDEX, CY_PDM_PCM_INTR_MASK);      
     Cy_PDM_PCM_Channel_SetInterruptMask(PDM0, RIGHT_CH_INDEX, CY_PDM_PCM_INTR_MASK);
 
-    /* 注册 PDM/PCM 硬件中断处理函数 */
+    /* 注册并使能 PDM/PCM 硬件中断处理函数。 */
     if(CY_SYSINT_SUCCESS != Cy_SysInt_Init(&PDM_IRQ_cfg, &pdm_interrupt_handler))
     {
         CY_ASSERT(0);
@@ -521,6 +555,7 @@ void pdm_interrupt_handler(void)
     volatile uint32_t int_stat;
     BaseType_t higher_priority_task_woken = pdFALSE;
 
+    /* 只读取 masked status，避免处理没有打开掩码的中断源。 */
     int_stat = Cy_PDM_PCM_Channel_GetInterruptStatusMasked(PDM0, RIGHT_CH_INDEX);
     if(CY_PDM_PCM_INTR_RX_TRIGGER & int_stat)
     {
@@ -540,6 +575,7 @@ void pdm_interrupt_handler(void)
             {
                 /* 双声道 PCM 按 L,R,L,R... 顺序保存。
                  * 推理侧可以直接使用双声道，也可以在拼窗口时下混成单声道。
+                 * 当前阈值为 32，所以一次 ISR 写入 32 组 L/R 样本，即 64 个 int16_t。
                  */
                 int32_t data = (int32_t)Cy_PDM_PCM_Channel_ReadFifo(PDM0, LEFT_CH_INDEX);
                 recorded_data[write_block_index][write_sample_index++] = (int16_t)(data);
@@ -559,6 +595,9 @@ void pdm_interrupt_handler(void)
                 }
             }
 
+            /* 旧调试指针只在本次 FIFO 片段处理完后更新一次，
+             * 避免在每个采样点上更新全局变量，减少 ISR 内部开销。
+             */
             audio_data_ptr = capture_paused ?
                              NULL :
                              &recorded_data[write_block_index][write_sample_index];
@@ -606,7 +645,11 @@ void app_pdm_pcm_task(void *pvParameters)
 {
     (void) pvParameters;
 
-    /* PDM 硬件启动由该任务负责。
+    /* PDM 硬件启动由该任务负责：
+     * 1. 初始化硬件和中断；
+     * 2. 重置 block 状态机和队列；
+     * 3. 激活左右声道，让后续采集完全由 ISR 驱动。
+     *
      * 把硬件初始化放在任务上下文中，可以避免队列未准备好时就启动中断。
      */
     app_pdm_pcm_init();

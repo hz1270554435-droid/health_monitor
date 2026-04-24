@@ -72,7 +72,9 @@ SOURCES+=
 INCLUDES+=
 
 # Add additional defines to the build process (without a leading -D).
-DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF
+# Keep CR/LF conversion disabled: training export sends binary PCM frames over
+# retarget-io, and translating 0x0A bytes would corrupt the payload.
+DEFINES+=
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT+=

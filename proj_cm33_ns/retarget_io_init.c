@@ -51,6 +51,8 @@
 static cy_stc_scb_uart_context_t    DEBUG_UART_context;  
 static mtb_hal_uart_t               DEBUG_UART_hal_obj;  
 
+#define DEBUG_UART_EXPORT_DIVIDER_VALUE    (4U)
+
 /* Retarget-io deepsleep callback parameters  */
 #if (CY_CFG_PWR_SYS_IDLE_MODE == CY_CFG_PWR_MODE_DEEPSLEEP)
 
@@ -109,6 +111,21 @@ static cy_stc_syspm_callback_t retarget_io_syspm_cb =
 void init_retarget_io(void)
 {
     cy_rslt_t result = CY_RSLT_SUCCESS;
+
+    /* The secure image may have initialized the debug UART clock at the BSP
+     * default. Force the export baud here so programming only CM33_NS still
+     * leaves the PC capture rate and firmware rate matched.
+     */
+    Cy_SysClk_PeriPclkDisableDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
+                                     CYBSP_DEBUG_UART_CLK_DIV_HW,
+                                     CYBSP_DEBUG_UART_CLK_DIV_NUM);
+    Cy_SysClk_PeriPclkSetDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
+                                 CYBSP_DEBUG_UART_CLK_DIV_HW,
+                                 CYBSP_DEBUG_UART_CLK_DIV_NUM,
+                                 DEBUG_UART_EXPORT_DIVIDER_VALUE);
+    Cy_SysClk_PeriPclkEnableDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
+                                    CYBSP_DEBUG_UART_CLK_DIV_HW,
+                                    CYBSP_DEBUG_UART_CLK_DIV_NUM);
 
     /* Initialize the SCB UART */
     result = (cy_rslt_t)Cy_SCB_UART_Init(CYBSP_DEBUG_UART_HW, 

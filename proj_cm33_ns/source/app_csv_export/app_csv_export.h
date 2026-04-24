@@ -25,9 +25,24 @@ extern "C" {
 #define APP_CSV_EXPORT_MIC_RAW_ENABLE         (1u)
 #endif
 
+/* Send MIC samples as compact binary PCM blocks instead of per-sample CSV rows.
+ * The PC capture tool recognizes these frames by the "PCMB" magic and converts
+ * them back into WAV/CSV/JSON training sessions.
+ */
+#ifndef APP_CSV_EXPORT_MIC_BINARY_ENABLE
+#define APP_CSV_EXPORT_MIC_BINARY_ENABLE      (1u)
+#endif
+
 /* Include the complete radar frame as hex without spaces. */
 #ifndef APP_CSV_EXPORT_RADAR_FRAME_HEX_ENABLE
 #define APP_CSV_EXPORT_RADAR_FRAME_HEX_ENABLE (1u)
+#endif
+
+/* Keep radar collection running but suppress radar rows on the debug UART.
+ * This lets us test high-speed MIC export without interleaved radar text.
+ */
+#ifndef APP_CSV_EXPORT_RADAR_PRINT_ENABLE
+#define APP_CSV_EXPORT_RADAR_PRINT_ENABLE     (1u)
 #endif
 
 #define APP_CSV_EXPORT_TASK_STACK_SIZE        (2048u)

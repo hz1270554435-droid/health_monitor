@@ -16,6 +16,9 @@
 #define APP_CSV_EXPORT_RADAR_TYPE_TARGET_RANGE      (0x0A16u)
 #define APP_CSV_EXPORT_RADAR_TYPE_TRACK_POSITION    (0x0A17u)
 
+#define APP_CSV_EXPORT_MIC_BINARY_VERSION           (1u)
+#define APP_CSV_EXPORT_MIC_BINARY_BITS_PER_SAMPLE   (16u)
+
 static TaskHandle_t csv_export_task_handle = NULL;
 
 #if (!APP_CSV_EXPORT_MIC_RAW_ENABLE)
@@ -26,6 +29,13 @@ static bool app_csv_export_radar_block_is_valid(const app_uart_radar_block_t *bl
 static void app_csv_export_print_header(void);
 static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block);
 static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block);
+#if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
+static void app_csv_export_print_mic_binary_block(const app_pdm_pcm_block_t *block,
+                                                  uint32_t tick_ms);
+static uint16_t app_csv_export_checksum_u8(const uint8_t *data, uint16_t len);
+static void app_csv_export_put_u16_le(uint16_t value);
+static void app_csv_export_put_u32_le(uint32_t value);
+#endif
 static void app_csv_export_print_hex(const uint8_t *data, uint16_t len);
 static void app_csv_export_print_radar_decoded(const app_uart_radar_block_t *block);
 static void app_csv_export_print_ascii_field(const uint8_t *data, uint16_t len);
@@ -76,7 +86,10 @@ void app_csv_export_task(void *pvParameters)
         if (app_uart_radar_receive_block(&radar_block,
                                          pdMS_TO_TICKS(APP_CSV_EXPORT_RADAR_RX_WAIT_MS)))
         {
-            app_csv_export_print_radar_block(&radar_block);
+            if (APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
+            {
+                app_csv_export_print_radar_block(&radar_block);
+            }
             app_uart_radar_release_block(radar_block.block_index);
             did_work = true;
         }
@@ -139,6 +152,9 @@ static void app_csv_export_print_header(void)
     printf("device,tick_ms,sequence,valid,block_index,sample_index,left,right,"
            "sample_count,min,max,peak_abs,mean_abs,frame_id,radar_type,"
            "frame_len,data_len,driver_drop,msg_drop,frame_hex,radar_decoded\r\n");
+#if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
+    printf("# audio_binary=PCMB,version=1,header_len=32,payload=int16_le_interleaved\r\n");
+#endif
 }
 
 static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block)
@@ -157,6 +173,9 @@ static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block)
     }
 
 #if (APP_CSV_EXPORT_MIC_RAW_ENABLE)
+#if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
+    app_csv_export_print_mic_binary_block(block, tick_ms);
+#else
     for (uint16_t i = 0; i < block->samples_per_channel; i++)
     {
         uint16_t base = (uint16_t)(i * NUM_CHANNELS);
@@ -173,6 +192,7 @@ static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block)
                (unsigned long)app_pdm_pcm_get_dropped_count(),
                (unsigned long)block->dropped_count);
     }
+#endif
 #else
     int16_t min_sample = INT16_MAX;
     int16_t max_sample = INT16_MIN;
@@ -214,6 +234,69 @@ static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block)
 #endif
 }
 
+#if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
+static void app_csv_export_print_mic_binary_block(const app_pdm_pcm_block_t *block,
+                                                  uint32_t tick_ms)
+{
+    uint16_t payload_bytes = (uint16_t)(block->sample_count * sizeof(int16_t));
+    uint16_t checksum = app_csv_export_checksum_u8((const uint8_t *)block->data,
+                                                   payload_bytes);
+
+    putchar('P');
+    putchar('C');
+    putchar('M');
+    putchar('B');
+    putchar(APP_CSV_EXPORT_MIC_BINARY_VERSION);
+    putchar(NUM_CHANNELS);
+    putchar(APP_CSV_EXPORT_MIC_BINARY_BITS_PER_SAMPLE);
+    putchar(block->block_index);
+    app_csv_export_put_u32_le(tick_ms);
+    app_csv_export_put_u32_le(block->sequence);
+    app_csv_export_put_u16_le(block->sample_count);
+    app_csv_export_put_u16_le(block->samples_per_channel);
+    app_csv_export_put_u32_le(app_pdm_pcm_get_dropped_count());
+    app_csv_export_put_u32_le(block->dropped_count);
+    app_csv_export_put_u16_le(payload_bytes);
+    app_csv_export_put_u16_le(checksum);
+
+    for (uint16_t i = 0; i < block->sample_count; i++)
+    {
+        app_csv_export_put_u16_le((uint16_t)block->data[i]);
+    }
+    fflush(stdout);
+}
+
+static uint16_t app_csv_export_checksum_u8(const uint8_t *data, uint16_t len)
+{
+    uint16_t checksum = 0;
+
+    if (NULL == data)
+    {
+        return 0u;
+    }
+
+    for (uint16_t i = 0; i < len; i++)
+    {
+        checksum = (uint16_t)(checksum + data[i]);
+    }
+    return checksum;
+}
+
+static void app_csv_export_put_u16_le(uint16_t value)
+{
+    putchar((int)(value & 0xFFu));
+    putchar((int)((value >> 8) & 0xFFu));
+}
+
+static void app_csv_export_put_u32_le(uint32_t value)
+{
+    putchar((int)(value & 0xFFu));
+    putchar((int)((value >> 8) & 0xFFu));
+    putchar((int)((value >> 16) & 0xFFu));
+    putchar((int)((value >> 24) & 0xFFu));
+}
+#endif
+
 static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block)
 {
     bool valid = app_csv_export_radar_block_is_valid(block);
@@ -245,6 +328,7 @@ static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block
     }
 
     printf("\r\n");
+    fflush(stdout);
 }
 
 static void app_csv_export_print_hex(const uint8_t *data, uint16_t len)

@@ -2466,7 +2466,7 @@
                         </Aliases>
                     </Block>
                     <Parameters>
-                        <Param id="intDivider" value="87"/>
+                        <Param id="intDivider" value="5"/>
                         <Param id="startOnReset" value="true"/>
                     </Parameters>
                 </Personality>
@@ -2654,7 +2654,7 @@
                     </Block>
                     <Parameters>
                         <Param id="ApiMode" value="HIGH_LEVEL"/>
-                        <Param id="BaudRate" value="115200"/>
+                        <Param id="BaudRate" value="2000000"/>
                         <Param id="BitsOrder" value="CY_SCB_UART_LSB_FIRST"/>
                         <Param id="BreakLevel" value="0"/>
                         <Param id="BreakSignalBits" value="11"/>

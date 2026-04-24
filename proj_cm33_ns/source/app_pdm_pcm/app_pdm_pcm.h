@@ -1,7 +1,9 @@
 /******************************************************************************
 * File Name : app_pdm_pcm.h
 *
-* Description : Header file for PDM PCM containing function ptototypes.
+* Description : PDM PCM 采集模块接口。
+*               本模块把 PDM 硬件转换出的左右声道 PCM 数据整理成固定 10 ms
+*               数据块，并通过 FreeRTOS 队列把“块描述符”交给推理任务。
 ********************************************************************************
 * Copyright 2025, Cypress Semiconductor Corporation (an Infineon company) or
 * an affiliate of Cypress Semiconductor Corporation.  All rights reserved.
@@ -52,19 +54,23 @@ extern "C" {
 #include "FreeRTOS.h"
 #include "queue.h"
 /*******************************************************************************
-* Macros
+* 宏定义
 *******************************************************************************/
-/* 声道数量 */
+/* 当前使用双声道采集，数据在内存中按 L,R,L,R... 交错排列。 */
 #define NUM_CHANNELS                   (2u)
 #define LEFT_CH_INDEX                  (2u)
 #define RIGHT_CH_INDEX                 (3u)
+
+/* 右声道中断作为本模块的统一触发源，左右声道在同一次 ISR 中一起读取。 */
 #define PDM_IRQ                        CYBSP_PDM_CHANNEL_3_IRQ
 #define LEFT_CH_CONFIG                 channel_2_config
 #define RIGHT_CH_CONFIG                channel_3_config
 
+/* PDM 硬件 FIFO 深度为 64，触发阈值取半 FIFO。
+ * 每次 RX trigger 到来时，ISR 从左右声道各读 32 个采样点。
+ */
 #define PDM_HW_FIFO_SIZE               (64u)
 #define RX_FIFO_TRIG_LEVEL             (PDM_HW_FIFO_SIZE/2)
-/* PDM Half FIFO Size */
 #define PDM_HALF_FIFO_SIZE             (PDM_HW_FIFO_SIZE/2)
 
 /* 录音缓存时长，单位：秒 */
@@ -75,12 +81,13 @@ extern "C" {
 /* 录音开始阶段需要忽略的采样点数量 */
 #define IGNORED_SAMPLES                (PDM_HW_FIFO_SIZE)
 
-/* PDM PCM interrupt priority */
+/* PDM PCM 中断优先级。FreeRTOS 中断安全 API 要求该优先级不能高于系统允许范围。 */
 #define PDM_PCM_ISR_PRIORITY            (7u)
 
-/* 面向流式推理的音频块配置。
+/* 面向流式推理的音频块配置：
  * 16 kHz 采样率下，10 ms 音频等于每声道 160 个采样点。
- * PCM 数据按双声道交错格式保存：L0, R0, L1, R1, ...
+ * 双声道交错后，一个 block 内共有 320 个 int16_t。
+ * APP_PDM_PCM_BLOCK_COUNT 是背压缓冲深度，推理任务短时变慢时可吸收抖动。 
  */
 #define APP_PDM_PCM_BLOCK_MS                       (10u)
 #define APP_PDM_PCM_BLOCK_COUNT                    (8u)
@@ -129,45 +136,72 @@ extern "C" {
 #define PDM_PCM_SEL_GAIN_NEGATIVE_97DB          (-97.0)
 #define PDM_PCM_SEL_GAIN_NEGATIVE_103DB         (-103.0)
 
-/*******************************************************************************
-* 全局变量
-*******************************************************************************/
+/* 推理任务从队列中收到的是这个描述符，而不是一整块 PCM 数据副本。
+ * 真正的 PCM 数据仍在 recorded_data 中；消费者处理完后必须释放 block_index。
+ */
 typedef struct
 {
-    /* 指向 recorded_data 中一个完整 10 ms 双声道音频块。 */
+    /* 指向 recorded_data 中一个完整 10 ms 双声道 PCM 块，格式为 L,R,L,R...。 */
     const int16_t *data;
-    /* 该块内 int16_t 总数，包含左右两个声道。 */
+
+    /* 该块内 int16_t 总数，包含左右两个声道。当前为 320。 */
     uint16_t sample_count;
-    /* 该块内每个声道的采样点数量。 */
+
+    /* 该块内每个声道的采样点数量。当前 16 kHz/10 ms 下为 160。 */
     uint16_t samples_per_channel;
-    /* 环形缓冲区块索引；推理任务处理完后需要释放这个索引。 */
+
+    /* recorded_data 的行索引；推理任务处理完后用它归还该 block。 */
     uint8_t block_index;
-    /* 单调递增的块序号，用于检测是否发生跳块。 */
+
+    /* 单调递增的块序号，测试或推理侧可用它检查是否发生跳块。 */
     uint32_t sequence;
-    /* 发布该块时的丢块计数快照。 */
+
+    /* 发布该块时的累计丢块计数快照，用于观察消费者是否跟不上采集。 */
     uint32_t dropped_count;
 } app_pdm_pcm_block_t;
 
-/* 共享内存中的环形缓冲区；每一行是一个完整 10 ms 双声道 PCM 块。 */
+/* 共享内存中的 PCM 环形缓冲区。
+ * 每一行是一个完整 10 ms 双声道块；数据所有权由 block 描述符和 release 接口管理。
+ */
 extern int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES];
 
 
 /*******************************************************************************
-* Functions Prototypes
+* 函数声明
 *******************************************************************************/
+/* 创建 PDM PCM 采集任务和内部队列。应在 vTaskStartScheduler() 前调用。 */
 cy_rslt_t app_pdm_pcm_task_init(void);
+
+/* 初始化 PDM/PCM 硬件、声道、增益和中断。通常由 app_pdm_pcm_task() 内部调用。 */
 void app_pdm_pcm_init(void);
+
+/* 激活左右声道，开始由硬件中断驱动采集。 */
 void app_pdm_pcm_activate(void);
+
+/* 将 dB 增益值映射为 PDM 驱动支持的离散 gain scale。 */
 cy_en_pdm_pcm_gain_sel_t convert_db_to_pdm_scale(double db);
+
+/* 同时设置左右声道的 PDM 增益。 */
 void set_pdm_pcm_gain(cy_en_pdm_pcm_gain_sel_t gain);
+
+/* PDM RX 中断处理函数，由 NVIC 调用，应用层不要直接调用。 */
 void pdm_interrupt_handler(void);
+
+/* 停止左右声道采集。 */
 void app_pdm_pcm_deactivate(void);
+
+/* PDM PCM 采集任务入口，负责启动硬件，之后采集由 ISR 驱动。 */
 void app_pdm_pcm_task(void *pvParameters);
+
+/* 获取内部 block 队列句柄，主要用于调试或兼容旧代码。优先使用 receive/release 接口。 */
 QueueHandle_t app_pdm_pcm_get_queue(void);
-/* 接收一个已准备好的 10 ms 音频块；使用完成后调用者必须释放 block_index。 */
+
+/* 接收一个已准备好的 10 ms PCM 块；使用完成后调用者必须释放 block_index。 */
 bool app_pdm_pcm_receive_block(app_pdm_pcm_block_t *block, TickType_t ticks_to_wait);
-/* 将已经消费完成的音频块归还给 ISR 可写的空闲池。 */
+
+/* 将已经消费完成的 PCM 块归还给 ISR 可写的空闲池。 */
 void app_pdm_pcm_release_block(uint8_t block_index);
+
 /* 因消费者释放不及时而被丢弃的音频块数量。 */
 uint32_t app_pdm_pcm_get_dropped_count(void);
 
