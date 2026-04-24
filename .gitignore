@@ -150,3 +150,6 @@ Thumbs.db:encryptable
 ehthumbs.db
 ehthumbs_vista.db
 [Dd]esktop.ini
+
+#导出的数据
+log_csv/
