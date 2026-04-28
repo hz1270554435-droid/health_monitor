@@ -77,6 +77,8 @@ RADAR_UART_RAW_CSV_HEADER = [
     "frame_hex",
 ]
 
+RADAR_MERGED_SESSION_CSV_NAME = "radar_sessions.csv"
+
 RADAR_TYPE_NAMES = {
     "0x0100": "text",
     "0x0f09": "human_status",
@@ -559,6 +561,7 @@ class RadarSessionWriter:
         self.raw_file = None
         self.raw_writer = None
         self.json_path: Path | None = None
+        self.session_csv_paths: list[Path] = []
 
     def write_row(self, row: list[str], now: datetime) -> None:
         if row[0].strip().lower() != "radar":
@@ -678,9 +681,34 @@ class RadarSessionWriter:
         self.csv_file = csv_path.open("w", newline="", encoding="utf-8")
         self.csv_writer = csv.writer(self.csv_file)
         self.csv_writer.writerow(RADAR_SESSION_CSV_HEADER)
+        self.session_csv_paths.append(csv_path)
         self.raw_file = raw_path.open("w", newline="", encoding="utf-8")
         self.raw_writer = csv.writer(self.raw_file)
         self.raw_writer.writerow(RADAR_UART_RAW_CSV_HEADER)
+
+    def merge_sessions(self) -> tuple[Path | None, int]:
+        if not self.session_csv_paths:
+            return None, 0
+
+        merged_path = self.root / RADAR_MERGED_SESSION_CSV_NAME
+        total_rows = 0
+        with merged_path.open("w", newline="", encoding="utf-8") as output_file:
+            writer = csv.writer(output_file)
+            writer.writerow(RADAR_SESSION_CSV_HEADER)
+
+            for csv_path in self.session_csv_paths:
+                if not csv_path.exists() or csv_path == merged_path:
+                    continue
+                with csv_path.open("r", newline="", encoding="utf-8") as input_file:
+                    reader = csv.reader(input_file)
+                    header = next(reader, None)
+                    if header != RADAR_SESSION_CSV_HEADER:
+                        continue
+                    for row in reader:
+                        writer.writerow(row)
+                        total_rows += 1
+
+        return merged_path, total_rows
 
     def _values_from_fields(self, fields: dict[str, str]) -> dict[str, str]:
         values = {
@@ -735,9 +763,10 @@ class TrainingSessionExporter:
         elif device == "radar":
             self.radar.write_row(row, now)
 
-    def close(self) -> None:
+    def close(self) -> tuple[Path | None, int]:
         self.audio.close()
         self.radar.close()
+        return self.radar.merge_sessions()
 
 
 def choose_auto_port(list_ports) -> str:
@@ -916,6 +945,8 @@ def main() -> int:
     rows = 0
     skipped = 0
     binary_frames = 0
+    radar_merged_path = None
+    radar_merged_rows = 0
 
     def process_text_line(line: str) -> None:
         nonlocal rows, skipped
@@ -1077,9 +1108,11 @@ def main() -> int:
         if radar_file is not None:
             radar_file.close()
         if session_exporter is not None:
-            session_exporter.close()
+            radar_merged_path, radar_merged_rows = session_exporter.close()
 
     print(f"\nDone. rows={rows} binary_frames={binary_frames} skipped={skipped}")
+    if radar_merged_path is not None:
+        print(f"Merged radar session CSV: {radar_merged_path} ({radar_merged_rows} rows)")
     if rows == 0 and raw_path is not None:
         print(
             f"No MIC/radar CSV rows were captured. Check {raw_path} "
