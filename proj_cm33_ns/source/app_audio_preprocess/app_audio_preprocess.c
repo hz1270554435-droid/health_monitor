@@ -9,14 +9,14 @@
  *
  * 任务边界：
  * - 输入：app_pdm_pcm 发布的 10 ms 双通道 PCM block，格式为 L,R,L,R...
- * - 输出：shared/app_model_shared.h 定义的共享内存特征帧，payload 已量化。
+ * - 输出：shared/app_model_shared.h 定义的共享内存特征帧，payload 为 float32。
  *
  * 设计原则：
  * - app_pdm_pcm 只做采集，不做算法；
  * - app_get_data 只做测试/导出，不参与正式业务；
- * - 本模块拥有滑动窗口、特征提取和量化参数，后续模型调整优先改配置结构；
- * - 当前频谱计算使用朴素 DFT，便于先验证端到端协议。若实时性能不足，
- *   只需要替换 app_audio_preprocess_power_spectrum()，上层接口不变。
+ * - 本模块拥有滑动窗口和特征提取参数，后续模型调整优先改配置结构；
+ * - 当前频谱计算仍是参考实现，但已避免在内层循环反复调用 sin/cos。
+ *   若实时性能仍不足，只需要替换 app_audio_preprocess_power_spectrum()。
  */
 
 typedef struct
@@ -27,7 +27,10 @@ typedef struct
     uint16_t frame_hop_samples;
     uint16_t spectrum_bins;
     uint16_t time_bins;
+    uint16_t fft_window_offset;
     uint16_t mel_edges[APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS + 2u];
+    float twiddle_cos[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
+    float twiddle_sin[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
     float frame_window[APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES];
 } app_audio_preprocess_plan_t;
 
@@ -49,7 +52,7 @@ static uint16_t delay_line_index;
 static float window_buffer[APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES];
 static float frame_buffer[APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES];
 static float power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
-static uint8_t quantized_feature[APP_MODEL_AUDIO_FEATURE_MAX_BYTES];
+static float model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
 
 static cy_rslt_t app_audio_preprocess_validate_and_plan(
     const app_audio_preprocess_config_t *config,
@@ -70,7 +73,7 @@ static void app_audio_preprocess_copy_ordered_window(void);
 static bool app_audio_preprocess_condition_window(float *energy);
 static void app_audio_preprocess_power_spectrum(const float *frame);
 static float app_audio_preprocess_mel_energy(uint16_t mel_index);
-static uint8_t app_audio_preprocess_quantize(float value);
+static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy);
 static void app_audio_preprocess_init_shared_region(void);
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
@@ -179,21 +182,25 @@ void app_audio_preprocess_task(void *pvParameters)
 cy_rslt_t app_audio_preprocess_configure(
     const app_audio_preprocess_config_t *config)
 {
-    app_audio_preprocess_plan_t plan;
-
     if ((NULL == config) || (NULL != audio_preprocess_task_handle))
     {
         return CY_RSLT_TYPE_ERROR;
     }
 
+    /* 注意：app_audio_preprocess_plan_t 内部包含窗函数、旋转因子和 Mel
+     * 边界等较大的工作表，大小约 8 KB。CM33 non-secure 工程默认 MSP
+     * 只有 4 KB，如果在 main()/scheduler 启动前把它作为局部变量放到栈上，
+     * 会在创建前处理任务前直接触发栈溢出或 HardFault，串口上只看到前一条
+     * BOOT 日志。这里直接写入静态 plan；如果校验失败，config_ready 不置位，
+     * 后续不会使用这份未完成的计划。
+     */
     if (CY_RSLT_SUCCESS !=
-        app_audio_preprocess_validate_and_plan(config, &plan))
+        app_audio_preprocess_validate_and_plan(config, &audio_preprocess_plan))
     {
         return CY_RSLT_TYPE_ERROR;
     }
 
     audio_preprocess_config = *config;
-    audio_preprocess_plan = plan;
     audio_preprocess_config_ready = true;
     app_audio_preprocess_reset_stream_state();
 
@@ -232,8 +239,8 @@ void app_audio_preprocess_get_default_config(
     config->log_epsilon = APP_AUDIO_PREPROCESS_DEFAULT_LOG_EPSILON;
     config->feature_mean = APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_MEAN;
     config->feature_std = APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_STD;
-    config->quant_type = APP_MODEL_AUDIO_QUANT_INT8;
-    config->quant_scale = APP_AUDIO_PREPROCESS_DEFAULT_QUANT_SCALE;
+    config->quant_type = APP_MODEL_AUDIO_QUANT_FLOAT32;
+    config->quant_scale = 1.0f;
     config->quant_zero_point = APP_AUDIO_PREPROCESS_DEFAULT_QUANT_ZERO;
 }
 
@@ -264,8 +271,7 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
         (0u == config->fft_size) ||
         (0u != (config->fft_size & 1u)) ||
         (APP_AUDIO_PREPROCESS_MAX_FFT_SIZE < config->fft_size) ||
-        (0u == config->mel_bin_count) ||
-        (APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS < config->mel_bin_count) ||
+        (APP_MODEL_AUDIO_MODEL_MEL_BINS != config->mel_bin_count) ||
         (0.0f > config->mel_low_hz) ||
         (config->mel_low_hz >= config->mel_high_hz) ||
         (((float)config->sample_rate_hz * 0.5f) < config->mel_high_hz) ||
@@ -274,6 +280,7 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
         (0.0f >= config->normalize_max_gain) ||
         (0.0f >= config->log_epsilon) ||
         (0.0f >= config->feature_std) ||
+        (APP_MODEL_AUDIO_QUANT_FLOAT32 != config->quant_type) ||
         (0.0f >= config->quant_scale))
     {
         return CY_RSLT_TYPE_ERROR;
@@ -308,14 +315,20 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
         return CY_RSLT_TYPE_ERROR;
     }
 
-    plan->time_bins = (uint16_t)(1u + ((plan->window_samples -
-                                        plan->frame_len_samples) /
-                                       plan->frame_hop_samples));
+    /* 训练端 librosa.melspectrogram() 默认 center=True，会在 1 s 音频两端按
+     * n_fft/2 补零。因此 16000 点、hop=160 时得到 1 + 16000 / 160 = 101 帧。
+     * 这里显式按 center padding 计算时间帧数，保证输出 shape 与模型一致。
+     */
+    plan->time_bins =
+        (uint16_t)(1u + (plan->window_samples / plan->frame_hop_samples));
     if ((0u == plan->time_bins) ||
-        (APP_MODEL_AUDIO_FEATURE_MAX_TIME_BINS < plan->time_bins))
+        (APP_MODEL_AUDIO_MODEL_TIME_BINS != plan->time_bins))
     {
         return CY_RSLT_TYPE_ERROR;
     }
+
+    plan->fft_window_offset =
+        (uint16_t)((config->fft_size - plan->frame_len_samples) / 2u);
 
     delay_abs = (0 > config->fixed_delay_samples) ?
                 (uint32_t)(-config->fixed_delay_samples) :
@@ -327,8 +340,9 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
 
     for (uint16_t i = 0; i < plan->frame_len_samples; i++)
     {
+        /* librosa 默认使用 periodic Hann/Hamming 窗；分母取 N 而不是 N-1。 */
         float phase = (2.0f * APP_AUDIO_PREPROCESS_PI * (float)i) /
-                      (float)(plan->frame_len_samples - 1u);
+                      (float)plan->frame_len_samples;
 
         switch (config->window_function)
         {
@@ -345,6 +359,15 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
                 plan->frame_window[i] = 0.5f - (0.5f * cosf(phase));
                 break;
         }
+    }
+
+    for (uint16_t k = 0; k < plan->spectrum_bins; k++)
+    {
+        float phase = (2.0f * APP_AUDIO_PREPROCESS_PI * (float)k) /
+                      (float)config->fft_size;
+
+        plan->twiddle_cos[k] = cosf(phase);
+        plan->twiddle_sin[k] = -sinf(phase);
     }
 
     mel_bin_count = config->mel_bin_count;
@@ -521,9 +544,10 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
 {
     /* 完整特征流水线：
      * 有序窗口 -> 去直流/归一化/能量门限 -> 分帧加窗 -> 功率谱
-     * -> Mel 滤波器组 -> log -> 全局归一化 -> int8/uint8 量化 -> 共享内存。
+     * -> Mel 滤波器组 -> power_to_db(ref=max) -> 本窗口标准化 -> float32 共享内存。
      */
     float energy = 0.0f;
+    float max_mel_energy = 0.0f;
 
     app_audio_preprocess_copy_ordered_window();
     if (!app_audio_preprocess_condition_window(&energy))
@@ -535,13 +559,29 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
 
     for (uint16_t t = 0; t < audio_preprocess_plan.time_bins; t++)
     {
-        uint16_t frame_start =
-            (uint16_t)(t * audio_preprocess_plan.frame_hop_samples);
+        int32_t frame_start =
+            ((int32_t)t * (int32_t)audio_preprocess_plan.frame_hop_samples) -
+            ((int32_t)audio_preprocess_plan.frame_len_samples / 2);
+
+        /* center=True 对应窗口中心落在 t * hop 的位置。
+         * 超出 1 s 原始窗口的左右边界按 0 补齐；这正是 PC 侧 librosa 默认行为。
+         */
+        memset(frame_buffer, 0,
+               (size_t)audio_preprocess_config.fft_size * sizeof(frame_buffer[0]));
 
         for (uint16_t n = 0; n < audio_preprocess_plan.frame_len_samples; n++)
         {
-            frame_buffer[n] = window_buffer[frame_start + n] *
-                              audio_preprocess_plan.frame_window[n];
+            int32_t source_index = frame_start + (int32_t)n;
+            uint16_t frame_index =
+                (uint16_t)(audio_preprocess_plan.fft_window_offset + n);
+
+            if ((0 <= source_index) &&
+                ((int32_t)audio_preprocess_plan.window_samples > source_index))
+            {
+                frame_buffer[frame_index] =
+                    window_buffer[source_index] *
+                    audio_preprocess_plan.frame_window[n];
+            }
         }
 
         app_audio_preprocess_power_spectrum(frame_buffer);
@@ -549,17 +589,18 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
         for (uint16_t mel = 0; mel < audio_preprocess_config.mel_bin_count; mel++)
         {
             float mel_energy = app_audio_preprocess_mel_energy(mel);
-            float logmel = logf(mel_energy + audio_preprocess_config.log_epsilon);
-            float normalized =
-                (logmel - audio_preprocess_config.feature_mean) /
-                audio_preprocess_config.feature_std;
             uint16_t out_index =
                 (uint16_t)((mel * audio_preprocess_plan.time_bins) + t);
 
-            quantized_feature[out_index] =
-                app_audio_preprocess_quantize(normalized);
+            model_input_feature[out_index] = mel_energy;
+            if (max_mel_energy < mel_energy)
+            {
+                max_mel_energy = mel_energy;
+            }
         }
     }
+
+    app_audio_preprocess_power_to_db_and_normalize(max_mel_energy);
 
     audio_preprocess_stats.last_energy = energy;
     return app_audio_preprocess_publish_feature(timestamp_ms,
@@ -631,8 +672,10 @@ static bool app_audio_preprocess_condition_window(float *energy)
 static void app_audio_preprocess_power_spectrum(const float *frame)
 {
     /* 参考实现：直接 DFT 得到单边功率谱。
-     * 复杂度较高，只用于先跑通框架。后续可以在这里替换为 CMSIS-DSP RFFT，
-     * 输出仍填 power_spectrum[]，其它函数无需变化。
+     *
+     * 第一版为了少引入库依赖，仍使用软件 DFT；但不再在内层循环里调用 sinf/cosf，
+     * 而是用配置阶段预计算的旋转因子递推。后续如果实时性能不足，应把本函数
+     * 替换成 CMSIS-DSP RFFT，输出仍填 power_spectrum[]，其它前处理流程不变。
      */
     uint16_t fft_size = audio_preprocess_config.fft_size;
 
@@ -640,19 +683,29 @@ static void app_audio_preprocess_power_spectrum(const float *frame)
     {
         float real = 0.0f;
         float imag = 0.0f;
+        float phase_cos = 1.0f;
+        float phase_sin = 0.0f;
+        float twiddle_cos = audio_preprocess_plan.twiddle_cos[k];
+        float twiddle_sin = audio_preprocess_plan.twiddle_sin[k];
 
         for (uint16_t n = 0; n < fft_size; n++)
         {
-            float sample = (n < audio_preprocess_plan.frame_len_samples) ?
-                           frame[n] : 0.0f;
-            float angle = (-2.0f * APP_AUDIO_PREPROCESS_PI *
-                           (float)k * (float)n) / (float)fft_size;
+            float sample = frame[n];
+            float next_cos;
+            float next_sin;
 
-            real += sample * cosf(angle);
-            imag += sample * sinf(angle);
+            real += sample * phase_cos;
+            imag += sample * phase_sin;
+
+            next_cos = (phase_cos * twiddle_cos) -
+                       (phase_sin * twiddle_sin);
+            next_sin = (phase_cos * twiddle_sin) +
+                       (phase_sin * twiddle_cos);
+            phase_cos = next_cos;
+            phase_sin = next_sin;
         }
 
-        power_spectrum[k] = ((real * real) + (imag * imag)) / (float)fft_size;
+        power_spectrum[k] = (real * real) + (imag * imag);
     }
 }
 
@@ -686,41 +739,58 @@ static float app_audio_preprocess_mel_energy(uint16_t mel_index)
     return energy;
 }
 
-static uint8_t app_audio_preprocess_quantize(float value)
+static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
 {
-    /* 量化公式：
-     * q = round(value / scale + zero_point)
-     * INT8 模式下以 uint8_t 存储底层字节，CM55 读取时按 int8_t 解释。
+    /* 对齐训练端 src/audio/features.py:
+     * 1. librosa.power_to_db(mel, ref=np.max)，最大能量对应 0 dB；
+     * 2. 默认 top_db=80，因此低能量区域被截到 -80 dB；
+     * 3. 对当前 40x101 特征图做本窗口 mean/std 标准化。
+     *
+     * 注意：这里仍是第一版板端近似实现，Mel 滤波器细节后续还要和 PC 做逐点比对。
      */
-    float scaled = (value / audio_preprocess_config.quant_scale) +
-                   (float)audio_preprocess_config.quant_zero_point;
-    int32_t rounded = (0.0f <= scaled) ?
-                      (int32_t)(scaled + 0.5f) :
-                      (int32_t)(scaled - 0.5f);
+    const float amin = 1.0e-10f;
+    const float top_db = 80.0f;
+    uint32_t element_count =
+        (uint32_t)audio_preprocess_config.mel_bin_count *
+        (uint32_t)audio_preprocess_plan.time_bins;
+    float ref_power = (max_mel_energy > amin) ? max_mel_energy : amin;
+    float ref_db = 10.0f * log10f(ref_power);
+    double sum = 0.0;
+    double square_sum = 0.0;
+    float mean;
+    float std;
 
-    if (APP_MODEL_AUDIO_QUANT_UINT8 == audio_preprocess_config.quant_type)
+    for (uint32_t i = 0; i < element_count; i++)
     {
-        if (0 > rounded)
+        float power = (model_input_feature[i] > amin) ?
+                      model_input_feature[i] : amin;
+        float db = (10.0f * log10f(power)) - ref_db;
+
+        if (-top_db > db)
         {
-            rounded = 0;
+            db = -top_db;
         }
-        else if (255 < rounded)
-        {
-            rounded = 255;
-        }
-        return (uint8_t)rounded;
+
+        model_input_feature[i] = db;
+        sum += db;
+        square_sum += ((double)db * (double)db);
     }
 
-    if (-128 > rounded)
+    mean = (float)(sum / (double)element_count);
+    std = (float)((square_sum / (double)element_count) -
+                  ((double)mean * (double)mean));
+    if (0.0f > std)
     {
-        rounded = -128;
+        std = 0.0f;
     }
-    else if (127 < rounded)
-    {
-        rounded = 127;
-    }
+    std = sqrtf(std);
 
-    return (uint8_t)((int8_t)rounded);
+    for (uint32_t i = 0; i < element_count; i++)
+    {
+        model_input_feature[i] =
+            (model_input_feature[i] - mean) /
+            (std + audio_preprocess_config.log_epsilon);
+    }
 }
 
 static void app_audio_preprocess_init_shared_region(void)
@@ -747,8 +817,9 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
      */
     volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
     uint16_t payload_bytes =
-        (uint16_t)(audio_preprocess_config.mel_bin_count *
-                   audio_preprocess_plan.time_bins);
+        (uint16_t)((uint32_t)audio_preprocess_config.mel_bin_count *
+                   (uint32_t)audio_preprocess_plan.time_bins *
+                   (uint32_t)sizeof(model_input_feature[0]));
     app_model_audio_feature_desc_t desc;
 
     if ((APP_MODEL_SHARED_INPUT_READY == shared->input_state) ||
@@ -780,7 +851,7 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
     shared->input_state = APP_MODEL_SHARED_INPUT_WRITING;
     shared->audio = desc;
     memcpy((void *)&shared->audio_payload[0],
-           quantized_feature,
+           model_input_feature,
            payload_bytes);
     shared->producer_sequence = desc.sequence;
     shared->input_state = APP_MODEL_SHARED_INPUT_READY;

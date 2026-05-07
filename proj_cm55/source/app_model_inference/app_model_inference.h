@@ -5,12 +5,11 @@
 *
 * 本模块只负责 CM55 侧正式业务链路：
 * 1. 轮询 shared/app_model_shared.h 定义的共享内存；
-* 2. 读取 CM33 已完成前处理和量化的音频特征；
-* 3. 调用模型推理入口；
-* 4. 把占位结果写回共享内存结果区。
+* 2. 读取 CM33 已完成前处理的 float32[40,101] 音频特征；
+* 3. 调用真实 AUDIO_compute() 模型推理入口；
+* 4. 把 logits、cough_prob 和调试信息写回共享内存结果区。
 *
-* 当前项目还没有导入模型，因此推理入口先返回 MODEL_NOT_READY。后续接入模型时，
-* 应只替换 app_model_inference.c 内部的占位函数，不需要改变 CM33 的采集和前处理任务。
+* smoke test 仍保留为可选 baseline，但第一版 MIC demo 默认直接进入正式推理链路。
 *******************************************************************************/
 
 #ifndef __APP_MODEL_INFERENCE_H__
@@ -46,11 +45,11 @@ typedef struct
     uint32_t shared_not_ready;
     /* 输入描述符不合法的次数。 */
     uint32_t invalid_inputs;
-    /* 已经调用占位/正式推理入口的次数。 */
+    /* 已经调用正式推理入口的次数。 */
     uint32_t inference_runs;
     /* 最近一次消费的 CM33 特征序号。 */
     uint32_t last_input_sequence;
-    /* 最近一次占位/正式推理耗时，单位 ms。 */
+    /* 最近一次正式推理耗时，单位 ms。 */
     uint32_t last_inference_time_ms;
     /* 最近一次推理状态，取 app_model_inference_status_t。 */
     uint8_t last_status;

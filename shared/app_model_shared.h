@@ -4,7 +4,7 @@
 * Description : CM33/CM55 之间传递“处理后模型输入”和“模型结果”的固定共享内存协议。
 *
 * 本头文件只定义共享内存中的协议和地址，不定义原始采集缓冲。
-* CM33 负责把 log-mel 量化后的特征写入输入槽；CM55 按同一份头文件读取输入槽，
+* CM33 负责把 log-mel float32 特征写入输入槽；CM55 按同一份头文件读取输入槽，
 * 并把推理结果写回结果槽。当前结果槽采用“最新结果覆盖旧结果”的调试友好语义。
 * 原始 PDM/PCM 采集数据不得放入这块协议区，避免和模型输入互相干扰。
 *******************************************************************************/
@@ -27,7 +27,7 @@ extern "C" {
 
 /* "MFEA" = Model FEAture，用于 CM55 判断共享区是否已经由 CM33 初始化。 */
 #define APP_MODEL_SHARED_MAGIC                 (0x4D464541u)
-#define APP_MODEL_SHARED_VERSION               (2u)
+#define APP_MODEL_SHARED_VERSION               (3u)
 
 /* 共享区固定偏移。
  * m33_m55_shared 开头已经有历史共享数据使用者，例如雷达帧缓冲。
@@ -47,18 +47,34 @@ extern "C" {
 #define APP_MODEL_SHARED_ADDR                  (APP_MODEL_SHARED_BASE_ADDR + \
                                                 APP_MODEL_SHARED_OFFSET_BYTES)
 
-/* 音频特征 payload 上限。
- * 运行时配置可以使用更小的 mel_bin_count/time_bin_count，但不能超过这些上限；
- * 如果模型改成更大的输入形状，需要同步扩展 CM33 前处理、CM55 模型输入和本协议。
+/* 当前真实音频模型的固定输入形状。
+ *
+ * CM55 已导入的 AUDIO_compute() 入口要求输入 float[1,40,101]，PC 测试向量也按
+ * NCHW 顺序展平成 40 * 101 个 float32。第一版 MIC demo 先把共享协议固定到这个
+ * shape，避免 CM33 前处理和 CM55 模型各自解释一套尺寸。
  */
-#define APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS   (64u)
-#define APP_MODEL_AUDIO_FEATURE_MAX_TIME_BINS  (100u)
-#define APP_MODEL_AUDIO_FEATURE_MAX_BYTES      (APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS * \
-                                                APP_MODEL_AUDIO_FEATURE_MAX_TIME_BINS)
+#define APP_MODEL_AUDIO_MODEL_MEL_BINS         (40u)
+#define APP_MODEL_AUDIO_MODEL_TIME_BINS        (101u)
+#define APP_MODEL_AUDIO_MODEL_FLOAT_COUNT      (APP_MODEL_AUDIO_MODEL_MEL_BINS * \
+                                                APP_MODEL_AUDIO_MODEL_TIME_BINS)
+#define APP_MODEL_AUDIO_MODEL_INPUT_BYTES      (APP_MODEL_AUDIO_MODEL_FLOAT_COUNT * \
+                                                sizeof(float))
 
-/* CM55 推理结果占位上限。
- * 当前项目还没有导入正式模型，所以这里先保留一个通用 scores[] 槽位。
- * 后续接入模型时，如果类别数超过该值，需要同步扩展本协议以及 CM55 推理任务。
+/* 音频特征 payload 上限。
+ * 当前上限直接等于真实模型输入大小；如果后续更换模型 shape，需要同步扩展
+ * CM33 前处理、CM55 模型输入和本协议版本号。
+ */
+#define APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS   (APP_MODEL_AUDIO_MODEL_MEL_BINS)
+#define APP_MODEL_AUDIO_FEATURE_MAX_TIME_BINS  (APP_MODEL_AUDIO_MODEL_TIME_BINS)
+#define APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS   (APP_MODEL_AUDIO_MODEL_FLOAT_COUNT)
+#define APP_MODEL_AUDIO_FEATURE_MAX_BYTES      (APP_MODEL_AUDIO_MODEL_INPUT_BYTES)
+
+/* smoke test 使用独立 result_sequence 区间，避免和正式 MIC 输入序号冲突。 */
+#define APP_MODEL_RESULT_SEQUENCE_SMOKE_BASE   (0x80000000UL)
+
+/* CM55 推理结果分数槽上限。
+ * 当前真实模型只输出两个 logits；scores[] 额外保留 cough_prob、能量等调试值。
+ * 后续如果类别数或输出头超过该值，需要同步扩展本协议以及 CM55 推理任务。
  */
 #define APP_MODEL_INFERENCE_MAX_SCORES         (16u)
 
@@ -89,17 +105,21 @@ typedef enum
     /* payload 中每个字节按 int8_t 解释，范围 -128 到 127。 */
     APP_MODEL_AUDIO_QUANT_INT8 = 0,
     /* payload 中每个字节按 uint8_t 解释，范围 0 到 255。 */
-    APP_MODEL_AUDIO_QUANT_UINT8
+    APP_MODEL_AUDIO_QUANT_UINT8,
+    /* payload 中每 4 个字节按 little-endian float32 解释，当前真实模型使用该格式。 */
+    APP_MODEL_AUDIO_QUANT_FLOAT32
 } app_model_audio_quant_type_t;
 
 typedef enum
 {
-    /* 占位推理成功执行。正式模型接入后，正常推理应返回该状态。 */
+    /* 模型推理成功执行。 */
     APP_MODEL_INFERENCE_STATUS_OK = 0,
     /* CM55 发现共享内存中的输入描述符不合法。 */
     APP_MODEL_INFERENCE_STATUS_INVALID_INPUT,
     /* 模型尚未导入；当前仅完成数据流框架。 */
-    APP_MODEL_INFERENCE_STATUS_MODEL_NOT_READY
+    APP_MODEL_INFERENCE_STATUS_MODEL_NOT_READY,
+    /* 模型初始化、soft reset 或运行时接口返回错误。 */
+    APP_MODEL_INFERENCE_STATUS_MODEL_ERROR
 } app_model_inference_status_t;
 
 typedef struct
@@ -117,11 +137,13 @@ typedef struct
     uint16_t fft_size;
     uint16_t mel_bin_count;
     uint16_t time_bin_count;
-    /* payload 有效字节数，等于 mel_bin_count * time_bin_count。 */
+    /* payload 有效字节数。float32 模式下等于 mel_bin_count * time_bin_count * 4。 */
     uint16_t payload_bytes;
     /* 量化类型，取 app_model_audio_quant_type_t。 */
     uint8_t quant_type;
-    /* 反量化公式：float_value = (q - quant_zero_point) * quant_scale。 */
+    /* 反量化公式：float_value = (q - quant_zero_point) * quant_scale。
+     * float32 模式下保留为 zero=0/scale=1，CM55 直接把 payload 解释为 float。
+     */
     int32_t quant_zero_point;
     float quant_scale;
     /* 去直流后、归一化前的平均能量；可用于观察能量门限效果。 */
@@ -139,14 +161,17 @@ typedef struct
     uint32_t input_sequence;
     /* CM55 写入结果时的系统 tick 时间，单位 ms。 */
     uint32_t timestamp_ms;
-    /* 本次推理或占位处理耗时，单位 ms。 */
+    /* 本次推理处理耗时，单位 ms。 */
     uint32_t inference_time_ms;
     /* 有效类别分数个数；模型未接入时为 0。 */
     uint16_t class_count;
     /* 取 app_model_inference_status_t。 */
     uint8_t status;
     uint8_t reserved;
-    /* 通用浮点分数占位。后续如果模型输出 int8/uint8 或多输出头，可在版本升级时替换。 */
+    /* 通用浮点分数槽。当前约定：
+     * scores[0]/[1]=两个 logits，scores[2]=cough_prob，
+     * scores[3]=CM33 窗口能量，scores[4]=选中通道。
+     */
     float scores[APP_MODEL_INFERENCE_MAX_SCORES];
 } app_model_inference_result_t;
 
@@ -168,7 +193,8 @@ typedef struct
 
     /* 特征 payload 按 mel-major 展平：
      * audio_payload[mel * time_bin_count + time]。
-     * quant_type 决定 CM55 把字节解释为 int8_t 还是 uint8_t。
+     * 当前真实模型要求 float32，因此每 4 字节组成一个 float；保留 uint8_t 数组
+     * 是为了协议区按字节计数和 memcpy 更直接。
      */
     uint8_t audio_payload[APP_MODEL_AUDIO_FEATURE_MAX_BYTES];
 } app_model_shared_region_t;

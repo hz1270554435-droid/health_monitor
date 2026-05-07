@@ -62,11 +62,29 @@
 #define SYSPM_SKIP_MODE         (0U)
 #define SYSPM_CALLBACK_ORDER    (1U)
 
+/* Debug UART 支持的应用层波特率。
+ *
+ * 注意：这里不是开放的任意 baud 配置，而是列出已经在 retarget_io_init.c 中
+ * 计算过 divider 的两个固定速率：
+ * - 115200：普通串口助手、模型 smoke test、正式链路调试日志；
+ * - 2000000：CSV/PCM 等高吞吐采集导出，减少串口阻塞和丢帧概率。
+ *
+ * 新增其它速率时，应同步在 retarget_io_init.c 中增加 divider 映射和注释。
+ */
+#define RETARGET_IO_BAUD_115200     (115200UL)
+#define RETARGET_IO_BAUD_2000000    (2000000UL)
+
 
 /*******************************************************************************
 * Function prototypes
 *******************************************************************************/
-void init_retarget_io(void);
+/* 初始化 debug UART 和 retarget-io。
+ *
+ * 参数 baud_rate 必须为 RETARGET_IO_BAUD_115200 或 RETARGET_IO_BAUD_2000000。
+ * 业务层应在 main.c 中根据 APP_RUNTIME_MODE 选择波特率；底层只负责按该速率
+ * 设置 UART 时钟分频并完成 printf 重定向。
+ */
+void init_retarget_io(uint32_t baud_rate);
 
 /*******************************************************************************
 * Function Name: handle_app_error

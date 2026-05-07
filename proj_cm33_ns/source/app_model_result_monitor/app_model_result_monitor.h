@@ -28,9 +28,17 @@
 extern "C" {
 #endif
 
-/* 结果观察任务默认较低优先级，只做慢速调试打印，避免影响音频前处理。 */
+/* 结果观察任务优先级。
+ *
+ * 当前阶段需要观察 CM55 smoke test 连续写回的多条结果。共享 result 区是
+ * “最新结果覆盖旧结果”的单槽语义，如果本任务优先级太低，正式音频前处理忙时
+ * 可能只看到第一条 smoke，后续结果会在打印前被覆盖。
+ *
+ * 该任务只在 APP_MODEL_RESULT_MONITOR_ENABLE 打开时启动，属于联调工具；正式部署
+ * 或实时性能测试时应关闭监控任务，避免 debug UART 打印影响音频链路。
+ */
 #define APP_MODEL_RESULT_MONITOR_TASK_STACK_SIZE    (1024u)
-#define APP_MODEL_RESULT_MONITOR_TASK_PRIORITY      (tskIDLE_PRIORITY + 1u)
+#define APP_MODEL_RESULT_MONITOR_TASK_PRIORITY      (configMAX_PRIORITIES - 1u)
 
 /* 轮询间隔。当前结果区是“最新结果覆盖旧结果”语义，不保证调试任务看到每一帧。 */
 #define APP_MODEL_RESULT_MONITOR_POLL_MS            (100u)

@@ -1,38 +1,45 @@
 #include "app_model_inference.h"
 
+#include <math.h>
 #include <string.h>
+
+#include "app_model_smoke.h"
+#include "audio_model_v2_float.h"
 
 /* 本文件是 CM55 侧模型任务框架。
  *
  * 数据边界：
- * - CM33 只把“已前处理、已量化”的模型输入写入共享内存；
+ * - CM33 只把“已前处理、float32 40x101”的模型输入写入共享内存；
  * - CM55 从共享内存取走输入后复制到本地缓冲，再释放共享输入槽；
  * - 原始 PDM/PCM 永远不进入这块共享协议，避免采集数据和模型输入互相干扰。
  *
- * 后续模型接入点：
- * - 替换 app_model_inference_run_model() 中的占位实现；
- * - 如果模型输入 shape、量化方式或输出类别数改变，同步更新 shared/app_model_shared.h；
- * - 如果模型需要 tensor arena，请在 CM55 本模块内单独分配，不要占用 CM33 原始采集缓冲。
+ * 当前模型接入点：
+ * - AUDIO_compute() 输入必须是 PC/CM33 一致的 NCHW 展平 float[40 * 101]；
+ * - 如果模型输入 shape、格式或输出类别数改变，同步更新 shared/app_model_shared.h；
+ * - 模型内部状态由导出代码管理，本模块只持有一份本地输入缓冲。
  */
 
 static TaskHandle_t model_inference_task_handle = NULL;
 static app_model_inference_stats_t model_inference_stats;
-static uint8_t model_input_payload[APP_MODEL_AUDIO_FEATURE_MAX_BYTES];
+static float model_input_payload[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+static bool model_runtime_initialized;
 
 static bool app_model_inference_try_take_input(
     app_model_audio_feature_desc_t *desc,
-    uint8_t *payload,
-    uint16_t payload_capacity);
+    float *payload,
+    uint16_t payload_capacity_bytes);
 static bool app_model_inference_desc_is_valid(
     const app_model_audio_feature_desc_t *desc);
 static app_model_inference_status_t app_model_inference_run_model(
     const app_model_audio_feature_desc_t *desc,
-    const uint8_t *payload,
+    const float *payload,
     app_model_inference_result_t *result);
 static void app_model_inference_publish_result(
     const app_model_audio_feature_desc_t *desc,
     const app_model_inference_result_t *result,
     uint32_t inference_time_ms);
+static float app_model_inference_softmax_cough_prob(float output0,
+                                                    float output1);
 static uint32_t app_model_inference_now_ms(void);
 
 cy_rslt_t app_model_inference_task_init(void)
@@ -57,6 +64,13 @@ cy_rslt_t app_model_inference_task_init(void)
 void app_model_inference_task(void *pvParameters)
 {
     (void)pvParameters;
+
+#if (APP_MODEL_SMOKE_TEST_ENABLE)
+    /* 第一阶段 baseline：先用 PC 生成的 Log-Mel 测试向量直接跑 AUDIO_compute()。
+     * 该测试不依赖实时 MIC 前处理，便于确认模型代码、ML runtime 和 CM55 链路已经部署成功。
+     */
+    (void)app_model_smoke_run_once();
+#endif
 
     for (;;)
     {
@@ -102,8 +116,8 @@ void app_model_inference_get_stats(app_model_inference_stats_t *stats)
 
 static bool app_model_inference_try_take_input(
     app_model_audio_feature_desc_t *desc,
-    uint8_t *payload,
-    uint16_t payload_capacity)
+    float *payload,
+    uint16_t payload_capacity_bytes)
 {
     volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
     uint16_t payload_bytes;
@@ -130,7 +144,7 @@ static bool app_model_inference_try_take_input(
     payload_bytes = desc->payload_bytes;
 
     if (!app_model_inference_desc_is_valid(desc) ||
-        (payload_capacity < payload_bytes))
+        (payload_capacity_bytes < payload_bytes))
     {
         app_model_inference_result_t result;
 
@@ -147,7 +161,8 @@ static bool app_model_inference_try_take_input(
         return false;
     }
 
-    memcpy(payload, (const void *)&shared->audio_payload[0], payload_bytes);
+    memcpy((void *)payload, (const void *)&shared->audio_payload[0],
+           payload_bytes);
 
     /* 已经复制到 CM55 本地缓冲后立即释放输入槽。
      * 这样 CM33 可以继续发布下一帧，真正模型推理耗时不会阻塞前处理写入。
@@ -171,16 +186,15 @@ static bool app_model_inference_desc_is_valid(
         return false;
     }
 
-    if ((0u == desc->mel_bin_count) ||
-        (APP_MODEL_AUDIO_FEATURE_MAX_MEL_BINS < desc->mel_bin_count) ||
-        (0u == desc->time_bin_count) ||
-        (APP_MODEL_AUDIO_FEATURE_MAX_TIME_BINS < desc->time_bin_count))
+    if ((APP_MODEL_AUDIO_MODEL_MEL_BINS != desc->mel_bin_count) ||
+        (APP_MODEL_AUDIO_MODEL_TIME_BINS != desc->time_bin_count))
     {
         return false;
     }
 
     expected_payload_bytes = (uint32_t)desc->mel_bin_count *
-                             (uint32_t)desc->time_bin_count;
+                             (uint32_t)desc->time_bin_count *
+                             (uint32_t)sizeof(float);
     if ((0u == expected_payload_bytes) ||
         (APP_MODEL_AUDIO_FEATURE_MAX_BYTES < expected_payload_bytes) ||
         (desc->payload_bytes != expected_payload_bytes))
@@ -188,13 +202,9 @@ static bool app_model_inference_desc_is_valid(
         return false;
     }
 
-    if ((APP_MODEL_AUDIO_QUANT_INT8 != desc->quant_type) &&
-        (APP_MODEL_AUDIO_QUANT_UINT8 != desc->quant_type))
-    {
-        return false;
-    }
-
-    if (0.0f >= desc->quant_scale)
+    if ((APP_MODEL_AUDIO_QUANT_FLOAT32 != desc->quant_type) ||
+        (0 != desc->quant_zero_point) ||
+        (0.0f >= desc->quant_scale))
     {
         return false;
     }
@@ -213,29 +223,49 @@ static bool app_model_inference_desc_is_valid(
 
 static app_model_inference_status_t app_model_inference_run_model(
     const app_model_audio_feature_desc_t *desc,
-    const uint8_t *payload,
+    const float *payload,
     app_model_inference_result_t *result)
 {
-    /* 占位推理入口。
-     * 正式接入模型时，把 payload 按 desc->quant_type 解释为 int8_t 或 uint8_t，
-     * shape 为 [mel_bin_count, time_bin_count]，再送入模型输入 tensor。
+    /* 正式 MIC 推理入口。
      *
-     * 推荐后续在这里拆出几个明确步骤：
-     * 1. 模型初始化：加载模型、分配/绑定 tensor arena、解析输入输出 tensor；
-     * 2. 输入校验：确认 desc 中的 mel/time/quant 参数和训练模型完全一致；
-     * 3. 输入填充：把 payload 复制到模型输入 tensor，必要时按模型要求转置；
-     * 4. 推理执行：调用 NNLite/TFLM/其它运行时；
-     * 5. 输出后处理：把类别数、分数和状态填入 app_model_inference_result_t。
-     *
-     * 这里不伪造分类结果，避免业务层误以为已经有可用模型输出。
+     * CM33 已经把 1 s MIC 窗口转换成和 PC 测试向量一致的 NCHW 展平 float32：
+     * payload[mel * 101 + time]。这里不再做反量化或额外转置，直接送入
+     * 已验证过的 AUDIO_compute()。
      */
-    (void)payload;
+    float output[AUDIO_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+
+    if ((NULL == desc) || (NULL == payload) || (NULL == result))
+    {
+        return APP_MODEL_INFERENCE_STATUS_INVALID_INPUT;
+    }
+
+    if (!model_runtime_initialized)
+    {
+        if (AUDIO_RET_SUCCESS != AUDIO_init())
+        {
+            return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
+        }
+        model_runtime_initialized = true;
+    }
+
+    if (AUDIO_RET_SUCCESS != AUDIO_soft_reset())
+    {
+        return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
+    }
+
+    AUDIO_compute(payload, output);
 
     result->input_sequence = desc->sequence;
     result->timestamp_ms = app_model_inference_now_ms();
-    result->class_count = 0u;
+    result->class_count = AUDIO_DATA_OUT_COUNT;
+    result->scores[0] = output[0];
+    result->scores[1] = output[1];
+    result->scores[2] =
+        app_model_inference_softmax_cough_prob(output[0], output[1]);
+    result->scores[3] = desc->energy;
+    result->scores[4] = (float)desc->selected_channel;
 
-    return APP_MODEL_INFERENCE_STATUS_MODEL_NOT_READY;
+    return APP_MODEL_INFERENCE_STATUS_OK;
 }
 
 static void app_model_inference_publish_result(
@@ -259,6 +289,17 @@ static void app_model_inference_publish_result(
     __DMB();
     shared->result_state = APP_MODEL_SHARED_RESULT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+}
+
+static float app_model_inference_softmax_cough_prob(float output0,
+                                                    float output1)
+{
+    float max_logit = (output0 > output1) ? output0 : output1;
+    float exp0 = expf(output0 - max_logit);
+    float exp1 = expf(output1 - max_logit);
+    float denom = exp0 + exp1;
+
+    return (0.0f < denom) ? (exp1 / denom) : 0.0f;
 }
 
 static uint32_t app_model_inference_now_ms(void)

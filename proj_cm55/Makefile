@@ -53,7 +53,7 @@ VERBOSE=
 # ... then code in directories named COMPONENT_foo and COMPONENT_bar will be
 # added to the build
 #
-COMPONENTS+=FREERTOS
+COMPONENTS+=FREERTOS ML_TFLM ML_FLOAT32 U55
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
 DISABLE_COMPONENTS=
@@ -65,14 +65,20 @@ CORE_NAME=CM55_0
 # tree for source code and builds it. The SOURCES variable can be used to
 # manually add source code to the build process from a location not searched
 # by default, or otherwise not found by the build system.
-SOURCES+=
+SOURCES+=model/audio_model_v2_float.c
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES+=../shared
+INCLUDES+=../shared model
 
 # Add additional defines to the build process (without a leading -D).
 DEFINES+=CY_RETARGET_IO_CONVERT_LF_TO_CRLF
+# TFLite Micro runtime 需要静态内存布局；模型为 float32 输入/输出，量化类型由
+# COMPONENTS+=ML_FLOAT32 选择。U55 组件用于让构建系统链接 CM55/U55 对应的 TFLM 库。
+DEFINES+=TF_LITE_STATIC_MEMORY
+# audio_model_v2_float.c 由工具生成，当前版本里有一个旧返回码名 IMAI_RET_ERROR。
+# 这里用编译宏做兼容，避免直接修改生成文件，后续重新导出模型时也更容易替换。
+DEFINES+=IMAI_RET_ERROR=IPWIN_RET_ERROR
 
 # Select softfp or hardfp floating point. Default is softfp.
 VFP_SELECT+=
@@ -81,7 +87,7 @@ VFP_SELECT+=
 #
 # NOTE: Includes and defines should use the INCLUDES and DEFINES variable
 # above.
-CFLAGS+=
+CFLAGS+=-O3
 
 # Additional / custom C++ compiler flags.
 #
@@ -99,7 +105,7 @@ ASFLAGS+=
 LDFLAGS+=
 
 # Additional / custom libraries to link in to the application.
-LDLIBS+=
+LDLIBS+=-lm
 
 # Path to the linker script to use (if empty, use the default linker script).
 LINKER_SCRIPT=

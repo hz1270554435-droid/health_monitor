@@ -51,7 +51,22 @@
 static cy_stc_scb_uart_context_t    DEBUG_UART_context;  
 static mtb_hal_uart_t               DEBUG_UART_hal_obj;  
 
-#define DEBUG_UART_EXPORT_DIVIDER_VALUE    (4U)
+/* Debug UART 分频表。
+ *
+ * 这里的数值和 BSP 当前生成配置绑定：CYBSP_DEBUG_UART_config.oversample = 10，
+ * debug UART 的 peripheral clock root = 100 MHz。PSoC 的 divider 寄存器值比
+ * 实际分频小 1，因此：
+ * - 2 Mbps：100 MHz / 5 / 10 = 2000000，寄存器值为 4；
+ * - 115200：100 MHz / 87 / 10 = 114942.5，寄存器值为 86，误差约 -0.22%。
+ *
+ * 如果以后用 Device Configurator 改了 UART oversample 或 clock root，必须同步
+ * 重新计算这里的 divider，否则上位机会继续出现乱码。
+ */
+#define DEBUG_UART_115200_DIVIDER_VALUE    (86U)
+#define DEBUG_UART_2000000_DIVIDER_VALUE   (4U)
+
+/* 将应用层选择的固定波特率映射为硬件 divider 寄存器值。 */
+static uint32_t debug_uart_get_divider_value(uint32_t baud_rate);
 
 /* Retarget-io deepsleep callback parameters  */
 #if (CY_CFG_PWR_SYS_IDLE_MODE == CY_CFG_PWR_MODE_DEEPSLEEP)
@@ -99,22 +114,23 @@ static cy_stc_syspm_callback_t retarget_io_syspm_cb =
 * Function Name: init_retarget_io
 ********************************************************************************
 * Summary:
-* User defined function to initialize the debug UART. 
+*  初始化 debug UART，并把 printf/scanf 重定向到该串口。
 *
 * Parameters:
-*  void
+*  baud_rate - 只能传 RETARGET_IO_BAUD_115200 或 RETARGET_IO_BAUD_2000000。
+*              该参数由 main.c 根据运行模式统一选择。
 *
 * Return:
 *  void
 *
 *******************************************************************************/
-void init_retarget_io(void)
+void init_retarget_io(uint32_t baud_rate)
 {
     cy_rslt_t result = CY_RSLT_SUCCESS;
 
-    /* The secure image may have initialized the debug UART clock at the BSP
-     * default. Force the export baud here so programming only CM33_NS still
-     * leaves the PC capture rate and firmware rate matched.
+    /* 安全镜像或 BSP 可能已经按默认值初始化过 debug UART 时钟。
+     * 这里在 CM33_NS 侧按 main.c 传入的应用模式重新设置，避免采集模式和
+     * 普通日志模式的串口助手波特率不一致。
      */
     Cy_SysClk_PeriPclkDisableDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
                                      CYBSP_DEBUG_UART_CLK_DIV_HW,
@@ -122,39 +138,60 @@ void init_retarget_io(void)
     Cy_SysClk_PeriPclkSetDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
                                  CYBSP_DEBUG_UART_CLK_DIV_HW,
                                  CYBSP_DEBUG_UART_CLK_DIV_NUM,
-                                 DEBUG_UART_EXPORT_DIVIDER_VALUE);
+                                 debug_uart_get_divider_value(baud_rate));
     Cy_SysClk_PeriPclkEnableDivider((en_clk_dst_t)CYBSP_DEBUG_UART_CLK_DIV_GRP_NUM,
                                     CYBSP_DEBUG_UART_CLK_DIV_HW,
                                     CYBSP_DEBUG_UART_CLK_DIV_NUM);
 
-    /* Initialize the SCB UART */
+    /* 初始化 SCB UART 本体。波特率由上面的 divider 决定，数据位/校验/停止位仍使用
+     * BSP 生成的 CYBSP_DEBUG_UART_config，即 8N1。
+     */
     result = (cy_rslt_t)Cy_SCB_UART_Init(CYBSP_DEBUG_UART_HW, 
                                         &CYBSP_DEBUG_UART_config, 
                                         &DEBUG_UART_context);
     
-    /* UART initialization failed. Stop program execution. */
+    /* UART 初始化失败时停机，避免后续调试日志看似正常但实际没有串口输出。 */
     handle_app_error(result);
 
-    /* Enable the SCB UART */
+    /* 使能 SCB UART。 */
     Cy_SCB_UART_Enable(CYBSP_DEBUG_UART_HW);
 
     result = mtb_hal_uart_setup(&DEBUG_UART_hal_obj, 
                                 &CYBSP_DEBUG_UART_hal_config, 
                                 &DEBUG_UART_context, NULL);
     
-    /* UART setup failed. Stop program execution. */
+    /* HAL UART 绑定失败时停机，避免 retarget-io 挂到无效 UART 对象。 */
     handle_app_error(result);
 
-    /* Initialize retarget-io to use the debug UART port. */
+    /* 初始化 retarget-io，使 printf/scanf 走 debug UART。 */
     result = cy_retarget_io_init(&DEBUG_UART_hal_obj);
 
-    /* retarget-io initialization failed. Stop program execution. */
+    /* retarget-io 初始化失败时停机，避免后续 printf 输出丢失且难以定位。 */
     handle_app_error(result);
 
 #if (CY_CFG_PWR_SYS_IDLE_MODE == CY_CFG_PWR_MODE_DEEPSLEEP)
-    /* UART SysPm callback registration for retarget-io */
+    /* 低功耗模式下注册 UART SysPm 回调，保证 deepsleep 进出时串口状态一致。 */
     Cy_SysPm_RegisterCallback(&retarget_io_syspm_cb);
 #endif /* (CY_CFG_PWR_SYS_IDLE_MODE == CY_CFG_PWR_MODE_DEEPSLEEP) */
+}
+
+static uint32_t debug_uart_get_divider_value(uint32_t baud_rate)
+{
+    /* 只接受头文件公开的两个固定速率。若传入其它值，说明 main.c 或编译宏配置
+     * 已经越过了当前已校准范围，直接停机比使用错误波特率输出乱码更容易定位。
+     */
+    switch (baud_rate)
+    {
+        case RETARGET_IO_BAUD_115200:
+            return DEBUG_UART_115200_DIVIDER_VALUE;
+
+        case RETARGET_IO_BAUD_2000000:
+            return DEBUG_UART_2000000_DIVIDER_VALUE;
+
+        default:
+            handle_app_error(CY_RSLT_TYPE_ERROR);
+            return DEBUG_UART_115200_DIVIDER_VALUE;
+    }
 }
 
 /* [] END OF FILE */

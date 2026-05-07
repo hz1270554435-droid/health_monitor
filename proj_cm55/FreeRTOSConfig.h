@@ -58,7 +58,7 @@ extern uint32_t SystemCoreClock;
 /* 当前 CM55 任务都用 xTaskCreate 动态创建，先关闭 static allocation，避免必须实现
  * vApplicationGetIdleTaskMemory/vApplicationGetTimerTaskMemory 钩子。
  */
-#define configSUPPORT_STATIC_ALLOCATION         0
+#define configSUPPORT_STATIC_ALLOCATION         1
 #define configSUPPORT_DYNAMIC_ALLOCATION        1
 #define configTOTAL_HEAP_SIZE                   ((size_t )(32 * 1024))
 #define configAPPLICATION_ALLOCATED_HEAP        0

@@ -8,8 +8,8 @@
 * 2. 按配置执行双通道选优、平均、单通道选择或固定延时求和；
 * 3. 得到 16 kHz 单声道 PCM，并写入 1 s 环形缓冲；
 * 4. 按 50% overlap 或其它配置步长取窗口；
-* 5. 执行去直流、归一化、能量门限、分帧、加窗、Mel、log、特征归一化；
-* 6. 量化成 int8/uint8，并只把处理好的模型输入写入 CM33/CM55 共享内存。
+* 5. 执行去直流、归一化、能量门限、分帧、加窗、Mel、power_to_db、特征归一化；
+* 6. 按真实模型要求输出 float32[40,101]，并只把处理好的模型输入写入共享内存。
 *
 * 注意：app_get_data 只保留测试/导出用途；正式业务不要让它和本任务同时
 * 消费 app_pdm_pcm 的同一个队列。
@@ -40,7 +40,7 @@ extern "C" {
  * 本地工作缓冲和 shared/app_model_shared.h 中的 CM55 输入协议。
  */
 #define APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES     (16000u)
-#define APP_AUDIO_PREPROCESS_MAX_FFT_SIZE           (512u)
+#define APP_AUDIO_PREPROCESS_MAX_FFT_SIZE           (1024u)
 #define APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS      ((APP_AUDIO_PREPROCESS_MAX_FFT_SIZE / 2u) + 1u)
 #define APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES      (APP_AUDIO_PREPROCESS_MAX_FFT_SIZE)
 #define APP_AUDIO_PREPROCESS_MAX_DELAY_SAMPLES      (256u)
@@ -48,15 +48,15 @@ extern "C" {
 /* 默认运行参数。
  * 这些宏只是“出厂默认值”，不是算法写死参数。实际项目中应保持训练脚本、
  * CM33 前处理、CM55 模型输入三处参数一致；如果训练时改了窗口长度、Mel bin
- * 数或量化参数，应优先改这里或在启动前调用 app_audio_preprocess_configure()。
+ * 数或输入 payload 类型，应优先改这里或在启动前调用 app_audio_preprocess_configure()。
  */
 #define APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS      (1000u)
 #define APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS  (500u)
-#define APP_AUDIO_PREPROCESS_DEFAULT_FRAME_LEN_MS   (25u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FRAME_LEN_MS   (64u)
 #define APP_AUDIO_PREPROCESS_DEFAULT_FRAME_HOP_MS   (10u)
-#define APP_AUDIO_PREPROCESS_DEFAULT_FFT_SIZE       (512u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FFT_SIZE       (1024u)
 #define APP_AUDIO_PREPROCESS_DEFAULT_MEL_BINS       (40u)
-#define APP_AUDIO_PREPROCESS_DEFAULT_MEL_LOW_HZ     (20.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_MEL_LOW_HZ     (50.0f)
 #define APP_AUDIO_PREPROCESS_DEFAULT_MEL_HIGH_HZ    (7600.0f)
 #define APP_AUDIO_PREPROCESS_DEFAULT_ENERGY_GATE    (0.000001f)
 #define APP_AUDIO_PREPROCESS_DEFAULT_TARGET_RMS     (0.10f)
@@ -133,14 +133,17 @@ typedef struct
     float normalize_max_gain;
 
     /* log-mel 后处理参数。
-     * 前处理顺序为 log(mel_energy + log_epsilon)，再做
-     * (logmel - feature_mean) / feature_std。feature_mean/std 后续应填训练集统计值。
+     * 当前真实模型训练端使用 librosa.power_to_db(ref=np.max)，然后对每个 40x101
+     * 特征图单独做 (feature - mean) / (std + 1e-6)。因此第一版 MIC demo 中
+     * feature_mean/std 只保留为兼容字段，正式输出不会使用固定全局均值和方差。
      */
     float log_epsilon;
     float feature_mean;
     float feature_std;
 
-    /* 量化参数。CM33 按这里量化，CM55 模型输入解释必须使用同一套参数。 */
+    /* payload 类型参数。当前真实模型使用 APP_MODEL_AUDIO_QUANT_FLOAT32；
+     * 旧量化字段先保留，便于后续如果换成 int8 模型时复用同一配置结构。
+     */
     app_model_audio_quant_type_t quant_type;
     float quant_scale;
     int32_t quant_zero_point;
