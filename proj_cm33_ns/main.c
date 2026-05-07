@@ -40,6 +40,8 @@
 
 #include "app_pdm_pcm.h"
 #include "app_get_data.h"
+#include "app_audio_preprocess.h"
+#include "app_model_result_monitor.h"
 #include "app_uart_radar.h"
 #include "app_csv_export.h"
 #include "retarget_io_init.h"
@@ -52,6 +54,45 @@
 #define CM55_APP_BOOT_ADDR                (CYMEM_CM33_0_m55_nvm_START + \
                                            CYBSP_MCUBOOT_HEADER_SIZE)
 
+/* 应用运行模式。
+ *
+ * 注意：app_pdm_pcm 内部只有一个 PDM block 队列。CSV 导出、MIC 自检和正式
+ * 音频前处理都属于这个队列的“消费者”，同一时间只能启用其中一个，否则同一个
+ * PCM block 会被其中一个任务抢走，另一个任务就会看到不连续数据。
+ *
+ * 默认使用正式业务链路：CM33 做音频输入前处理，把处理好的量化特征写入
+ * m33_m55_shared，后续由 CM55 推理任务读取。需要采集训练数据时，把
+ * APP_RUNTIME_MODE 改成 APP_RUNTIME_MODE_CSV_EXPORT；需要只看 MIC 数据质量时，
+ * 改成 APP_RUNTIME_MODE_MIC_SELF_TEST。
+ */
+#define APP_RUNTIME_MODE_AUDIO_PREPROCESS (0u)
+#define APP_RUNTIME_MODE_CSV_EXPORT       (1u)
+#define APP_RUNTIME_MODE_MIC_SELF_TEST    (2u)
+
+#ifndef APP_RUNTIME_MODE
+#define APP_RUNTIME_MODE                  APP_RUNTIME_MODE_AUDIO_PREPROCESS
+#endif
+
+/* CM55 结果观察开关。
+ * 0：默认正式业务模式，不打印 CM55 结果，避免 debug UART 对实时链路产生干扰；
+ * 1：在正式音频前处理模式下额外启动结果观察任务，只读共享内存 result 区。
+ * 该任务不消费 PDM 队列，因此不会影响 app_audio_preprocess。
+ */
+#ifndef APP_MODEL_RESULT_MONITOR_ENABLE
+#define APP_MODEL_RESULT_MONITOR_ENABLE   (0u)
+#endif
+
+#if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
+     (APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) && \
+     (APP_RUNTIME_MODE != APP_RUNTIME_MODE_MIC_SELF_TEST))
+#error "Unsupported APP_RUNTIME_MODE"
+#endif
+
+#if ((APP_MODEL_RESULT_MONITOR_ENABLE != 0u) && \
+     (APP_MODEL_RESULT_MONITOR_ENABLE != 1u))
+#error "Unsupported APP_MODEL_RESULT_MONITOR_ENABLE"
+#endif
+
 int main(void)
 {
     cy_rslt_t result;
@@ -61,44 +102,72 @@ int main(void)
 
     __enable_irq();
 
-    /* Initialize retarget-io before any printf from FreeRTOS tasks. */
+    /* 初始化 debug UART 重定向。测试导出和自检任务会通过 printf 输出日志；
+     * 正式前处理任务默认不打印，但保留初始化不会影响业务链路。
+     */
     init_retarget_io();
 
-    /* Create the PDM/PCM capture task. It initializes the microphone stream
-     * after the scheduler starts and publishes 10 ms blocks for inference.
+    /* 创建 PDM/PCM 采集任务。
+     * 该任务只负责启动硬件并由 ISR 持续产出 10 ms 双通道 PCM block；
+     * 后续由下面按运行模式选择的唯一消费者取走这些 block。
      */
     result = app_pdm_pcm_task_init();
     handle_app_error(result);
 
-    /* Create the LD6002 radar UART task. It collects complete TF frames from
-     * SCB5 and publishes them as queued blocks for inference.
+#if ((APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT) || \
+     (APP_RUNTIME_MODE == APP_RUNTIME_MODE_MIC_SELF_TEST))
+    /* 测试/导出模式下启动雷达接收任务。
+     * CSV 导出会同时消费 MIC 和雷达队列；MIC 自检模式下也保留雷达自检入口，
+     * 方便单板联调两个传感器。正式音频前处理模式暂不启动雷达任务，避免无人
+     * 消费雷达队列时产生无意义背压。
      */
     result = app_uart_radar_task_init();
     handle_app_error(result);
+#endif
 
-#if (APP_CSV_EXPORT_ENABLE)
-    /* CSV export task consumes both PDM and radar queues and prints one
-     * tagged CSV stream through the debug UART.
+#if (APP_RUNTIME_MODE == APP_RUNTIME_MODE_AUDIO_PREPROCESS)
+    /* 正式业务模式：只创建一个音频输入前处理任务作为 PDM 队列消费者。
+     * 该任务完成双通道转单声道、滑窗、log-mel、归一化和量化，然后把特征
+     * 写入 CM33/CM55 共享内存。不要在该模式下再启动 app_get_data 或
+     * app_csv_export，否则会抢同一个 PDM block 队列。
+     */
+    result = app_audio_preprocess_task_init();
+    handle_app_error(result);
+
+#if (APP_MODEL_RESULT_MONITOR_ENABLE)
+    /* 可选调试任务：观察 CM55 写回的 result 区。
+     * 它不读取 audio_payload，不消费 PDM block，只适合联调阶段确认 CM55 是否已
+     * 消费特征并运行到模型入口。默认关闭。
+     */
+    result = app_model_result_monitor_task_init();
+    handle_app_error(result);
+#endif
+#elif (APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT)
+    /* 训练/采集数据模式：CSV 导出任务同时消费 MIC 和雷达队列，并通过 debug UART
+     * 输出带 device 标签的数据流。该模式用于 PC 端采集，不运行正式前处理任务。
      */
     result = app_csv_export_task_init();
     handle_app_error(result);
-#else
+#elif (APP_RUNTIME_MODE == APP_RUNTIME_MODE_MIC_SELF_TEST)
 #if (APP_UART_RADAR_TEST_ENABLE)
-    /* Radar self-test task. It consumes only the radar frame queue and prints
-     * summaries through the debug UART, not through SCB5.
+    /* 雷达自检任务只消费雷达队列，并通过 debug UART 打印摘要。
+     * 它不会消费 PDM 队列，因此可以和下面的 MIC 自检任务并行。
      */
     result = app_uart_radar_test_task_init();
     handle_app_error(result);
 #endif
 
-    /* Temporary self-test task. Replace this when the real inference task
-     * consumes the PDM/radar queues directly.
+    /* MIC 自检任务只消费 PDM 队列，用于观察 block 连续性、幅值、均值等采集质量。
+     * 它是测试任务，不属于正式业务前处理链路。
      */
-    result = inference_task_init();
+    result = app_get_data_test_task_init();
     handle_app_error(result);
 #endif
 
-    /* Enable CM55. Keep this if the multi-core project still uses the CM55 app. */
+    /* 启动 CM55。
+     * CM55 侧模型推理任务会读取 app_audio_preprocess 写入的共享内存特征。
+     * 测试/导出模式下 CM33 不发布正式特征，CM55 任务会保持轮询等待。
+     */
     Cy_SysEnableCM55(MXCM55, CM55_APP_BOOT_ADDR, CM55_BOOT_WAIT_TIME_USEC);
 
     vTaskStartScheduler();

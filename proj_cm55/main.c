@@ -43,6 +43,10 @@
 *******************************************************************************/
 
 #include "cybsp.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include "app_model_inference.h"
 
 /*******************************************************************************
 * Function Name: main
@@ -50,8 +54,8 @@
 * Summary:
 * This is the main function for CM55 application. 
 * 
-* CM33 application enables the CM55 CPU and then the CM55 CPU enters 
-* deep sleep.
+* CM33 application enables the CM55 CPU. CM55 then starts a FreeRTOS task
+* that reads prepared model input from shared memory.
 * 
 * Parameters:
 *  void
@@ -76,10 +80,17 @@ int main(void)
     /* Enable global interrupts */
     __enable_irq();
 
-    /* Put the CPU to Deep Sleep */
+    result = app_model_inference_task_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        CY_ASSERT(0);
+    }
+
+    vTaskStartScheduler();
+    CY_ASSERT(0);
+
     for (;;)
     {
-        Cy_SysPm_CpuEnterDeepSleep(CY_SYSPM_WAIT_FOR_INTERRUPT);
     }
 }
 

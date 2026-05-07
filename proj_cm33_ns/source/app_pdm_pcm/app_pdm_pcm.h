@@ -160,8 +160,9 @@ typedef struct
     uint32_t dropped_count;
 } app_pdm_pcm_block_t;
 
-/* 共享内存中的 PCM 环形缓冲区。
+/* CM33 本地 PCM 环形缓冲区。
  * 每一行是一个完整 10 ms 双声道块；数据所有权由 block 描述符和 release 接口管理。
+ * 该原始采集缓冲区不放入 CM33/CM55 共享内存，避免干扰正式模型输入池。
  */
 extern int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES];
 

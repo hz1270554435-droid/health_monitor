@@ -1,8 +1,12 @@
-/******************************************************************************
+/*******************************************************************************
 * File Name : app_get_data.h
 *
-* Description : Header file for GET DATA containing function prototypes.
-********************************************************************************/
+* Description : PDM/PCM 采集链路测试接口。
+*
+* 本模块只用于 MIC 数据自检：从 app_pdm_pcm 的 PDM block 队列取数，检查序号、
+* 幅值和 block 描述符是否正常。它不是正式音频前处理任务，也不是 CM55 模型
+* 推理任务。正式业务链路请使用 app_audio_preprocess + CM55 app_model_inference。
+*******************************************************************************/
 
 #ifndef __APP_GET_DATA_H__
 #define __APP_GET_DATA_H__
@@ -25,8 +29,8 @@ extern "C" {
 /*******************************************************************************
 * Macros
 *******************************************************************************/
-#define APP_INFERENCE_TASK_STACK_SIZE       (1024u)
-#define APP_INFERENCE_TASK_PRIORITY         (APP_PDM_PCM_TASK_PRIORITY - 1u)
+#define APP_GET_DATA_TEST_TASK_STACK_SIZE       (1024u)
+#define APP_GET_DATA_TEST_TASK_PRIORITY         (APP_PDM_PCM_TASK_PRIORITY - 1u)
 
 /*******************************************************************************
 * Global Variables
@@ -35,10 +39,8 @@ extern "C" {
 /*******************************************************************************
 * Functions Prototypes
 *******************************************************************************/
-cy_rslt_t inference_task_init(void);
-void inference_task(void *pvParameters);
-void mic_data_test(void);
-
+cy_rslt_t app_get_data_test_task_init(void);
+void app_get_data_test_task(void *pvParameters);
 
 #ifdef __cplusplus
 }

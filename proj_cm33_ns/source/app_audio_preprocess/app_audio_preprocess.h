@@ -1,0 +1,189 @@
+/*******************************************************************************
+* File Name : app_audio_preprocess.h
+*
+* Description : CM33 音频输入信号前处理任务。
+*
+* 本任务只负责正式业务链路中的 MIC 输入前处理：
+* 1. 从 app_pdm_pcm 接收 10 ms 双通道 PCM block；
+* 2. 按配置执行双通道选优、平均、单通道选择或固定延时求和；
+* 3. 得到 16 kHz 单声道 PCM，并写入 1 s 环形缓冲；
+* 4. 按 50% overlap 或其它配置步长取窗口；
+* 5. 执行去直流、归一化、能量门限、分帧、加窗、Mel、log、特征归一化；
+* 6. 量化成 int8/uint8，并只把处理好的模型输入写入 CM33/CM55 共享内存。
+*
+* 注意：app_get_data 只保留测试/导出用途；正式业务不要让它和本任务同时
+* 消费 app_pdm_pcm 的同一个队列。
+*******************************************************************************/
+
+#ifndef __APP_AUDIO_PREPROCESS_H__
+#define __APP_AUDIO_PREPROCESS_H__
+
+#include <stdbool.h>
+#include <stdint.h>
+
+#include "cy_pdl.h"
+#include "mtb_hal.h"
+#include "cybsp.h"
+#include "FreeRTOS.h"
+#include "task.h"
+
+#include "app_pdm_pcm.h"
+#include "app_model_shared.h"
+
+#if defined(__cplusplus)
+extern "C" {
+#endif
+
+/* 静态工作缓冲上限。
+ * 运行时参数都可以通过 app_audio_preprocess_config_t 调整，但不能超过这些
+ * 上限；如果后续模型需要更大的窗口、FFT 或特征图，需要同时扩展这里的
+ * 本地工作缓冲和 shared/app_model_shared.h 中的 CM55 输入协议。
+ */
+#define APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES     (16000u)
+#define APP_AUDIO_PREPROCESS_MAX_FFT_SIZE           (512u)
+#define APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS      ((APP_AUDIO_PREPROCESS_MAX_FFT_SIZE / 2u) + 1u)
+#define APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES      (APP_AUDIO_PREPROCESS_MAX_FFT_SIZE)
+#define APP_AUDIO_PREPROCESS_MAX_DELAY_SAMPLES      (256u)
+
+/* 默认运行参数。
+ * 这些宏只是“出厂默认值”，不是算法写死参数。实际项目中应保持训练脚本、
+ * CM33 前处理、CM55 模型输入三处参数一致；如果训练时改了窗口长度、Mel bin
+ * 数或量化参数，应优先改这里或在启动前调用 app_audio_preprocess_configure()。
+ */
+#define APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS      (1000u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS  (500u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FRAME_LEN_MS   (25u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FRAME_HOP_MS   (10u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FFT_SIZE       (512u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_MEL_BINS       (40u)
+#define APP_AUDIO_PREPROCESS_DEFAULT_MEL_LOW_HZ     (20.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_MEL_HIGH_HZ    (7600.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_ENERGY_GATE    (0.000001f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_TARGET_RMS     (0.10f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_MAX_GAIN       (20.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_LOG_EPSILON    (0.000001f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_MEAN   (0.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_STD    (1.0f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_QUANT_SCALE    (0.03125f)
+#define APP_AUDIO_PREPROCESS_DEFAULT_QUANT_ZERO     (0)
+
+#define APP_AUDIO_PREPROCESS_TASK_STACK_SIZE        (4096u)
+#define APP_AUDIO_PREPROCESS_TASK_PRIORITY          (APP_PDM_PCM_TASK_PRIORITY - 1u)
+#define APP_AUDIO_PREPROCESS_SELECTED_MIXED         (0xFFu)
+
+typedef enum
+{
+    /* 只取左 MIC。用于调试单通道质量或模型明确只吃左路时。 */
+    APP_AUDIO_CHANNEL_MIX_LEFT = 0,
+    /* 只取右 MIC。用于调试单通道质量或模型明确只吃右路时。 */
+    APP_AUDIO_CHANNEL_MIX_RIGHT,
+    /* 左右 MIC 直接平均，适合两路相位和延时差异较小时。 */
+    APP_AUDIO_CHANNEL_MIX_AVERAGE,
+    /* 按短时能量选择当前 block 中能量更高的一路，适合简单抗遮挡/抗弱信号。 */
+    APP_AUDIO_CHANNEL_MIX_SELECT_BEST,
+    /* 固定延时求和。fixed_delay_samples 用于补偿两个 MIC 的固定采样延时。 */
+    APP_AUDIO_CHANNEL_MIX_DELAY_SUM
+} app_audio_channel_mix_mode_t;
+
+typedef enum
+{
+    /* Hann 窗，语音 log-mel 的常用选择。 */
+    APP_AUDIO_WINDOW_HANN = 0,
+    /* Hamming 窗，旁瓣抑制略有不同，保留给后续实验。 */
+    APP_AUDIO_WINDOW_HAMMING,
+    /* 矩形窗，只建议用于排查或和外部工具对齐。 */
+    APP_AUDIO_WINDOW_RECTANGULAR
+} app_audio_window_function_t;
+
+typedef struct
+{
+    /* 采样率。当前必须与 app_pdm_pcm 的 SAMPLE_RATE_HZ 一致，除非底层采集也同步改。 */
+    uint32_t sample_rate_hz;
+
+    /* 模型输入窗口长度和窗口步长。默认 1000 ms 窗口、500 ms hop，即 50% 重叠。 */
+    uint16_t window_ms;
+    uint16_t window_hop_ms;
+
+    /* STFT 分帧参数。frame_len_ms 是每一帧的时间长度，frame_hop_ms 是相邻帧步长。
+     * fft_size 必须不小于 frame_len_samples，且不能超过 APP_AUDIO_PREPROCESS_MAX_FFT_SIZE。
+     */
+    uint16_t frame_len_ms;
+    uint16_t frame_hop_ms;
+    uint16_t fft_size;
+    app_audio_window_function_t window_function;
+
+    /* Mel 滤波器组参数。mel_high_hz 通常不超过 sample_rate_hz / 2。 */
+    uint16_t mel_bin_count;
+    float mel_low_hz;
+    float mel_high_hz;
+
+    /* 双通道转单声道策略。
+     * fixed_delay_samples 仅在 APP_AUDIO_CHANNEL_MIX_DELAY_SUM 下生效：
+     * 大于 0 表示右声道延后参与求和，小于 0 表示左声道延后参与求和。
+     */
+    app_audio_channel_mix_mode_t channel_mix_mode;
+    int16_t fixed_delay_samples;
+
+    /* 特征提取前的信号整形参数。
+     * energy_gate_threshold 使用“去直流后、RMS 归一化前”的平均能量；
+     * normalize_target_rms 是目标 RMS，normalize_max_gain 限制静音附近被过度放大。
+     */
+    float energy_gate_threshold;
+    float normalize_target_rms;
+    float normalize_max_gain;
+
+    /* log-mel 后处理参数。
+     * 前处理顺序为 log(mel_energy + log_epsilon)，再做
+     * (logmel - feature_mean) / feature_std。feature_mean/std 后续应填训练集统计值。
+     */
+    float log_epsilon;
+    float feature_mean;
+    float feature_std;
+
+    /* 量化参数。CM33 按这里量化，CM55 模型输入解释必须使用同一套参数。 */
+    app_model_audio_quant_type_t quant_type;
+    float quant_scale;
+    int32_t quant_zero_point;
+} app_audio_preprocess_config_t;
+
+typedef struct
+{
+    /* 从 PDM/PCM 队列成功收到的 10 ms block 数。 */
+    uint32_t blocks_received;
+    /* 描述符或 block 内容校验失败次数。 */
+    uint32_t invalid_blocks;
+    /* block sequence 不连续次数，用于观察是否发生丢块。 */
+    uint32_t sequence_gaps;
+    /* 已经凑够 1 个滑动窗口的次数。 */
+    uint32_t windows_ready;
+    /* 因能量低于门限而没有发布给 CM55 的窗口数。 */
+    uint32_t windows_energy_gated;
+    /* 成功写入共享内存并标记 READY 的特征窗口数。 */
+    uint32_t windows_published;
+    /* CM55 尚未消费上一帧，导致本次特征无法发布的次数。 */
+    uint32_t shared_busy;
+    /* 最近处理到的 PDM block sequence。 */
+    uint32_t last_sequence;
+    /* 最近一个窗口去直流后的平均能量。 */
+    float last_energy;
+    /* 最近一次选中的通道：0=左，1=右，0xFF=混合模式。 */
+    uint8_t last_selected_channel;
+    /* last_sequence 是否已经有效。 */
+    bool has_last_sequence;
+} app_audio_preprocess_stats_t;
+
+cy_rslt_t app_audio_preprocess_task_init(void);
+void app_audio_preprocess_task(void *pvParameters);
+
+cy_rslt_t app_audio_preprocess_configure(
+    const app_audio_preprocess_config_t *config);
+const app_audio_preprocess_config_t *app_audio_preprocess_get_config(void);
+void app_audio_preprocess_get_default_config(
+    app_audio_preprocess_config_t *config);
+void app_audio_preprocess_get_stats(app_audio_preprocess_stats_t *stats);
+
+#if defined(__cplusplus)
+}
+#endif
+
+#endif /* __APP_AUDIO_PREPROCESS_H__ */

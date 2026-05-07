@@ -34,12 +34,11 @@ typedef enum
     APP_PDM_PCM_BLOCK_READY
 } app_pdm_pcm_block_state_t;
 
-/* 面向推理任务的 10 ms 双声道音频块环形缓冲区。
- * 该缓冲区放在共享 SoC 内存中，后续如果把推理放到 CM55，
- * 可以直接消费同一批 PCM 块，避免从 CM33 本地 SRAM 再复制一份。
+/* 面向消费者任务的 10 ms 双声道音频块环形缓冲区。
+ * 该缓冲区仅属于 CM33 采集链路；正式推理前处理任务会把处理好的
+ * 模型输入写入独立的 CM33/CM55 共享内存池。
  */
-int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES]
-    __attribute__((section(".cy_shared_socmem"))) = {0};
+int16_t recorded_data[APP_PDM_PCM_BLOCK_COUNT][APP_PDM_PCM_BLOCK_SAMPLES] = {0};
 
 /* 兼容旧调试逻辑的“当前写指针”和“当前 block 已写入长度”。
  * 新的推理链路不要直接依赖这两个变量，应该通过 app_pdm_pcm_receive_block()

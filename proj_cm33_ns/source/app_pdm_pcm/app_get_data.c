@@ -3,10 +3,15 @@
 #include <stdio.h>
 
 /*******************************************************************************
-* 全局变量
+* 本文件只保留 MIC 采集链路自检逻辑。
+*
+* app_get_data 会消费 app_pdm_pcm 的 PDM block 队列，因此只能在
+* APP_RUNTIME_MODE_MIC_SELF_TEST 下启动。正式业务模式下，PDM 队列由
+* app_audio_preprocess 消费；CM55 推理任务不会调用本文件。
 *******************************************************************************/
-static TaskHandle_t inference_task_handle = NULL;
+static TaskHandle_t app_get_data_test_task_handle = NULL;
 
+static void mic_data_test(void);
 static uint16_t mic_data_abs_i16(int16_t sample)
 {
     return (sample < 0) ? (uint16_t)(-(int32_t)sample) : (uint16_t)sample;
@@ -29,16 +34,21 @@ static uint16_t mic_data_abs_i16(int16_t sample)
 *  CY_RSLT_TYPE_ERROR - 任务创建失败
 *
 *******************************************************************************/
-cy_rslt_t inference_task_init(void)
+cy_rslt_t app_get_data_test_task_init(void)
 {
     BaseType_t ret;
 
-    ret = xTaskCreate(inference_task,
-                      "inference_task",
-                      APP_INFERENCE_TASK_STACK_SIZE,
+    if (NULL != app_get_data_test_task_handle)
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    ret = xTaskCreate(app_get_data_test_task,
+                      "mic_data_test",
+                      APP_GET_DATA_TEST_TASK_STACK_SIZE,
                       NULL,
-                      APP_INFERENCE_TASK_PRIORITY,
-                      &inference_task_handle);
+                      APP_GET_DATA_TEST_TASK_PRIORITY,
+                      &app_get_data_test_task_handle);
 
     return (pdPASS == ret) ? CY_RSLT_SUCCESS : CY_RSLT_TYPE_ERROR;
 }
@@ -52,14 +62,14 @@ cy_rslt_t inference_task_init(void)
 *  这条链路可以稳定工作。
 *
 *******************************************************************************/
-void inference_task(void *pvParameters)
+void app_get_data_test_task(void *pvParameters)
 {
     (void)pvParameters;
 
     mic_data_test();
 }
 
-void mic_data_test(void)
+static void mic_data_test(void)
 {
 
     app_pdm_pcm_block_t block;

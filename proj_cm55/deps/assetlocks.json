@@ -24,6 +24,10 @@
         "locked-commit": "release-v4.37.0"
     },
     {
+        "asset-name": "freertos",
+        "locked-commit": "release-v10.6.202"
+    },
+    {
         "asset-name": "mtb-dsl-pse8xxgp",
         "locked-commit": "release-v1.4.0"
     },
