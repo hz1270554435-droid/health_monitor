@@ -153,3 +153,41 @@ ehthumbs_vista.db
 
 #导出的数据
 log_csv/
+
+# Local capture and integration artifacts
+.codex_tmp/
+/mic.csv
+/radar.csv
+/sensor_export.csv
+/serial_raw.log
+/tools/log_csv/
+
+# Raw audio, radar dumps, and generated feature arrays
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+*.aac
+*.raw
+*.dat
+*.npy
+*.npz
+
+# Model binaries and training-side artifacts should stay out of firmware Git.
+# Reviewed generated C/H model sources are handled case-by-case.
+*.pt
+*.pth
+*.onnx
+*.tflite
+*.h5
+*.keras
+*.ckpt
+*.pb
+*.pkl
+*.joblib
+*.safetensors
+*.zip
+*.7z
+*.tar
+*.tar.gz
