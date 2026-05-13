@@ -3,8 +3,9 @@
 #include <math.h>
 #include <string.h>
 
+#include "app_audio_deployment_config.h"
 #include "app_model_smoke.h"
-#include "audio_model_v2_float.h"
+#include APP_AUDIO_ACTIVE_MODEL_HEADER
 
 /* 本文件是 CM55 侧模型任务框架。
  *
@@ -14,7 +15,7 @@
  * - 原始 PDM/PCM 永远不进入这块共享协议，避免采集数据和模型输入互相干扰。
  *
  * 当前模型接入点：
- * - AUDIO_compute() 输入必须是 PC/CM33 一致的 NCHW 展平 float[40 * 101]；
+ * - active model compute API 输入必须是 PC/CM33 一致的 NCHW 展平 float[40 * 101]；
  * - 如果模型输入 shape、格式或输出类别数改变，同步更新 shared/app_model_shared.h；
  * - 模型内部状态由导出代码管理，本模块只持有一份本地输入缓冲。
  */
@@ -66,7 +67,7 @@ void app_model_inference_task(void *pvParameters)
     (void)pvParameters;
 
 #if (APP_MODEL_SMOKE_TEST_ENABLE)
-    /* 第一阶段 baseline：先用 PC 生成的 Log-Mel 测试向量直接跑 AUDIO_compute()。
+    /* 第一阶段 baseline：先用 PC 生成的 Log-Mel 测试向量直接跑 active model API。
      * 该测试不依赖实时 MIC 前处理，便于确认模型代码、ML runtime 和 CM55 链路已经部署成功。
      */
     (void)app_model_smoke_run_once();
@@ -230,9 +231,9 @@ static app_model_inference_status_t app_model_inference_run_model(
      *
      * CM33 已经把 1 s MIC 窗口转换成和 PC 测试向量一致的 NCHW 展平 float32：
      * payload[mel * 101 + time]。这里不再做反量化或额外转置，直接送入
-     * 已验证过的 AUDIO_compute()。
+     * 已验证过的 active model compute API。
      */
-    float output[AUDIO_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+    float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
 
     if ((NULL == desc) || (NULL == payload) || (NULL == result))
     {
@@ -241,23 +242,23 @@ static app_model_inference_status_t app_model_inference_run_model(
 
     if (!model_runtime_initialized)
     {
-        if (AUDIO_RET_SUCCESS != AUDIO_init())
+        if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_INIT())
         {
             return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
         }
         model_runtime_initialized = true;
     }
 
-    if (AUDIO_RET_SUCCESS != AUDIO_soft_reset())
+    if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_SOFT_RESET())
     {
         return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
     }
 
-    AUDIO_compute(payload, output);
+    APP_AUDIO_ACTIVE_MODEL_COMPUTE(payload, output);
 
     result->input_sequence = desc->sequence;
     result->timestamp_ms = app_model_inference_now_ms();
-    result->class_count = AUDIO_DATA_OUT_COUNT;
+    result->class_count = APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT;
     result->scores[0] = output[0];
     result->scores[1] = output[1];
     result->scores[2] =

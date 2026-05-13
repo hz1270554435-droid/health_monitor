@@ -67,6 +67,9 @@ static volatile uint8_t write_block_index;
 static volatile uint16_t write_sample_index;
 static volatile uint32_t block_sequence;
 static volatile uint32_t dropped_block_count;
+static volatile uint32_t dropped_queue_full_count;
+static volatile uint32_t dropped_no_free_block_count;
+static volatile uint32_t dropped_capture_paused_count;
 static volatile uint32_t pdm_error_count;
 static volatile bool capture_paused;
 
@@ -154,6 +157,29 @@ uint32_t app_pdm_pcm_get_dropped_count(void)
     return dropped_block_count;
 }
 
+void app_pdm_pcm_get_stats(app_pdm_pcm_stats_t *stats)
+{
+    if (NULL == stats)
+    {
+        return;
+    }
+
+    taskENTER_CRITICAL();
+    stats->dropped_total = dropped_block_count;
+    stats->dropped_queue_full = dropped_queue_full_count;
+    stats->dropped_no_free_block = dropped_no_free_block_count;
+    stats->dropped_capture_paused = dropped_capture_paused_count;
+    stats->pdm_error_count = pdm_error_count;
+    stats->block_sequence = block_sequence;
+    stats->free_block_count = free_block_count;
+    stats->capture_paused = capture_paused;
+    taskEXIT_CRITICAL();
+
+    stats->queue_depth = (NULL != pdm_pcm_block_queue) ?
+                         (uint32_t)uxQueueMessagesWaiting(pdm_pcm_block_queue) :
+                         0u;
+}
+
 static void app_pdm_pcm_reset_stream_state(void)
 {
     /* 重新启动采集流时，把状态机恢复到“block0 正在写，其余 block 空闲”。
@@ -170,6 +196,9 @@ static void app_pdm_pcm_reset_stream_state(void)
     free_block_count = 0;
     block_sequence = 0;
     dropped_block_count = 0;
+    dropped_queue_full_count = 0;
+    dropped_no_free_block_count = 0;
+    dropped_capture_paused_count = 0;
     pdm_error_count = 0;
     capture_paused = false;
 
@@ -278,6 +307,7 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
          */
         block_state[completed_index] = APP_PDM_PCM_BLOCK_FREE;
         (void)app_pdm_pcm_push_free_block(completed_index);
+        dropped_queue_full_count++;
         dropped_block_count++;
     }
 
@@ -286,6 +316,7 @@ static void app_pdm_pcm_publish_block_from_isr(BaseType_t *higher_priority_task_
         /* 没有新的可写 block，说明消费者处理速度低于采集速度。
          * 后续 ISR 会清空硬件 FIFO 来保护系统实时性。
          */
+        dropped_no_free_block_count++;
         dropped_block_count++;
     }
 }
@@ -563,6 +594,7 @@ void pdm_interrupt_handler(void)
          */
         if (capture_paused && !app_pdm_pcm_claim_next_block_from_isr())
         {
+            dropped_capture_paused_count++;
             dropped_block_count++;
             app_pdm_pcm_discard_fifo_from_isr();
             Cy_PDM_PCM_Channel_ClearInterrupt(PDM0, RIGHT_CH_INDEX,

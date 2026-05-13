@@ -5,6 +5,10 @@
 
 #define APP_AUDIO_PREPROCESS_PI                 (3.14159265358979323846f)
 
+#ifndef APP_MODEL_RUNTIME_PROFILE_ENABLE
+#define APP_MODEL_RUNTIME_PROFILE_ENABLE        (0u)
+#endif
+
 /* 本文件是正式业务链路的唯一 MIC 输入前处理任务实现。
  *
  * 任务边界：
@@ -74,6 +78,10 @@ static bool app_audio_preprocess_condition_window(float *energy);
 static void app_audio_preprocess_power_spectrum(const float *frame);
 static float app_audio_preprocess_mel_energy(uint16_t mel_index);
 static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy);
+static bool app_audio_preprocess_uses_no_norm_frontend(void);
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+static void app_audio_preprocess_record_mel_time(uint32_t elapsed_ms);
+#endif
 static void app_audio_preprocess_init_shared_region(void);
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
@@ -83,6 +91,7 @@ static uint32_t app_audio_preprocess_ms_to_samples(uint32_t sample_rate_hz,
 static float app_audio_preprocess_hz_to_mel(float hz);
 static float app_audio_preprocess_mel_to_hz(float mel);
 static int16_t app_audio_preprocess_saturate_i16(int32_t value);
+static uint32_t app_audio_preprocess_now_ms(void);
 
 cy_rslt_t app_audio_preprocess_task_init(void)
 {
@@ -159,8 +168,7 @@ void app_audio_preprocess_task(void *pvParameters)
             audio_preprocess_stats.last_selected_channel = selected_channel;
             if (app_audio_preprocess_window_ready())
             {
-                uint32_t timestamp_ms =
-                    (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+                uint32_t timestamp_ms = app_audio_preprocess_now_ms();
 
                 audio_preprocess_stats.windows_ready++;
                 if (app_audio_preprocess_extract_and_publish(timestamp_ms,
@@ -233,6 +241,7 @@ void app_audio_preprocess_get_default_config(
     config->mel_high_hz = APP_AUDIO_PREPROCESS_DEFAULT_MEL_HIGH_HZ;
     config->channel_mix_mode = APP_AUDIO_CHANNEL_MIX_SELECT_BEST;
     config->fixed_delay_samples = 0;
+    config->frontend_profile = APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE;
     config->energy_gate_threshold = APP_AUDIO_PREPROCESS_DEFAULT_ENERGY_GATE;
     config->normalize_target_rms = APP_AUDIO_PREPROCESS_DEFAULT_TARGET_RMS;
     config->normalize_max_gain = APP_AUDIO_PREPROCESS_DEFAULT_MAX_GAIN;
@@ -276,6 +285,8 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
         (config->mel_low_hz >= config->mel_high_hz) ||
         (((float)config->sample_rate_hz * 0.5f) < config->mel_high_hz) ||
         (0.0f > config->energy_gate_threshold) ||
+        (((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE != config->frontend_profile) &&
+         ((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1 != config->frontend_profile)) ||
         (0.0f >= config->normalize_target_rms) ||
         (0.0f >= config->normalize_max_gain) ||
         (0.0f >= config->log_epsilon) ||
@@ -548,6 +559,9 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
      */
     float energy = 0.0f;
     float max_mel_energy = 0.0f;
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    uint32_t profile_start_ms = app_audio_preprocess_now_ms();
+#endif
 
     app_audio_preprocess_copy_ordered_window();
     if (!app_audio_preprocess_condition_window(&energy))
@@ -603,6 +617,10 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
     app_audio_preprocess_power_to_db_and_normalize(max_mel_energy);
 
     audio_preprocess_stats.last_energy = energy;
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    app_audio_preprocess_record_mel_time(
+        app_audio_preprocess_now_ms() - profile_start_ms);
+#endif
     return app_audio_preprocess_publish_feature(timestamp_ms,
                                                 selected_channel,
                                                 energy);
@@ -652,6 +670,11 @@ static bool app_audio_preprocess_condition_window(float *energy)
     if (*energy < audio_preprocess_config.energy_gate_threshold)
     {
         return false;
+    }
+
+    if (app_audio_preprocess_uses_no_norm_frontend())
+    {
+        return true;
     }
 
     rms = sqrtf(*energy);
@@ -744,7 +767,8 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
     /* 对齐训练端 src/audio/features.py:
      * 1. librosa.power_to_db(mel, ref=np.max)，最大能量对应 0 dB；
      * 2. 默认 top_db=80，因此低能量区域被截到 -80 dB；
-     * 3. 对当前 40x101 特征图做本窗口 mean/std 标准化。
+     * 3. v3 board_htk_no_norm_v1 到此为止，不做特征标准化；
+     * 4. v2 兼容 profile 才对当前 40x101 特征图做本窗口 mean/std 标准化。
      *
      * 注意：这里仍是第一版板端近似实现，Mel 滤波器细节后续还要和 PC 做逐点比对。
      */
@@ -776,6 +800,11 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
         square_sum += ((double)db * (double)db);
     }
 
+    if (app_audio_preprocess_uses_no_norm_frontend())
+    {
+        return;
+    }
+
     mean = (float)(sum / (double)element_count);
     std = (float)((square_sum / (double)element_count) -
                   ((double)mean * (double)mean));
@@ -792,6 +821,25 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
             (std + audio_preprocess_config.log_epsilon);
     }
 }
+
+static bool app_audio_preprocess_uses_no_norm_frontend(void)
+{
+    return ((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1 ==
+            audio_preprocess_config.frontend_profile);
+}
+
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+static void app_audio_preprocess_record_mel_time(uint32_t elapsed_ms)
+{
+    audio_preprocess_stats.last_mel_ms = elapsed_ms;
+    audio_preprocess_stats.mel_ms_total += elapsed_ms;
+    audio_preprocess_stats.mel_windows_profiled++;
+    if (audio_preprocess_stats.mel_ms_max < elapsed_ms)
+    {
+        audio_preprocess_stats.mel_ms_max = elapsed_ms;
+    }
+}
+#endif
 
 static void app_audio_preprocess_init_shared_region(void)
 {
@@ -854,6 +902,8 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
            model_input_feature,
            payload_bytes);
     shared->producer_sequence = desc.sequence;
+    audio_preprocess_stats.last_published_sequence = desc.sequence;
+    audio_preprocess_stats.last_published_timestamp_ms = timestamp_ms;
     shared->input_state = APP_MODEL_SHARED_INPUT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
 
@@ -887,4 +937,9 @@ static int16_t app_audio_preprocess_saturate_i16(int32_t value)
         return INT16_MIN;
     }
     return (int16_t)value;
+}
+
+static uint32_t app_audio_preprocess_now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }

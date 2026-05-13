@@ -61,6 +61,20 @@ typedef struct
     uint32_t result_writing;
     /* 最近一次看到的 CM55 result_sequence。 */
     uint32_t last_result_sequence;
+    /* 最近一次看到的输入序号。 */
+    uint32_t last_input_sequence;
+    /* OK 结果数量。 */
+    uint32_t ok_results;
+    /* INVALID_INPUT 结果数量。 */
+    uint32_t invalid_input_results;
+    /* MODEL_NOT_READY 结果数量。 */
+    uint32_t model_not_ready_results;
+    /* MODEL_ERROR 结果数量。 */
+    uint32_t model_error_results;
+    /* 已打印的 cough 事件数量。 */
+    uint32_t events_printed;
+    /* 最近一次日志 printf 耗时，单位 ms；profile 关闭时保持 0。 */
+    uint32_t last_log_ms;
     /* 最近一次结果状态，取 app_model_inference_status_t。 */
     uint8_t last_status;
     /* 是否已经看到过至少一个结果。 */

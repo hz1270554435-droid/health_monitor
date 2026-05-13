@@ -160,6 +160,28 @@ typedef struct
     uint32_t dropped_count;
 } app_pdm_pcm_block_t;
 
+typedef struct
+{
+    /* Total dropped 10 ms PCM blocks/fragments reported by this capture path. */
+    uint32_t dropped_total;
+    /* Queue was full or unavailable when an ISR tried to publish a completed block. */
+    uint32_t dropped_queue_full;
+    /* No free block was available after publishing a completed block. */
+    uint32_t dropped_no_free_block;
+    /* Capture was already paused and the ISR discarded another FIFO fragment. */
+    uint32_t dropped_capture_paused;
+    /* PDM hardware error interrupts observed. */
+    uint32_t pdm_error_count;
+    /* Latest produced 10 ms block sequence. */
+    uint32_t block_sequence;
+    /* Current queued block descriptors waiting for the consumer. */
+    uint32_t queue_depth;
+    /* Blocks currently available for ISR reuse. */
+    uint8_t free_block_count;
+    /* True while the ISR is discarding FIFO data due to capture backpressure. */
+    bool capture_paused;
+} app_pdm_pcm_stats_t;
+
 /* CM33 本地 PCM 环形缓冲区。
  * 每一行是一个完整 10 ms 双声道块；数据所有权由 block 描述符和 release 接口管理。
  * 该原始采集缓冲区不放入 CM33/CM55 共享内存，避免干扰正式模型输入池。
@@ -205,6 +227,9 @@ void app_pdm_pcm_release_block(uint8_t block_index);
 
 /* 因消费者释放不及时而被丢弃的音频块数量。 */
 uint32_t app_pdm_pcm_get_dropped_count(void);
+
+/* 获取采集背压和硬件错误细分计数。 */
+void app_pdm_pcm_get_stats(app_pdm_pcm_stats_t *stats);
 
 
 #ifdef __cplusplus

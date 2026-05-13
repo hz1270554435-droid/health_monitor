@@ -65,7 +65,24 @@ CORE_NAME=CM55_0
 # tree for source code and builds it. The SOURCES variable can be used to
 # manually add source code to the build process from a location not searched
 # by default, or otherwise not found by the build system.
-SOURCES+=model/audio_model_v2_float.c
+APP_AUDIO_MODEL_SELECT?=3
+APP_MODEL_SMOKE_TEST_ENABLE?=0
+APP_MODEL_RUNTIME_PROFILE_ENABLE?=0
+APP_MODEL_LOG_LEVEL?=1
+APP_MODEL_LOG_RATE_LIMIT_MS?=1000
+APP_MODEL_PRINT_FLOAT_ENABLE?=1
+ifeq ($(APP_AUDIO_MODEL_SELECT),3)
+CY_IGNORE+=model/audio_model_v2_float.c
+DEFINES+=APP_AUDIO_MODEL_SELECT=3
+else
+CY_IGNORE+=model/audio_model_v3_board_htk_hardneg_float.c
+DEFINES+=APP_AUDIO_MODEL_SELECT=2
+endif
+DEFINES+=APP_MODEL_SMOKE_TEST_ENABLE=$(APP_MODEL_SMOKE_TEST_ENABLE)
+DEFINES+=APP_MODEL_RUNTIME_PROFILE_ENABLE=$(APP_MODEL_RUNTIME_PROFILE_ENABLE)
+DEFINES+=APP_MODEL_LOG_LEVEL=$(APP_MODEL_LOG_LEVEL)
+DEFINES+=APP_MODEL_LOG_RATE_LIMIT_MS=$(APP_MODEL_LOG_RATE_LIMIT_MS)
+DEFINES+=APP_MODEL_PRINT_FLOAT_ENABLE=$(APP_MODEL_PRINT_FLOAT_ENABLE)
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).

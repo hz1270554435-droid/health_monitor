@@ -28,6 +28,7 @@
 #include "task.h"
 
 #include "app_pdm_pcm.h"
+#include "app_audio_deployment_config.h"
 #include "app_model_shared.h"
 
 #if defined(__cplusplus)
@@ -66,6 +67,19 @@ extern "C" {
 #define APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_STD    (1.0f)
 #define APP_AUDIO_PREPROCESS_DEFAULT_QUANT_SCALE    (0.03125f)
 #define APP_AUDIO_PREPROCESS_DEFAULT_QUANT_ZERO     (0)
+
+#define APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE              (0u)
+#define APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1   (1u)
+
+#ifndef APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_V3_BOARD_HTK_HARDNEG)
+#define APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE \
+    APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1
+#else
+#define APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE \
+    APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE
+#endif
+#endif
 
 #define APP_AUDIO_PREPROCESS_TASK_STACK_SIZE        (4096u)
 #define APP_AUDIO_PREPROCESS_TASK_PRIORITY          (APP_PDM_PCM_TASK_PRIORITY - 1u)
@@ -124,6 +138,13 @@ typedef struct
     app_audio_channel_mix_mode_t channel_mix_mode;
     int16_t fixed_delay_samples;
 
+    /* Frontend profile.
+     * v3 deployment uses BOARD_HTK_NO_NORM_V1: DC removal + energy gate,
+     * HTK log-mel, no RMS gain, no per-window feature z-score.
+     * v2 compatibility uses V2_ZSCORE: RMS gain + per-window feature z-score.
+     */
+    uint8_t frontend_profile;
+
     /* 特征提取前的信号整形参数。
      * energy_gate_threshold 使用“去直流后、RMS 归一化前”的平均能量；
      * normalize_target_rms 是目标 RMS，normalize_max_gain 限制静音附近被过度放大。
@@ -169,6 +190,18 @@ typedef struct
     uint32_t last_sequence;
     /* 最近一个窗口去直流后的平均能量。 */
     float last_energy;
+    /* 最近一次完整 Mel 特征提取耗时，单位 ms；profile 关闭时保持 0。 */
+    uint32_t last_mel_ms;
+    /* Mel 特征提取累计耗时，单位 ms；用于低频平均值。 */
+    uint32_t mel_ms_total;
+    /* Mel 特征提取最大耗时，单位 ms。 */
+    uint32_t mel_ms_max;
+    /* 已纳入 Mel 耗时统计的窗口数量。 */
+    uint32_t mel_windows_profiled;
+    /* 最近一次成功发布给 CM55 的 input sequence。 */
+    uint32_t last_published_sequence;
+    /* 最近一次成功发布给 CM55 的 CM33 时间戳，单位 ms。 */
+    uint32_t last_published_timestamp_ms;
     /* 最近一次选中的通道：0=左，1=右，0xFF=混合模式。 */
     uint8_t last_selected_channel;
     /* last_sequence 是否已经有效。 */

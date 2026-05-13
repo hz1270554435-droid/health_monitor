@@ -8,9 +8,10 @@
 #include "FreeRTOS.h"
 #include "task.h"
 
+#include "app_audio_deployment_config.h"
 #include "app_model_shared.h"
-#include "audio_model_v2_float.h"
-#include "audio_test_vectors.h"
+#include APP_AUDIO_ACTIVE_MODEL_HEADER
+#include APP_AUDIO_ACTIVE_TEST_VECTOR_HEADER
 
 #endif /* APP_MODEL_SMOKE_TEST_ENABLE */
 
@@ -21,7 +22,7 @@
  * D:\cough_model_train\health_monitor_ai\deploy\test_vectors\audio
  *
  * 注意：这里使用 PC 侧已经生成好的 Log-Mel float32 特征，目的是先验证模型部署
- * 和推理 API，而不是验证板端 PDM/PCM 前处理。
+ * 和 active model 推理 API，而不是验证板端 PDM/PCM 前处理。
  *
  * 当前样本组成：
  * - 5 条 PC 判定正确的 cough；
@@ -45,6 +46,7 @@ typedef struct
  * input_seq 1/2 冲突。否则 CM33 监控任务如果漏看某条 smoke，后续同序号的正式
  * MODEL_RESULT 也可能被当成“已打印过的结果”跳过。
  */
+#ifndef AUDIO_TEST_VECTOR_EXPECTED_COUNT
 static const app_model_smoke_expected_t app_model_smoke_expected[] =
 {
     {
@@ -132,6 +134,23 @@ static const app_model_smoke_expected_t app_model_smoke_expected[] =
         0.8610793352127075f
     }
 };
+#define APP_MODEL_SMOKE_EXPECTED_COUNT \
+    (sizeof(app_model_smoke_expected) / sizeof(app_model_smoke_expected[0]))
+#define APP_MODEL_SMOKE_EXPECTED_OUTPUT0(i) \
+    (app_model_smoke_expected[(i)].expected_output0)
+#define APP_MODEL_SMOKE_EXPECTED_OUTPUT1(i) \
+    (app_model_smoke_expected[(i)].expected_output1)
+#define APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i) \
+    (app_model_smoke_expected[(i)].expected_cough_prob)
+#else
+#define APP_MODEL_SMOKE_EXPECTED_COUNT AUDIO_TEST_VECTOR_EXPECTED_COUNT
+#define APP_MODEL_SMOKE_EXPECTED_OUTPUT0(i) \
+    (audio_test_vector_expected_output0[(i)])
+#define APP_MODEL_SMOKE_EXPECTED_OUTPUT1(i) \
+    (audio_test_vector_expected_output1[(i)])
+#define APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i) \
+    (audio_test_vector_expected_cough_prob[(i)])
+#endif
 
 static float app_model_smoke_softmax_cough_prob(float output0,
                                                 float output1);
@@ -152,21 +171,20 @@ bool app_model_smoke_run_once(void)
     bool all_passed = true;
     int init_ret;
 
-    if (AUDIO_TEST_VECTOR_COUNT !=
-        (sizeof(app_model_smoke_expected) / sizeof(app_model_smoke_expected[0])))
+    if (AUDIO_TEST_VECTOR_COUNT != APP_MODEL_SMOKE_EXPECTED_COUNT)
     {
         return false;
     }
 
-    init_ret = AUDIO_init();
-    if (AUDIO_RET_SUCCESS != init_ret)
+    init_ret = APP_AUDIO_ACTIVE_MODEL_INIT();
+    if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != init_ret)
     {
-        float empty_output[AUDIO_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+        float empty_output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
 
         app_model_smoke_publish_result(0u,
                                        empty_output,
                                        0.0f,
-                                       app_model_smoke_expected[0].expected_cough_prob,
+                                       APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(0u),
                                        0u,
                                        (uint8_t)APP_MODEL_INFERENCE_STATUS_INVALID_INPUT);
         return false;
@@ -174,21 +192,21 @@ bool app_model_smoke_run_once(void)
 
     for (uint32_t i = 0u; i < AUDIO_TEST_VECTOR_COUNT; i++)
     {
-        float output[AUDIO_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+        float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
         uint32_t start_ms;
         uint32_t elapsed_ms;
         float cough_prob;
         float diff;
 
-        (void)AUDIO_soft_reset();
+        (void)APP_AUDIO_ACTIVE_MODEL_SOFT_RESET();
 
         start_ms = app_model_smoke_now_ms();
-        AUDIO_compute(audio_test_vectors[i], output);
+        APP_AUDIO_ACTIVE_MODEL_COMPUTE(audio_test_vectors[i], output);
         elapsed_ms = app_model_smoke_now_ms() - start_ms;
 
         cough_prob = app_model_smoke_softmax_cough_prob(output[0], output[1]);
         diff = app_model_smoke_absf(cough_prob -
-                                    app_model_smoke_expected[i].expected_cough_prob);
+                                    APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i));
 
         if (0.01f < diff)
         {
@@ -198,7 +216,7 @@ bool app_model_smoke_run_once(void)
         app_model_smoke_publish_result(i,
                                        output,
                                        cough_prob,
-                                       app_model_smoke_expected[i].expected_cough_prob,
+                                       APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i),
                                        elapsed_ms,
                                        (uint8_t)APP_MODEL_INFERENCE_STATUS_OK);
 
@@ -258,8 +276,8 @@ static void app_model_smoke_publish_result(uint32_t sample_index,
     result.scores[0] = output[0];
     result.scores[1] = output[1];
     result.scores[2] = cough_prob;
-    result.scores[3] = app_model_smoke_expected[sample_index].expected_output0;
-    result.scores[4] = app_model_smoke_expected[sample_index].expected_output1;
+    result.scores[3] = APP_MODEL_SMOKE_EXPECTED_OUTPUT0(sample_index);
+    result.scores[4] = APP_MODEL_SMOKE_EXPECTED_OUTPUT1(sample_index);
     result.scores[5] = expected_cough_prob;
     result.scores[6] = app_model_smoke_absf(cough_prob - expected_cough_prob);
 
