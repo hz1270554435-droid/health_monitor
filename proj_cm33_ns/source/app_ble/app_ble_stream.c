@@ -1,0 +1,392 @@
+#include "app_ble_stream.h"
+
+#include <stdio.h>
+#include <string.h>
+
+#include "FreeRTOS.h"
+#include "queue.h"
+#include "task.h"
+
+#include "app_ble_cmd.h"
+#include "app_ble_config.h"
+#include "app_ble_diag.h"
+#include "app_ble_protocol.h"
+
+#if (APP_BLE_ENABLE)
+
+static QueueHandle_t ble_realtime_queue;
+static QueueHandle_t ble_event_queue;
+static TaskHandle_t ble_task_handle;
+
+static uint32_t fake_last_realtime_ms;
+static uint32_t fake_last_event_ms;
+static uint32_t stat_last_print_ms;
+static uint32_t fake_event_id;
+static bool fake_commands_done;
+
+static void app_ble_stream_task(void *pvParameters);
+static uint32_t app_ble_stream_now_ms(void);
+static uint32_t app_ble_stream_now_s(void);
+static void app_ble_stream_maybe_publish_fake(uint32_t now_ms);
+static void app_ble_stream_run_fake_commands_once(void);
+static void app_ble_stream_run_fake_command(const app_ble_command_t *cmd);
+static void app_ble_stream_make_time_sync_cmd(app_ble_command_t *cmd);
+static void app_ble_stream_print_stat(uint32_t now_ms);
+
+cy_rslt_t app_ble_stream_init(void)
+{
+    BaseType_t ret;
+
+    if (NULL != ble_task_handle)
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    app_ble_diag_reset();
+    app_ble_protocol_reset_sequences();
+
+    ble_realtime_queue = xQueueCreate(APP_BLE_REALTIME_QUEUE_DEPTH,
+                                      sizeof(app_ble_realtime_sample_t));
+    ble_event_queue = xQueueCreate(APP_BLE_EVENT_QUEUE_DEPTH,
+                                   sizeof(app_ble_event_t));
+    if ((NULL == ble_realtime_queue) || (NULL == ble_event_queue))
+    {
+        app_ble_diag_set_last_error(APP_BLE_ERR_QUEUE_FULL);
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    ret = xTaskCreate(app_ble_stream_task,
+                      "ble_stage1",
+                      APP_BLE_TASK_STACK_SIZE,
+                      NULL,
+                      APP_BLE_TASK_PRIORITY,
+                      &ble_task_handle);
+
+    return (pdPASS == ret) ? CY_RSLT_SUCCESS : CY_RSLT_TYPE_ERROR;
+}
+
+cy_rslt_t app_ble_publish_realtime(
+    const app_ble_realtime_sample_t *sample)
+{
+    app_ble_realtime_sample_t dropped;
+
+    if ((NULL == sample) || (NULL == ble_realtime_queue))
+    {
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    if (pdPASS == xQueueSend(ble_realtime_queue, sample, 0u))
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    if (pdPASS == xQueueReceive(ble_realtime_queue, &dropped, 0u))
+    {
+        app_ble_diag_note_realtime_drop();
+    }
+
+    if (pdPASS == xQueueSend(ble_realtime_queue, sample, 0u))
+    {
+        return CY_RSLT_SUCCESS;
+    }
+
+    app_ble_diag_note_realtime_drop();
+    return CY_RSLT_TYPE_ERROR;
+}
+
+cy_rslt_t app_ble_publish_event(const app_ble_event_t *event)
+{
+    if ((NULL == event) || (NULL == ble_event_queue))
+    {
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    if (pdPASS != xQueueSend(ble_event_queue, event, 0u))
+    {
+        app_ble_diag_note_event_drop();
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+    return CY_RSLT_SUCCESS;
+}
+
+void app_ble_stream_process(void)
+{
+    app_ble_realtime_sample_t sample;
+    app_ble_event_t event;
+    uint8_t frame[APP_BLE_CMD_RESPONSE_FRAME_MAX_LEN];
+    uint16_t frame_len = 0u;
+
+    while ((NULL != ble_event_queue) &&
+           (pdPASS == xQueueReceive(ble_event_queue, &event, 0u)))
+    {
+        if (CY_RSLT_SUCCESS == app_ble_pack_event(&event,
+                                                  frame,
+                                                  sizeof(frame),
+                                                  &frame_len))
+        {
+            app_ble_diag_note_notify_ok();
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+            printf("[BLE_FAKE] event seq=%u id=%lu type=%s conf=%u "
+                   "len=%u crc=0x%02x\r\n",
+                   (unsigned int)frame[3],
+                   (unsigned long)event.event_id,
+                   app_ble_event_type_name(event.event_type),
+                   (unsigned int)event.confidence,
+                   (unsigned int)frame_len,
+                   (unsigned int)frame[frame_len - 1u]);
+            printf("[BLE_EVENT] type=%s severity=%u conf=%u ts=%lu\r\n",
+                   app_ble_event_type_name(event.event_type),
+                   (unsigned int)event.severity,
+                   (unsigned int)event.confidence,
+                   (unsigned long)event.ts_s);
+#endif
+        }
+        else
+        {
+            app_ble_diag_note_notify_fail(APP_BLE_ERR_PACK_FAILED);
+        }
+    }
+
+    while ((NULL != ble_realtime_queue) &&
+           (pdPASS == xQueueReceive(ble_realtime_queue, &sample, 0u)))
+    {
+        if (CY_RSLT_SUCCESS == app_ble_pack_realtime(&sample,
+                                                     frame,
+                                                     sizeof(frame),
+                                                     &frame_len))
+        {
+            app_ble_diag_note_notify_ok();
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+            printf("[BLE_FAKE] realtime seq=%u rr=%u hr=%u state=%s "
+                   "len=%u crc=0x%02x\r\n",
+                   (unsigned int)frame[3],
+                   (unsigned int)sample.rr_bpm,
+                   (unsigned int)sample.hr_bpm,
+                   app_ble_fusion_state_name(sample.fusion_state),
+                   (unsigned int)frame_len,
+                   (unsigned int)frame[frame_len - 1u]);
+#endif
+        }
+        else
+        {
+            app_ble_diag_note_notify_fail(APP_BLE_ERR_PACK_FAILED);
+        }
+    }
+}
+
+static void app_ble_stream_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+    printf("[BLE_STAT] stage=1 enable=%u fake=%u stack=%u device=%s\r\n",
+           (unsigned int)APP_BLE_ENABLE,
+           (unsigned int)APP_BLE_FAKE_DATA_ENABLE,
+           (unsigned int)APP_BLE_STACK_ENABLE,
+           APP_BLE_DEVICE_NAME);
+#endif
+
+    for (;;)
+    {
+        uint32_t now_ms = app_ble_stream_now_ms();
+
+        app_ble_stream_run_fake_commands_once();
+        app_ble_stream_maybe_publish_fake(now_ms);
+        app_ble_stream_process();
+        app_ble_stream_print_stat(now_ms);
+
+        vTaskDelay(pdMS_TO_TICKS(100u));
+    }
+}
+
+static uint32_t app_ble_stream_now_ms(void)
+{
+    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+}
+
+static uint32_t app_ble_stream_now_s(void)
+{
+    return (uint32_t)(app_ble_stream_now_ms() / 1000u);
+}
+
+static void app_ble_stream_maybe_publish_fake(uint32_t now_ms)
+{
+#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
+    if ((0u == fake_last_realtime_ms) ||
+        ((now_ms - fake_last_realtime_ms) >= APP_BLE_REALTIME_PERIOD_MS))
+    {
+        uint32_t tick_s = app_ble_stream_now_s();
+        app_ble_realtime_sample_t sample = {
+            .ts_s = tick_s,
+            .rr_bpm = (uint8_t)(14u + (tick_s % 5u)),
+            .hr_bpm = (uint8_t)(70u + (tick_s % 8u)),
+            .presence = 100u,
+            .motion = (uint8_t)((tick_s * 7u) % 40u),
+            .cough_prob = (uint8_t)((0u == (tick_s % 15u)) ? 87u : 12u),
+            .snore_prob = APP_BLE_INVALID_U8,
+            .fusion_state = (uint8_t)((0u == (tick_s % 15u)) ?
+                            APP_BLE_FUSION_WARNING :
+                            APP_BLE_FUSION_NORMAL),
+            .alert_level = (uint8_t)((0u == (tick_s % 15u)) ?
+                           APP_BLE_ALERT_WARNING :
+                           APP_BLE_ALERT_NONE),
+            .quality_flags = (uint8_t)(APP_BLE_QUALITY_AUDIO_VALID |
+                                       APP_BLE_QUALITY_RADAR_VALID |
+                                       APP_BLE_QUALITY_FUSION_VALID |
+                                       APP_BLE_QUALITY_HR_VALID |
+                                       APP_BLE_QUALITY_RR_VALID |
+                                       APP_BLE_QUALITY_MODEL_READY)
+        };
+
+        (void)app_ble_publish_realtime(&sample);
+        fake_last_realtime_ms = now_ms;
+    }
+
+    if ((0u == fake_last_event_ms) ||
+        ((now_ms - fake_last_event_ms) >= APP_BLE_EVENT_FAKE_PERIOD_MS))
+    {
+        app_ble_event_t event = {
+            .event_id = ++fake_event_id,
+            .ts_s = app_ble_stream_now_s(),
+            .event_type = APP_BLE_EVENT_COUGH,
+            .severity = 2u,
+            .confidence = 87u,
+            .duration_s = 1u,
+            .source_flags = (uint8_t)(APP_BLE_EVENT_SOURCE_AUDIO |
+                                      APP_BLE_EVENT_SOURCE_FUSION)
+        };
+
+        (void)app_ble_publish_event(&event);
+        fake_last_event_ms = now_ms;
+    }
+#else
+    (void)now_ms;
+#endif
+}
+
+static void app_ble_stream_run_fake_commands_once(void)
+{
+#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
+    app_ble_command_t cmd;
+
+    if (fake_commands_done)
+    {
+        return;
+    }
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.command_id = APP_BLE_CMD_PING;
+    app_ble_stream_run_fake_command(&cmd);
+
+    app_ble_stream_make_time_sync_cmd(&cmd);
+    app_ble_stream_run_fake_command(&cmd);
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.seq = 2u;
+    cmd.command_id = APP_BLE_CMD_START_MONITOR;
+    app_ble_stream_run_fake_command(&cmd);
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.seq = 3u;
+    cmd.command_id = APP_BLE_CMD_CLEAR_NIGHT_SUMMARY;
+    app_ble_stream_run_fake_command(&cmd);
+
+    fake_commands_done = true;
+#endif
+}
+
+static void app_ble_stream_run_fake_command(const app_ble_command_t *cmd)
+{
+    app_ble_cmd_response_t resp;
+    uint8_t frame[APP_BLE_CMD_RESPONSE_FRAME_MAX_LEN];
+    uint16_t frame_len = 0u;
+
+    if (NULL == cmd)
+    {
+        return;
+    }
+
+    if (CY_RSLT_SUCCESS != app_ble_cmd_handle(cmd, &resp))
+    {
+        app_ble_diag_note_notify_fail(APP_BLE_ERR_INVALID_ARG);
+        return;
+    }
+
+    if (CY_RSLT_SUCCESS == app_ble_pack_cmd_response(&resp,
+                                                     frame,
+                                                     sizeof(frame),
+                                                     &frame_len))
+    {
+        app_ble_diag_note_notify_ok();
+    }
+    else
+    {
+        app_ble_diag_note_notify_fail(APP_BLE_ERR_PACK_FAILED);
+    }
+
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+    printf("[BLE_CMD] id=%s result=%s resp_len=%u\r\n",
+           app_ble_cmd_name(cmd->command_id),
+           app_ble_error_name(resp.status),
+           (unsigned int)frame_len);
+    if (APP_BLE_OK != resp.status)
+    {
+        printf("[BLE_ERR] code=%s detail=%s\r\n",
+               app_ble_error_name(resp.status),
+               app_ble_cmd_name(cmd->command_id));
+    }
+#endif
+}
+
+static void app_ble_stream_make_time_sync_cmd(app_ble_command_t *cmd)
+{
+    uint32_t epoch_s = 1735689600UL;
+
+    if (NULL == cmd)
+    {
+        return;
+    }
+
+    memset(cmd, 0, sizeof(*cmd));
+    cmd->seq = 1u;
+    cmd->command_id = APP_BLE_CMD_TIME_SYNC;
+    cmd->payload_len = 4u;
+    cmd->payload[0] = (uint8_t)(epoch_s & 0xFFu);
+    cmd->payload[1] = (uint8_t)((epoch_s >> 8u) & 0xFFu);
+    cmd->payload[2] = (uint8_t)((epoch_s >> 16u) & 0xFFu);
+    cmd->payload[3] = (uint8_t)((epoch_s >> 24u) & 0xFFu);
+}
+
+static void app_ble_stream_print_stat(uint32_t now_ms)
+{
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+    app_ble_diag_t diag;
+
+    if ((0u != stat_last_print_ms) &&
+        ((now_ms - stat_last_print_ms) < APP_BLE_STAT_PRINT_PERIOD_MS))
+    {
+        return;
+    }
+
+    if (CY_RSLT_SUCCESS == app_ble_get_diag(&diag))
+    {
+        printf("[BLE_STAT] conn=%u mtu=%u sent=%lu fail=%lu drop_rt=%lu "
+               "drop_evt=%lu cmd=%lu err=%u\r\n",
+               (unsigned int)diag.connected,
+               (unsigned int)diag.mtu,
+               (unsigned long)diag.notify_ok,
+               (unsigned long)diag.notify_fail,
+               (unsigned long)diag.realtime_drop,
+               (unsigned long)diag.event_drop,
+               (unsigned long)diag.cmd_count,
+               (unsigned int)diag.last_error);
+    }
+
+    stat_last_print_ms = now_ms;
+#else
+    (void)now_ms;
+#endif
+}
+
+#endif /* APP_BLE_ENABLE */

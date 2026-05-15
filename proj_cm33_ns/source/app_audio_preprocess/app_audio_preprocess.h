@@ -71,6 +71,21 @@ extern "C" {
 #define APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE              (0u)
 #define APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1   (1u)
 
+#define APP_AUDIO_SPECTRUM_BACKEND_DFT                               (0u)
+#define APP_AUDIO_SPECTRUM_BACKEND_RFFT                              (1u)
+
+#ifndef APP_AUDIO_SPECTRUM_BACKEND
+#define APP_AUDIO_SPECTRUM_BACKEND APP_AUDIO_SPECTRUM_BACKEND_DFT
+#endif
+
+#ifndef APP_AUDIO_SPECTRUM_COMPARE_ENABLE
+#define APP_AUDIO_SPECTRUM_COMPARE_ENABLE                            (0u)
+#endif
+
+#ifndef APP_AUDIO_SPECTRUM_COMPARE_WINDOWS
+#define APP_AUDIO_SPECTRUM_COMPARE_WINDOWS                           (3u)
+#endif
+
 #ifndef APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE
 #if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_V3_BOARD_HTK_HARDNEG)
 #define APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE \
@@ -198,6 +213,30 @@ typedef struct
     uint32_t mel_ms_max;
     /* 已纳入 Mel 耗时统计的窗口数量。 */
     uint32_t mel_windows_profiled;
+    /* 最近一次窗口整形/能量门限耗时，单位 ms；profile 关闭时保持 0。 */
+    uint32_t last_condition_ms;
+    /* 窗口整形/能量门限累计耗时，单位 ms。 */
+    uint32_t condition_ms_total;
+    /* 窗口整形/能量门限最大耗时，单位 ms。 */
+    uint32_t condition_ms_max;
+    /* 已纳入窗口整形/能量门限统计的窗口数量。 */
+    uint32_t condition_windows_profiled;
+    /* 最近一次全窗口频谱计算累计耗时，单位 ms。 */
+    uint32_t last_spectrum_ms;
+    /* 全窗口频谱计算累计耗时，单位 ms。 */
+    uint32_t spectrum_ms_total;
+    /* 全窗口频谱计算最大耗时，单位 ms。 */
+    uint32_t spectrum_ms_max;
+    /* 已纳入频谱统计的窗口数量。 */
+    uint32_t spectrum_windows_profiled;
+    /* 最近一次全窗口 Mel filterbank 累计耗时，单位 ms。 */
+    uint32_t last_melbank_ms;
+    /* 全窗口 Mel filterbank 累计耗时，单位 ms。 */
+    uint32_t melbank_ms_total;
+    /* 全窗口 Mel filterbank 最大耗时，单位 ms。 */
+    uint32_t melbank_ms_max;
+    /* 已纳入 Mel filterbank 统计的窗口数量。 */
+    uint32_t melbank_windows_profiled;
     /* 最近一次成功发布给 CM55 的 input sequence。 */
     uint32_t last_published_sequence;
     /* 最近一次成功发布给 CM55 的 CM33 时间戳，单位 ms。 */

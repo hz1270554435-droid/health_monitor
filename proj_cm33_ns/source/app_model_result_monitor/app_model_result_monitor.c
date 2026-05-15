@@ -45,6 +45,34 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_MODEL_PRINT_FLOAT_ENABLE             (1u)
 #endif
 
+#ifndef APP_MODEL_EVENT_THRESHOLD
+#define APP_MODEL_EVENT_THRESHOLD                (0.95f)
+#endif
+
+#ifndef APP_MODEL_EVENT_MIN_HITS
+#define APP_MODEL_EVENT_MIN_HITS                 (2u)
+#endif
+
+#ifndef APP_MODEL_EVENT_WINDOW_MS
+#define APP_MODEL_EVENT_WINDOW_MS                (1200u)
+#endif
+
+#ifndef APP_MODEL_EVENT_COOLDOWN_MS
+#define APP_MODEL_EVENT_COOLDOWN_MS              (1500u)
+#endif
+
+#ifndef APP_BLE_ENABLE
+#define APP_BLE_ENABLE                           (0u)
+#endif
+
+#ifndef APP_BLE_FAKE_DATA_ENABLE
+#define APP_BLE_FAKE_DATA_ENABLE                 (0u)
+#endif
+
+#ifndef APP_BLE_STACK_ENABLE
+#define APP_BLE_STACK_ENABLE                     (0u)
+#endif
+
 #define APP_MODEL_LOG_LEVEL_QUIET                (0u)
 #define APP_MODEL_LOG_LEVEL_STAT                 (1u)
 #define APP_MODEL_LOG_LEVEL_DEBUG                (2u)
@@ -65,6 +93,15 @@ typedef struct
     uint32_t prev_dropped_total;
     uint32_t prev_mel_ms_total;
     uint32_t prev_mel_windows_profiled;
+    uint32_t prev_condition_ms_total;
+    uint32_t prev_condition_windows_profiled;
+    uint32_t prev_spectrum_ms_total;
+    uint32_t prev_spectrum_windows_profiled;
+    uint32_t prev_melbank_ms_total;
+    uint32_t prev_melbank_windows_profiled;
+    uint32_t event_candidate_start_ms;
+    uint32_t event_candidate_hits;
+    uint32_t last_event_ms;
 } app_model_result_monitor_runtime_t;
 
 static app_model_result_monitor_runtime_t model_result_runtime;
@@ -88,6 +125,9 @@ static void app_model_result_monitor_print_event(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
     const char *decision);
+static bool app_model_result_monitor_should_print_event(
+    const app_model_inference_result_t *result,
+    uint32_t now_ms);
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
 static void app_model_result_monitor_maybe_print_stat(
     const volatile app_model_shared_region_t *shared,
@@ -215,7 +255,9 @@ void app_model_result_monitor_task(void *pvParameters)
                 app_model_result_monitor_print_demo_result(&result);
 #endif
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
-                if (APP_MODEL_DEMO_COUGH_THRESHOLD <= result.scores[2])
+                if (app_model_result_monitor_should_print_event(
+                        &result,
+                        app_model_result_monitor_now_ms()))
                 {
                     app_model_result_monitor_print_event(&result,
                                                          result_sequence,
@@ -343,7 +385,29 @@ static void app_model_result_monitor_print_deployment_info(void)
            APP_AUDIO_ACTIVE_INPUT_SHAPE,
            APP_AUDIO_ACTIVE_CLASS_ORDER);
     app_model_result_monitor_print_float(APP_MODEL_DEMO_COUGH_THRESHOLD);
-    printf(", frontend_name=%s\r\n", APP_AUDIO_ACTIVE_FRONTEND_NAME);
+    printf(", event_threshold=");
+    app_model_result_monitor_print_float(APP_MODEL_EVENT_THRESHOLD);
+    printf(", frontend_name=%s, APP_AUDIO_MODEL_SELECT=%lu, "
+           "APP_MODEL_RUNTIME_PROFILE_ENABLE=%lu, APP_MODEL_LOG_LEVEL=%lu, "
+           "APP_MODEL_LOG_RATE_LIMIT_MS=%lu, APP_MODEL_PRINT_FLOAT_ENABLE=%lu, "
+           "APP_BLE_ENABLE=%lu, APP_BLE_FAKE_DATA_ENABLE=%lu, "
+           "APP_BLE_STACK_ENABLE=%lu, APP_AUDIO_SPECTRUM_BACKEND=%lu, "
+           "APP_PDM_PCM_BLOCK_COUNT=%lu, APP_MODEL_EVENT_MIN_HITS=%lu, "
+           "APP_MODEL_EVENT_WINDOW_MS=%lu, APP_MODEL_EVENT_COOLDOWN_MS=%lu\r\n",
+           APP_AUDIO_ACTIVE_FRONTEND_NAME,
+           (unsigned long)APP_AUDIO_MODEL_SELECT,
+           (unsigned long)APP_MODEL_RUNTIME_PROFILE_ENABLE,
+           (unsigned long)APP_MODEL_LOG_LEVEL,
+           (unsigned long)APP_MODEL_LOG_RATE_LIMIT_MS,
+           (unsigned long)APP_MODEL_PRINT_FLOAT_ENABLE,
+           (unsigned long)APP_BLE_ENABLE,
+           (unsigned long)APP_BLE_FAKE_DATA_ENABLE,
+           (unsigned long)APP_BLE_STACK_ENABLE,
+           (unsigned long)APP_AUDIO_SPECTRUM_BACKEND,
+           (unsigned long)APP_PDM_PCM_BLOCK_COUNT,
+           (unsigned long)APP_MODEL_EVENT_MIN_HITS,
+           (unsigned long)APP_MODEL_EVENT_WINDOW_MS,
+           (unsigned long)APP_MODEL_EVENT_COOLDOWN_MS);
     app_model_result_monitor_log_end(log_start_ms);
 }
 
@@ -497,7 +561,7 @@ static void app_model_result_monitor_print_event(
            (unsigned long)model_result_runtime.event_id);
     app_model_result_monitor_print_float(result->scores[2]);
     printf(", threshold=");
-    app_model_result_monitor_print_float(APP_MODEL_DEMO_COUGH_THRESHOLD);
+    app_model_result_monitor_print_float(APP_MODEL_EVENT_THRESHOLD);
     printf(", input_seq=%lu, result_seq=%lu, decision=%s, energy=",
            (unsigned long)result->input_sequence,
            (unsigned long)result_sequence,
@@ -505,6 +569,47 @@ static void app_model_result_monitor_print_event(
     app_model_result_monitor_print_float(result->scores[3]);
     printf("\r\n");
     app_model_result_monitor_log_end(log_start_ms);
+}
+
+static bool app_model_result_monitor_should_print_event(
+    const app_model_inference_result_t *result,
+    uint32_t now_ms)
+{
+    if ((NULL == result) ||
+        (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
+    {
+        model_result_runtime.event_candidate_hits = 0u;
+        model_result_runtime.event_candidate_start_ms = 0u;
+        return false;
+    }
+
+    if ((0u != model_result_runtime.last_event_ms) &&
+        (0u < APP_MODEL_EVENT_COOLDOWN_MS) &&
+        ((now_ms - model_result_runtime.last_event_ms) <
+         APP_MODEL_EVENT_COOLDOWN_MS))
+    {
+        return false;
+    }
+
+    if ((0u == model_result_runtime.event_candidate_hits) ||
+        ((0u < APP_MODEL_EVENT_WINDOW_MS) &&
+         ((now_ms - model_result_runtime.event_candidate_start_ms) >
+          APP_MODEL_EVENT_WINDOW_MS)))
+    {
+        model_result_runtime.event_candidate_start_ms = now_ms;
+        model_result_runtime.event_candidate_hits = 0u;
+    }
+
+    model_result_runtime.event_candidate_hits++;
+    if (model_result_runtime.event_candidate_hits < APP_MODEL_EVENT_MIN_HITS)
+    {
+        return false;
+    }
+
+    model_result_runtime.event_candidate_hits = 0u;
+    model_result_runtime.event_candidate_start_ms = 0u;
+    model_result_runtime.last_event_ms = now_ms;
+    return true;
 }
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
@@ -519,6 +624,17 @@ static void app_model_result_monitor_maybe_print_stat(
     uint32_t mel_count_delta;
     uint32_t mel_total_delta;
     uint32_t mel_ms_avg;
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    uint32_t condition_count_delta;
+    uint32_t condition_total_delta;
+    uint32_t condition_ms_avg;
+    uint32_t spectrum_count_delta;
+    uint32_t spectrum_total_delta;
+    uint32_t spectrum_ms_avg;
+    uint32_t melbank_count_delta;
+    uint32_t melbank_total_delta;
+    uint32_t melbank_ms_avg;
+#endif
     uint32_t infer_ms_avg;
     uint32_t total_ms_avg;
     uint32_t seq_gap;
@@ -547,6 +663,26 @@ static void app_model_result_monitor_maybe_print_stat(
                       model_result_runtime.prev_mel_ms_total;
     mel_ms_avg = (0u < mel_count_delta) ?
                  (mel_total_delta / mel_count_delta) : 0u;
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    condition_count_delta = audio_stats.condition_windows_profiled -
+        model_result_runtime.prev_condition_windows_profiled;
+    condition_total_delta = audio_stats.condition_ms_total -
+        model_result_runtime.prev_condition_ms_total;
+    condition_ms_avg = (0u < condition_count_delta) ?
+        (condition_total_delta / condition_count_delta) : 0u;
+    spectrum_count_delta = audio_stats.spectrum_windows_profiled -
+        model_result_runtime.prev_spectrum_windows_profiled;
+    spectrum_total_delta = audio_stats.spectrum_ms_total -
+        model_result_runtime.prev_spectrum_ms_total;
+    spectrum_ms_avg = (0u < spectrum_count_delta) ?
+        (spectrum_total_delta / spectrum_count_delta) : 0u;
+    melbank_count_delta = audio_stats.melbank_windows_profiled -
+        model_result_runtime.prev_melbank_windows_profiled;
+    melbank_total_delta = audio_stats.melbank_ms_total -
+        model_result_runtime.prev_melbank_ms_total;
+    melbank_ms_avg = (0u < melbank_count_delta) ?
+        (melbank_total_delta / melbank_count_delta) : 0u;
+#endif
     infer_ms_avg = (0u < model_result_runtime.infer_ms_count_1s) ?
                    (model_result_runtime.infer_ms_total_1s /
                     model_result_runtime.infer_ms_count_1s) : 0u;
@@ -565,15 +701,27 @@ static void app_model_result_monitor_maybe_print_stat(
     app_model_result_monitor_print_float(model_result_runtime.max_cough_prob_1s);
     printf(", decision_count_cough_1s=%lu, "
            "decision_count_non_cough_1s=%lu, mel_ms_avg=%lu, "
-           "mel_ms_max=%lu, infer_ms_avg=%lu, infer_ms_max=%lu, "
+           "mel_ms_max=%lu",
+           (unsigned long)model_result_runtime.decision_count_cough_1s,
+           (unsigned long)model_result_runtime.decision_count_non_cough_1s,
+           (unsigned long)mel_ms_avg,
+           (unsigned long)audio_stats.mel_ms_max);
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    printf(", condition_ms_avg=%lu, condition_ms_max=%lu, "
+           "spectrum_ms_avg=%lu, spectrum_ms_max=%lu, "
+           "melbank_ms_avg=%lu, melbank_ms_max=%lu",
+           (unsigned long)condition_ms_avg,
+           (unsigned long)audio_stats.condition_ms_max,
+           (unsigned long)spectrum_ms_avg,
+           (unsigned long)audio_stats.spectrum_ms_max,
+           (unsigned long)melbank_ms_avg,
+           (unsigned long)audio_stats.melbank_ms_max);
+#endif
+    printf(", infer_ms_avg=%lu, infer_ms_max=%lu, "
            "total_ms_avg=%lu, dropped_total=%lu, dropped_delta_1s=%lu, "
            "dropped_queue=%lu, dropped_no_free=%lu, dropped_paused=%lu, "
            "pdm_error=%lu, ready=%lu, published=%lu, busy=%lu, gated=%lu, "
            "queue_depth=%lu, seq_gap=%lu, model_not_ready=%lu, log_ms=%lu\r\n",
-           (unsigned long)model_result_runtime.decision_count_cough_1s,
-           (unsigned long)model_result_runtime.decision_count_non_cough_1s,
-           (unsigned long)mel_ms_avg,
-           (unsigned long)audio_stats.mel_ms_max,
            (unsigned long)infer_ms_avg,
            (unsigned long)model_result_runtime.infer_ms_max_1s,
            (unsigned long)total_ms_avg,
@@ -598,6 +746,20 @@ static void app_model_result_monitor_maybe_print_stat(
     model_result_runtime.prev_mel_ms_total = audio_stats.mel_ms_total;
     model_result_runtime.prev_mel_windows_profiled =
         audio_stats.mel_windows_profiled;
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    model_result_runtime.prev_condition_ms_total =
+        audio_stats.condition_ms_total;
+    model_result_runtime.prev_condition_windows_profiled =
+        audio_stats.condition_windows_profiled;
+    model_result_runtime.prev_spectrum_ms_total =
+        audio_stats.spectrum_ms_total;
+    model_result_runtime.prev_spectrum_windows_profiled =
+        audio_stats.spectrum_windows_profiled;
+    model_result_runtime.prev_melbank_ms_total =
+        audio_stats.melbank_ms_total;
+    model_result_runtime.prev_melbank_windows_profiled =
+        audio_stats.melbank_windows_profiled;
+#endif
     model_result_runtime.max_cough_prob_1s = 0.0f;
     model_result_runtime.decision_count_cough_1s = 0u;
     model_result_runtime.decision_count_non_cough_1s = 0u;

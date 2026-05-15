@@ -3,6 +3,28 @@
 #include <math.h>
 #include <string.h>
 
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+#include <stdio.h>
+#endif
+
+#if ((APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_DFT) && \
+     (APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_RFFT))
+#error "Unsupported APP_AUDIO_SPECTRUM_BACKEND"
+#endif
+
+#if ((APP_AUDIO_SPECTRUM_COMPARE_ENABLE != 0u) && \
+     (APP_AUDIO_SPECTRUM_COMPARE_ENABLE != 1u))
+#error "Unsupported APP_AUDIO_SPECTRUM_COMPARE_ENABLE"
+#endif
+
+#if ((APP_AUDIO_SPECTRUM_BACKEND == APP_AUDIO_SPECTRUM_BACKEND_RFFT) || \
+     (APP_AUDIO_SPECTRUM_COMPARE_ENABLE))
+#define APP_AUDIO_PREPROCESS_RFFT_REQUIRED       (1u)
+#include "arm_math.h"
+#else
+#define APP_AUDIO_PREPROCESS_RFFT_REQUIRED       (0u)
+#endif
+
 #define APP_AUDIO_PREPROCESS_PI                 (3.14159265358979323846f)
 
 #ifndef APP_MODEL_RUNTIME_PROFILE_ENABLE
@@ -38,6 +60,22 @@ typedef struct
     float frame_window[APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES];
 } app_audio_preprocess_plan_t;
 
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+typedef struct
+{
+    float power_max_abs_diff;
+    float mel_max_abs_diff;
+    float logmel_max_abs_diff;
+    double power_abs_sum;
+    double mel_abs_sum;
+    double logmel_abs_sum;
+    uint32_t power_count;
+    uint32_t mel_count;
+    uint32_t logmel_count;
+    uint32_t window_index;
+} app_audio_preprocess_compare_stats_t;
+#endif
+
 static TaskHandle_t audio_preprocess_task_handle = NULL;
 static app_audio_preprocess_config_t audio_preprocess_config;
 static app_audio_preprocess_plan_t audio_preprocess_plan;
@@ -57,6 +95,17 @@ static float window_buffer[APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES];
 static float frame_buffer[APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES];
 static float power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
 static float model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+static float compare_power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
+static float compare_model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+static uint32_t compare_windows_reported;
+#endif
+#if (APP_AUDIO_PREPROCESS_RFFT_REQUIRED)
+static arm_rfft_fast_instance_f32 audio_preprocess_rfft_instance;
+static float rfft_input_buffer[APP_AUDIO_PREPROCESS_MAX_FFT_SIZE];
+static float rfft_output_buffer[APP_AUDIO_PREPROCESS_MAX_FFT_SIZE];
+static bool audio_preprocess_rfft_ready;
+#endif
 
 static cy_rslt_t app_audio_preprocess_validate_and_plan(
     const app_audio_preprocess_config_t *config,
@@ -76,11 +125,41 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
 static void app_audio_preprocess_copy_ordered_window(void);
 static bool app_audio_preprocess_condition_window(float *energy);
 static void app_audio_preprocess_power_spectrum(const float *frame);
+static void app_audio_preprocess_power_spectrum_dft(const float *frame,
+                                                    float *spectrum);
+#if (APP_AUDIO_PREPROCESS_RFFT_REQUIRED)
+static bool app_audio_preprocess_init_rfft(uint16_t fft_size);
+static void app_audio_preprocess_power_spectrum_rfft(const float *frame,
+                                                     float *spectrum);
+#endif
+static float app_audio_preprocess_mel_energy_from(const float *spectrum,
+                                                  uint16_t mel_index);
 static float app_audio_preprocess_mel_energy(uint16_t mel_index);
 static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy);
+static void app_audio_preprocess_power_to_db_and_normalize_buffer(
+    float *feature,
+    float max_mel_energy);
 static bool app_audio_preprocess_uses_no_norm_frontend(void);
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+static void app_audio_preprocess_record_stage_time(uint32_t elapsed_ms,
+                                                   uint32_t *last_ms,
+                                                   uint32_t *total_ms,
+                                                   uint32_t *max_ms,
+                                                   uint32_t *count);
+static void app_audio_preprocess_record_condition_time(uint32_t elapsed_ms);
+static void app_audio_preprocess_record_spectrum_time(uint32_t elapsed_ms);
+static void app_audio_preprocess_record_melbank_time(uint32_t elapsed_ms);
 static void app_audio_preprocess_record_mel_time(uint32_t elapsed_ms);
+#endif
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+static void app_audio_preprocess_compare_update(float active,
+                                                float reference,
+                                                float *max_abs_diff,
+                                                double *abs_sum,
+                                                uint32_t *count);
+static void app_audio_preprocess_print_compare_result(
+    const app_audio_preprocess_compare_stats_t *stats);
+static void app_audio_preprocess_print_float(float value);
 #endif
 static void app_audio_preprocess_init_shared_region(void);
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
@@ -207,6 +286,13 @@ cy_rslt_t app_audio_preprocess_configure(
     {
         return CY_RSLT_TYPE_ERROR;
     }
+
+#if (APP_AUDIO_PREPROCESS_RFFT_REQUIRED)
+    if (!app_audio_preprocess_init_rfft(config->fft_size))
+    {
+        return CY_RSLT_TYPE_ERROR;
+    }
+#endif
 
     audio_preprocess_config = *config;
     audio_preprocess_config_ready = true;
@@ -417,6 +503,9 @@ static void app_audio_preprocess_reset_stream_state(void)
     mono_total_samples = 0;
     mono_samples_since_window = 0;
     delay_line_index = 0;
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+    compare_windows_reported = 0u;
+#endif
 }
 
 static bool app_audio_preprocess_block_is_valid(
@@ -561,15 +650,41 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
     float max_mel_energy = 0.0f;
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
     uint32_t profile_start_ms = app_audio_preprocess_now_ms();
+    uint32_t stage_start_ms;
+    uint32_t spectrum_ms_total = 0u;
+    uint32_t melbank_ms_total = 0u;
+#endif
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+    bool compare_enabled =
+        (compare_windows_reported < APP_AUDIO_SPECTRUM_COMPARE_WINDOWS);
+    float compare_max_mel_energy = 0.0f;
+    app_audio_preprocess_compare_stats_t compare_stats;
+
+    if (compare_enabled)
+    {
+        memset(&compare_stats, 0, sizeof(compare_stats));
+        compare_stats.window_index = compare_windows_reported + 1u;
+    }
 #endif
 
     app_audio_preprocess_copy_ordered_window();
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    stage_start_ms = app_audio_preprocess_now_ms();
+#endif
     if (!app_audio_preprocess_condition_window(&energy))
     {
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+        app_audio_preprocess_record_condition_time(
+            app_audio_preprocess_now_ms() - stage_start_ms);
+#endif
         audio_preprocess_stats.windows_energy_gated++;
         audio_preprocess_stats.last_energy = energy;
         return false;
     }
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    app_audio_preprocess_record_condition_time(
+        app_audio_preprocess_now_ms() - stage_start_ms);
+#endif
 
     for (uint16_t t = 0; t < audio_preprocess_plan.time_bins; t++)
     {
@@ -598,8 +713,39 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
             }
         }
 
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+        stage_start_ms = app_audio_preprocess_now_ms();
+#endif
         app_audio_preprocess_power_spectrum(frame_buffer);
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+        spectrum_ms_total += app_audio_preprocess_now_ms() - stage_start_ms;
+#endif
 
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+        if (compare_enabled)
+        {
+#if (APP_AUDIO_SPECTRUM_BACKEND == APP_AUDIO_SPECTRUM_BACKEND_RFFT)
+            app_audio_preprocess_power_spectrum_dft(frame_buffer,
+                                                    compare_power_spectrum);
+#else
+            app_audio_preprocess_power_spectrum_rfft(frame_buffer,
+                                                     compare_power_spectrum);
+#endif
+            for (uint16_t k = 0; k < audio_preprocess_plan.spectrum_bins; k++)
+            {
+                app_audio_preprocess_compare_update(
+                    power_spectrum[k],
+                    compare_power_spectrum[k],
+                    &compare_stats.power_max_abs_diff,
+                    &compare_stats.power_abs_sum,
+                    &compare_stats.power_count);
+            }
+        }
+#endif
+
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+        stage_start_ms = app_audio_preprocess_now_ms();
+#endif
         for (uint16_t mel = 0; mel < audio_preprocess_config.mel_bin_count; mel++)
         {
             float mel_energy = app_audio_preprocess_mel_energy(mel);
@@ -612,12 +758,72 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
                 max_mel_energy = mel_energy;
             }
         }
+#if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+        melbank_ms_total += app_audio_preprocess_now_ms() - stage_start_ms;
+#endif
+
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+        if (compare_enabled)
+        {
+            for (uint16_t mel = 0; mel < audio_preprocess_config.mel_bin_count; mel++)
+            {
+                float active_mel_energy;
+                float compare_mel_energy =
+                    app_audio_preprocess_mel_energy_from(compare_power_spectrum,
+                                                         mel);
+                uint16_t out_index =
+                    (uint16_t)((mel * audio_preprocess_plan.time_bins) + t);
+
+                compare_model_input_feature[out_index] = compare_mel_energy;
+                if (compare_max_mel_energy < compare_mel_energy)
+                {
+                    compare_max_mel_energy = compare_mel_energy;
+                }
+
+                active_mel_energy = model_input_feature[out_index];
+                app_audio_preprocess_compare_update(
+                    active_mel_energy,
+                    compare_mel_energy,
+                    &compare_stats.mel_max_abs_diff,
+                    &compare_stats.mel_abs_sum,
+                    &compare_stats.mel_count);
+            }
+        }
+#endif
     }
 
     app_audio_preprocess_power_to_db_and_normalize(max_mel_energy);
 
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+    if (compare_enabled)
+    {
+        uint32_t element_count =
+            (uint32_t)audio_preprocess_config.mel_bin_count *
+            (uint32_t)audio_preprocess_plan.time_bins;
+
+        app_audio_preprocess_power_to_db_and_normalize_buffer(
+            compare_model_input_feature,
+            compare_max_mel_energy);
+
+        for (uint32_t i = 0; i < element_count; i++)
+        {
+            app_audio_preprocess_compare_update(
+                model_input_feature[i],
+                compare_model_input_feature[i],
+                &compare_stats.logmel_max_abs_diff,
+                &compare_stats.logmel_abs_sum,
+                &compare_stats.logmel_count);
+        }
+
+        app_audio_preprocess_print_compare_result(&compare_stats);
+        compare_windows_reported++;
+    }
+#endif
+
     audio_preprocess_stats.last_energy = energy;
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+    app_audio_preprocess_record_spectrum_time(spectrum_ms_total);
+    app_audio_preprocess_record_melbank_time(melbank_ms_total);
     app_audio_preprocess_record_mel_time(
         app_audio_preprocess_now_ms() - profile_start_ms);
 #endif
@@ -694,11 +900,20 @@ static bool app_audio_preprocess_condition_window(float *energy)
 
 static void app_audio_preprocess_power_spectrum(const float *frame)
 {
+#if (APP_AUDIO_SPECTRUM_BACKEND == APP_AUDIO_SPECTRUM_BACKEND_RFFT)
+    app_audio_preprocess_power_spectrum_rfft(frame, power_spectrum);
+#else
+    app_audio_preprocess_power_spectrum_dft(frame, power_spectrum);
+#endif
+}
+
+static void app_audio_preprocess_power_spectrum_dft(const float *frame,
+                                                    float *spectrum)
+{
     /* 参考实现：直接 DFT 得到单边功率谱。
      *
-     * 第一版为了少引入库依赖，仍使用软件 DFT；但不再在内层循环里调用 sinf/cosf，
-     * 而是用配置阶段预计算的旋转因子递推。后续如果实时性能不足，应把本函数
-     * 替换成 CMSIS-DSP RFFT，输出仍填 power_spectrum[]，其它前处理流程不变。
+     * 这条路径保留为 RFFT 等价性检查和回退基准。它输出未归一化的
+     * real^2 + imag^2，RFFT 后端必须维持同一尺度。
      */
     uint16_t fft_size = audio_preprocess_config.fft_size;
 
@@ -728,11 +943,65 @@ static void app_audio_preprocess_power_spectrum(const float *frame)
             phase_sin = next_sin;
         }
 
-        power_spectrum[k] = (real * real) + (imag * imag);
+        spectrum[k] = (real * real) + (imag * imag);
     }
 }
 
+#if (APP_AUDIO_PREPROCESS_RFFT_REQUIRED)
+static bool app_audio_preprocess_init_rfft(uint16_t fft_size)
+{
+    audio_preprocess_rfft_ready =
+        (ARM_MATH_SUCCESS ==
+         arm_rfft_fast_init_f32(&audio_preprocess_rfft_instance,
+                                (uint16_t)fft_size));
+
+    return audio_preprocess_rfft_ready;
+}
+
+static void app_audio_preprocess_power_spectrum_rfft(const float *frame,
+                                                     float *spectrum)
+{
+    uint16_t fft_size = audio_preprocess_config.fft_size;
+    uint16_t nyquist_bin = (uint16_t)(fft_size / 2u);
+
+    if (!audio_preprocess_rfft_ready)
+    {
+        app_audio_preprocess_power_spectrum_dft(frame, spectrum);
+        return;
+    }
+
+    memcpy(rfft_input_buffer,
+           frame,
+           (size_t)fft_size * sizeof(rfft_input_buffer[0]));
+    arm_rfft_fast_f32(&audio_preprocess_rfft_instance,
+                      rfft_input_buffer,
+                      rfft_output_buffer,
+                      0u);
+
+    /* CMSIS-DSP fast RFFT forward output is unnormalized. For real input:
+     * out[0] is DC real, out[1] is Nyquist real, and bins 1..N/2-1 are
+     * interleaved real/imag pairs. Imaginary sign differences do not affect
+     * power, but the DC/Nyquist packing must be handled explicitly.
+     */
+    spectrum[0] = rfft_output_buffer[0] * rfft_output_buffer[0];
+    for (uint16_t k = 1u; k < nyquist_bin; k++)
+    {
+        float real = rfft_output_buffer[2u * k];
+        float imag = rfft_output_buffer[(2u * k) + 1u];
+
+        spectrum[k] = (real * real) + (imag * imag);
+    }
+    spectrum[nyquist_bin] = rfft_output_buffer[1] * rfft_output_buffer[1];
+}
+#endif
+
 static float app_audio_preprocess_mel_energy(uint16_t mel_index)
+{
+    return app_audio_preprocess_mel_energy_from(power_spectrum, mel_index);
+}
+
+static float app_audio_preprocess_mel_energy_from(const float *spectrum,
+                                                  uint16_t mel_index)
 {
     /* 三角 Mel 滤波器。mel_edges[] 在配置阶段根据 sample_rate/fft_size/mel 范围预计算。 */
     uint16_t start = audio_preprocess_plan.mel_edges[mel_index];
@@ -749,20 +1018,28 @@ static float app_audio_preprocess_mel_energy(uint16_t mel_index)
     {
         float weight = (float)(k - start) / (float)(center - start);
 
-        energy += power_spectrum[k] * weight;
+        energy += spectrum[k] * weight;
     }
 
     for (uint16_t k = center; k <= end; k++)
     {
         float weight = (float)(end - k) / (float)(end - center);
 
-        energy += power_spectrum[k] * weight;
+        energy += spectrum[k] * weight;
     }
 
     return energy;
 }
 
 static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
+{
+    app_audio_preprocess_power_to_db_and_normalize_buffer(model_input_feature,
+                                                          max_mel_energy);
+}
+
+static void app_audio_preprocess_power_to_db_and_normalize_buffer(
+    float *feature,
+    float max_mel_energy)
 {
     /* 对齐训练端 src/audio/features.py:
      * 1. librosa.power_to_db(mel, ref=np.max)，最大能量对应 0 dB；
@@ -786,8 +1063,7 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
 
     for (uint32_t i = 0; i < element_count; i++)
     {
-        float power = (model_input_feature[i] > amin) ?
-                      model_input_feature[i] : amin;
+        float power = (feature[i] > amin) ? feature[i] : amin;
         float db = (10.0f * log10f(power)) - ref_db;
 
         if (-top_db > db)
@@ -795,7 +1071,7 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
             db = -top_db;
         }
 
-        model_input_feature[i] = db;
+        feature[i] = db;
         sum += db;
         square_sum += ((double)db * (double)db);
     }
@@ -816,9 +1092,8 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
 
     for (uint32_t i = 0; i < element_count; i++)
     {
-        model_input_feature[i] =
-            (model_input_feature[i] - mean) /
-            (std + audio_preprocess_config.log_epsilon);
+        feature[i] = (feature[i] - mean) /
+                     (std + audio_preprocess_config.log_epsilon);
     }
 }
 
@@ -829,15 +1104,141 @@ static bool app_audio_preprocess_uses_no_norm_frontend(void)
 }
 
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
+static void app_audio_preprocess_record_stage_time(uint32_t elapsed_ms,
+                                                   uint32_t *last_ms,
+                                                   uint32_t *total_ms,
+                                                   uint32_t *max_ms,
+                                                   uint32_t *count)
+{
+    *last_ms = elapsed_ms;
+    *total_ms += elapsed_ms;
+    (*count)++;
+    if (*max_ms < elapsed_ms)
+    {
+        *max_ms = elapsed_ms;
+    }
+}
+
+static void app_audio_preprocess_record_condition_time(uint32_t elapsed_ms)
+{
+    app_audio_preprocess_record_stage_time(
+        elapsed_ms,
+        &audio_preprocess_stats.last_condition_ms,
+        &audio_preprocess_stats.condition_ms_total,
+        &audio_preprocess_stats.condition_ms_max,
+        &audio_preprocess_stats.condition_windows_profiled);
+}
+
+static void app_audio_preprocess_record_spectrum_time(uint32_t elapsed_ms)
+{
+    app_audio_preprocess_record_stage_time(
+        elapsed_ms,
+        &audio_preprocess_stats.last_spectrum_ms,
+        &audio_preprocess_stats.spectrum_ms_total,
+        &audio_preprocess_stats.spectrum_ms_max,
+        &audio_preprocess_stats.spectrum_windows_profiled);
+}
+
+static void app_audio_preprocess_record_melbank_time(uint32_t elapsed_ms)
+{
+    app_audio_preprocess_record_stage_time(
+        elapsed_ms,
+        &audio_preprocess_stats.last_melbank_ms,
+        &audio_preprocess_stats.melbank_ms_total,
+        &audio_preprocess_stats.melbank_ms_max,
+        &audio_preprocess_stats.melbank_windows_profiled);
+}
+
 static void app_audio_preprocess_record_mel_time(uint32_t elapsed_ms)
 {
-    audio_preprocess_stats.last_mel_ms = elapsed_ms;
-    audio_preprocess_stats.mel_ms_total += elapsed_ms;
-    audio_preprocess_stats.mel_windows_profiled++;
-    if (audio_preprocess_stats.mel_ms_max < elapsed_ms)
+    app_audio_preprocess_record_stage_time(
+        elapsed_ms,
+        &audio_preprocess_stats.last_mel_ms,
+        &audio_preprocess_stats.mel_ms_total,
+        &audio_preprocess_stats.mel_ms_max,
+        &audio_preprocess_stats.mel_windows_profiled);
+}
+#endif
+
+#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
+static void app_audio_preprocess_compare_update(float active,
+                                                float reference,
+                                                float *max_abs_diff,
+                                                double *abs_sum,
+                                                uint32_t *count)
+{
+    float diff = active - reference;
+
+    if (0.0f > diff)
     {
-        audio_preprocess_stats.mel_ms_max = elapsed_ms;
+        diff = -diff;
     }
+
+    if (*max_abs_diff < diff)
+    {
+        *max_abs_diff = diff;
+    }
+    *abs_sum += (double)diff;
+    (*count)++;
+}
+
+static void app_audio_preprocess_print_compare_result(
+    const app_audio_preprocess_compare_stats_t *stats)
+{
+    uint32_t active_backend = APP_AUDIO_SPECTRUM_BACKEND;
+    uint32_t reference_backend =
+        (APP_AUDIO_SPECTRUM_BACKEND == APP_AUDIO_SPECTRUM_BACKEND_RFFT) ?
+        APP_AUDIO_SPECTRUM_BACKEND_DFT : APP_AUDIO_SPECTRUM_BACKEND_RFFT;
+    float power_mean_abs_diff =
+        (0u < stats->power_count) ?
+        (float)(stats->power_abs_sum / (double)stats->power_count) : 0.0f;
+    float mel_mean_abs_diff =
+        (0u < stats->mel_count) ?
+        (float)(stats->mel_abs_sum / (double)stats->mel_count) : 0.0f;
+    float logmel_mean_abs_diff =
+        (0u < stats->logmel_count) ?
+        (float)(stats->logmel_abs_sum / (double)stats->logmel_count) : 0.0f;
+
+    printf("[MODEL_SPEC_COMPARE] window=%lu, active_backend=%lu, "
+           "reference_backend=%lu, power_max_abs_diff=",
+           (unsigned long)stats->window_index,
+           (unsigned long)active_backend,
+           (unsigned long)reference_backend);
+    app_audio_preprocess_print_float(stats->power_max_abs_diff);
+    printf(", power_mean_abs_diff=");
+    app_audio_preprocess_print_float(power_mean_abs_diff);
+    printf(", mel_max_abs_diff=");
+    app_audio_preprocess_print_float(stats->mel_max_abs_diff);
+    printf(", mel_mean_abs_diff=");
+    app_audio_preprocess_print_float(mel_mean_abs_diff);
+    printf(", logmel_max_abs_diff=");
+    app_audio_preprocess_print_float(stats->logmel_max_abs_diff);
+    printf(", logmel_mean_abs_diff=");
+    app_audio_preprocess_print_float(logmel_mean_abs_diff);
+    printf("\r\n");
+}
+
+static void app_audio_preprocess_print_float(float value)
+{
+    const char *sign = "";
+    uint32_t whole;
+    uint32_t frac;
+
+    if (0.0f > value)
+    {
+        sign = "-";
+        value = -value;
+    }
+
+    whole = (uint32_t)value;
+    frac = (uint32_t)(((value - (float)whole) * 1000000.0f) + 0.5f);
+    if (1000000u <= frac)
+    {
+        whole++;
+        frac -= 1000000u;
+    }
+
+    printf("%s%lu.%06lu", sign, (unsigned long)whole, (unsigned long)frac);
 }
 #endif
 

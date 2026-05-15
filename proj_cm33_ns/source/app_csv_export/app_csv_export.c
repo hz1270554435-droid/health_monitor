@@ -5,8 +5,11 @@
 #include <string.h>
 
 #include "app_pdm_pcm.h"
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE)
 #include "app_uart_radar.h"
+#endif
 
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE && APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
 #define APP_CSV_EXPORT_RADAR_TYPE_TEXT              (0x0100u)
 #define APP_CSV_EXPORT_RADAR_TYPE_HUMAN_STATUS      (0x0F09u)
 #define APP_CSV_EXPORT_RADAR_TYPE_HUMAN_POSITION    (0x0A04u)
@@ -15,20 +18,21 @@
 #define APP_CSV_EXPORT_RADAR_TYPE_HEART_RATE        (0x0A15u)
 #define APP_CSV_EXPORT_RADAR_TYPE_TARGET_RANGE      (0x0A16u)
 #define APP_CSV_EXPORT_RADAR_TYPE_TRACK_POSITION    (0x0A17u)
+#endif
 
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
 #define APP_CSV_EXPORT_MIC_BINARY_VERSION           (1u)
 #define APP_CSV_EXPORT_MIC_BINARY_BITS_PER_SAMPLE   (16u)
+#endif
 
 static TaskHandle_t csv_export_task_handle = NULL;
 
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
 #if (!APP_CSV_EXPORT_MIC_RAW_ENABLE)
 static uint16_t app_csv_export_abs_i16(int16_t sample);
 #endif
 static bool app_csv_export_mic_block_is_valid(const app_pdm_pcm_block_t *block);
-static bool app_csv_export_radar_block_is_valid(const app_uart_radar_block_t *block);
-static void app_csv_export_print_header(void);
 static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block);
-static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block);
 #if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
 static void app_csv_export_print_mic_binary_block(const app_pdm_pcm_block_t *block,
                                                   uint32_t tick_ms);
@@ -36,7 +40,16 @@ static uint16_t app_csv_export_checksum_u8(const uint8_t *data, uint16_t len);
 static void app_csv_export_put_u16_le(uint16_t value);
 static void app_csv_export_put_u32_le(uint32_t value);
 #endif
+#endif
+
+static void app_csv_export_print_header(void);
+
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE && APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
+static bool app_csv_export_radar_block_is_valid(const app_uart_radar_block_t *block);
+static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block);
+#if (APP_CSV_EXPORT_RADAR_FRAME_HEX_ENABLE)
 static void app_csv_export_print_hex(const uint8_t *data, uint16_t len);
+#endif
 static void app_csv_export_print_radar_decoded(const app_uart_radar_block_t *block);
 static void app_csv_export_print_ascii_field(const uint8_t *data, uint16_t len);
 static uint16_t app_csv_export_read_le_u16(const uint8_t *data);
@@ -44,6 +57,7 @@ static uint32_t app_csv_export_read_le_u32(const uint8_t *data);
 static int32_t app_csv_export_read_le_i32(const uint8_t *data);
 static int32_t app_csv_export_float_to_milli(const uint8_t *data);
 static void app_csv_export_print_milli(int32_t value);
+#endif
 
 cy_rslt_t app_csv_export_task_init(void)
 {
@@ -73,26 +87,33 @@ void app_csv_export_task(void *pvParameters)
     for (;;)
     {
         bool did_work = false;
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
         app_pdm_pcm_block_t mic_block;
+#endif
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE)
         app_uart_radar_block_t radar_block;
+#endif
 
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
         if (app_pdm_pcm_receive_block(&mic_block, 0))
         {
             app_csv_export_print_mic_block(&mic_block);
             app_pdm_pcm_release_block(mic_block.block_index);
             did_work = true;
         }
+#endif
 
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE)
         if (app_uart_radar_receive_block(&radar_block,
                                          pdMS_TO_TICKS(APP_CSV_EXPORT_RADAR_RX_WAIT_MS)))
         {
-            if (APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
-            {
-                app_csv_export_print_radar_block(&radar_block);
-            }
+#if (APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
+            app_csv_export_print_radar_block(&radar_block);
+#endif
             app_uart_radar_release_block(radar_block.block_index);
             did_work = true;
         }
+#endif
 
         if (!did_work)
         {
@@ -101,6 +122,7 @@ void app_csv_export_task(void *pvParameters)
     }
 }
 
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
 #if (!APP_CSV_EXPORT_MIC_RAW_ENABLE)
 static uint16_t app_csv_export_abs_i16(int16_t sample)
 {
@@ -117,7 +139,9 @@ static bool app_csv_export_mic_block_is_valid(const app_pdm_pcm_block_t *block)
             (APP_PDM_PCM_BLOCK_COUNT > block->block_index) &&
             (&recorded_data[block->block_index][0] == block->data));
 }
+#endif
 
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE && APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
 static bool app_csv_export_radar_block_is_valid(const app_uart_radar_block_t *block)
 {
     uint16_t expected_len;
@@ -146,17 +170,26 @@ static bool app_csv_export_radar_block_is_valid(const app_uart_radar_block_t *bl
 
     return (expected_len == block->frame_len);
 }
+#endif
 
 static void app_csv_export_print_header(void)
 {
     printf("device,tick_ms,sequence,valid,block_index,sample_index,left,right,"
            "sample_count,min,max,peak_abs,mean_abs,frame_id,radar_type,"
            "frame_len,data_len,driver_drop,msg_drop,frame_hex,radar_decoded\r\n");
-#if (APP_CSV_EXPORT_MIC_BINARY_ENABLE)
+#if (APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_ONLY)
+    printf("# capture_mode=audio_only,mic=1,radar=0\r\n");
+#elif (APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_RADAR)
+    printf("# capture_mode=audio_radar,mic=1,radar=1\r\n");
+#else
+    printf("# capture_mode=radar_only,mic=0,radar=1\r\n");
+#endif
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE && APP_CSV_EXPORT_MIC_BINARY_ENABLE)
     printf("# audio_binary=PCMB,version=1,header_len=32,payload=int16_le_interleaved\r\n");
 #endif
 }
 
+#if (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE)
 static void app_csv_export_print_mic_block(const app_pdm_pcm_block_t *block)
 {
     bool valid = app_csv_export_mic_block_is_valid(block);
@@ -296,7 +329,9 @@ static void app_csv_export_put_u32_le(uint32_t value)
     putchar((int)((value >> 24) & 0xFFu));
 }
 #endif
+#endif
 
+#if (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE && APP_CSV_EXPORT_RADAR_PRINT_ENABLE)
 static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block)
 {
     bool valid = app_csv_export_radar_block_is_valid(block);
@@ -331,6 +366,7 @@ static void app_csv_export_print_radar_block(const app_uart_radar_block_t *block
     fflush(stdout);
 }
 
+#if (APP_CSV_EXPORT_RADAR_FRAME_HEX_ENABLE)
 static void app_csv_export_print_hex(const uint8_t *data, uint16_t len)
 {
     static const char hex[] = "0123456789ABCDEF";
@@ -347,6 +383,7 @@ static void app_csv_export_print_hex(const uint8_t *data, uint16_t len)
         putchar((int)hex[value & 0x0Fu]);
     }
 }
+#endif
 
 static void app_csv_export_print_radar_decoded(const app_uart_radar_block_t *block)
 {
@@ -533,3 +570,4 @@ static void app_csv_export_print_milli(int32_t value)
     fraction = magnitude % 1000u;
     printf("%lu.%03lu", (unsigned long)integer, (unsigned long)fraction);
 }
+#endif

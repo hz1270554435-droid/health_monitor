@@ -90,7 +90,9 @@ extern "C" {
  * APP_PDM_PCM_BLOCK_COUNT 是背压缓冲深度，推理任务短时变慢时可吸收抖动。 
  */
 #define APP_PDM_PCM_BLOCK_MS                       (10u)
+#ifndef APP_PDM_PCM_BLOCK_COUNT
 #define APP_PDM_PCM_BLOCK_COUNT                    (8u)
+#endif
 #define APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK       ((SAMPLE_RATE_HZ * APP_PDM_PCM_BLOCK_MS) / 1000u)
 #define APP_PDM_PCM_BLOCK_SAMPLES                  (NUM_CHANNELS * APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK)
 #define APP_PDM_PCM_TASK_STACK_SIZE                (1024u)

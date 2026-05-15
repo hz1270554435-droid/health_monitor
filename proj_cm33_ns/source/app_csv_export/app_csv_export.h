@@ -18,6 +18,35 @@ extern "C" {
 #define APP_CSV_EXPORT_ENABLE                 (1u)
 #endif
 
+/* CSV export capture mode.
+ *
+ * AUDIO_ONLY is the default for board-live audio mining: it keeps the high-rate
+ * MIC PCMB stream clean and avoids interleaved radar traffic on the debug UART.
+ * Use AUDIO_RADAR when synchronized MIC + radar sessions are needed, or
+ * RADAR_ONLY for radar parser/debug capture.
+ */
+#define APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_ONLY  (0u)
+#define APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_RADAR (1u)
+#define APP_CSV_EXPORT_CAPTURE_MODE_RADAR_ONLY  (2u)
+
+#ifndef APP_CSV_EXPORT_CAPTURE_MODE
+#define APP_CSV_EXPORT_CAPTURE_MODE           APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_ONLY
+#endif
+
+#if ((APP_CSV_EXPORT_CAPTURE_MODE != APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_ONLY) && \
+     (APP_CSV_EXPORT_CAPTURE_MODE != APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_RADAR) && \
+     (APP_CSV_EXPORT_CAPTURE_MODE != APP_CSV_EXPORT_CAPTURE_MODE_RADAR_ONLY))
+#error "Unsupported APP_CSV_EXPORT_CAPTURE_MODE"
+#endif
+
+#define APP_CSV_EXPORT_MIC_CAPTURE_ENABLE \
+    ((APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_ONLY) || \
+     (APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_RADAR))
+
+#define APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE \
+    ((APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_AUDIO_RADAR) || \
+     (APP_CSV_EXPORT_CAPTURE_MODE == APP_CSV_EXPORT_CAPTURE_MODE_RADAR_ONLY))
+
 /* Raw MIC CSV is bandwidth-heavy: at 16 kHz stereo it prints 16000 rows/s.
  * Use a fast debug UART, or set this to 0 for one summary row per MIC block.
  */
@@ -42,7 +71,12 @@ extern "C" {
  * This lets us test high-speed MIC export without interleaved radar text.
  */
 #ifndef APP_CSV_EXPORT_RADAR_PRINT_ENABLE
-#define APP_CSV_EXPORT_RADAR_PRINT_ENABLE     (1u)
+#define APP_CSV_EXPORT_RADAR_PRINT_ENABLE     APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE
+#endif
+
+#if ((APP_CSV_EXPORT_RADAR_PRINT_ENABLE != 0u) && \
+     (APP_CSV_EXPORT_RADAR_PRINT_ENABLE != 1u))
+#error "Unsupported APP_CSV_EXPORT_RADAR_PRINT_ENABLE"
 #endif
 
 #define APP_CSV_EXPORT_TASK_STACK_SIZE        (2048u)

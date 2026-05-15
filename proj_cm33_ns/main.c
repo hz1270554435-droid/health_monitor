@@ -44,6 +44,10 @@
 #include "app_model_result_monitor.h"
 #include "app_uart_radar.h"
 #include "app_csv_export.h"
+#include "app_ble_config.h"
+#if (APP_BLE_ENABLE)
+#include "app_ble_stream.h"
+#endif
 #include "retarget_io_init.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -148,15 +152,20 @@ int main(void)
      * 该任务只负责启动硬件并由 ISR 持续产出 10 ms 双通道 PCM block；
      * 后续由下面按运行模式选择的唯一消费者取走这些 block。
      */
+#if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) || \
+     (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE))
     result = app_pdm_pcm_task_init();
     handle_app_error(result);
     printf("[BOOT] PDM PCM task created\r\n");
     fflush(stdout);
+#endif
 
-#if ((APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT) || \
+#if (((APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT) && \
+      (APP_CSV_EXPORT_RADAR_CAPTURE_ENABLE)) || \
      (APP_RUNTIME_MODE == APP_RUNTIME_MODE_MIC_SELF_TEST))
     /* 测试/导出模式下启动雷达接收任务。
-     * CSV 导出会同时消费 MIC 和雷达队列；MIC 自检模式下也保留雷达自检入口，
+     * CSV 导出按 APP_CSV_EXPORT_CAPTURE_MODE 决定是否消费雷达队列；
+     * MIC 自检模式下也保留雷达自检入口，
      * 方便单板联调两个传感器。正式音频前处理模式暂不启动雷达任务，避免无人
      * 消费雷达队列时产生无意义背压。
      */
@@ -197,8 +206,9 @@ int main(void)
     fflush(stdout);
 #endif
 #elif (APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT)
-    /* 训练/采集数据模式：CSV 导出任务同时消费 MIC 和雷达队列，并通过 debug UART
-     * 输出带 device 标签的数据流。该模式用于 PC 端采集，不运行正式前处理任务。
+    /* 训练/采集数据模式：CSV 导出任务按 APP_CSV_EXPORT_CAPTURE_MODE 消费 MIC
+     * 和/或雷达队列，并通过 debug UART 输出带 device 标签的数据流。该模式用于
+     * PC 端采集，不运行正式前处理任务。
      */
     result = app_csv_export_task_init();
     handle_app_error(result);
@@ -216,6 +226,21 @@ int main(void)
      */
     result = app_get_data_test_task_init();
     handle_app_error(result);
+#endif
+
+#if (APP_BLE_ENABLE)
+    result = app_ble_stream_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] BLE Stage 1 init failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+    printf("[BOOT] BLE Stage 1 task created, fake=%u, stack=%u\r\n",
+           (unsigned int)APP_BLE_FAKE_DATA_ENABLE,
+           (unsigned int)APP_BLE_STACK_ENABLE);
+    fflush(stdout);
 #endif
 
     /* 启动 CM55。
