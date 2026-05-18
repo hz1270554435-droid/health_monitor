@@ -247,6 +247,8 @@ const char *app_ble_error_name(app_ble_error_t error)
             return "STACK_FAILED";
         case APP_BLE_ERR_CMD_NOT_READY:
             return "CMD_NOT_READY";
+        case APP_BLE_ERR_BUSY:
+            return "BUSY";
         default:
             return "UNKNOWN";
     }

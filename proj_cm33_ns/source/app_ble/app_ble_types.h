@@ -36,7 +36,8 @@ typedef enum
     APP_BLE_ERR_CMD_UNSUPPORTED = 8,
     APP_BLE_ERR_CMD_DENIED = 9,
     APP_BLE_ERR_STACK_FAILED = 10,
-    APP_BLE_ERR_CMD_NOT_READY = 11
+    APP_BLE_ERR_CMD_NOT_READY = 11,
+    APP_BLE_ERR_BUSY = 12
 } app_ble_error_t;
 
 typedef enum
@@ -165,7 +166,26 @@ typedef struct
     uint32_t notify_fail;
     uint32_t realtime_drop;
     uint32_t event_drop;
+    uint32_t realtime_no_sub;
+    uint32_t realtime_busy_drop;
+    uint32_t realtime_oversize_drop;
+    uint32_t event_no_sub;
+    uint32_t event_busy_drop;
+    uint32_t event_oversize_drop;
+    uint32_t transport_err;
+    uint32_t cmd_rx;
+    uint32_t cmd_ok;
+    uint32_t cmd_unsupported;
+    uint32_t cmd_not_ready;
+    uint32_t cmd_denied;
+    uint32_t cmd_crc_err;
+    uint32_t cmd_rsp_notify_ok;
+    uint32_t cmd_rsp_notify_fail;
+    uint32_t cmd_rsp_no_sub;
+    uint32_t cmd_rsp_busy_drop;
+    uint32_t cmd_rsp_oversize_drop;
     uint32_t cmd_count;
+    uint32_t cmd_drop;
     uint32_t disconnect_count;
     uint16_t mtu;
     uint8_t connected;

@@ -42,6 +42,7 @@ extern "C" {
 
 #define APP_BLE_REALTIME_QUEUE_DEPTH      (4u)
 #define APP_BLE_EVENT_QUEUE_DEPTH         (8u)
+#define APP_BLE_CMD_RAW_QUEUE_DEPTH       (4u)
 
 #define APP_BLE_TIME_SYNC_MIN_EPOCH_S     (1577836800UL)
 #define APP_BLE_TIME_SYNC_MAX_EPOCH_S     (4102444800UL)
@@ -56,6 +57,10 @@ extern "C" {
 
 #if ((APP_BLE_STACK_ENABLE != 0u) && (APP_BLE_STACK_ENABLE != 1u))
 #error "Unsupported APP_BLE_STACK_ENABLE"
+#endif
+
+#if ((APP_BLE_DIAG_ENABLE != 0u) && (APP_BLE_DIAG_ENABLE != 1u))
+#error "Unsupported APP_BLE_DIAG_ENABLE"
 #endif
 
 #if ((APP_BLE_STACK_ENABLE != 0u) && (APP_BLE_ENABLE == 0u))

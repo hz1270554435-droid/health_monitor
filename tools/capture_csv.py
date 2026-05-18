@@ -221,6 +221,15 @@ def parse_args() -> argparse.Namespace:
         help="Audio channel count used for WAV headers.",
     )
     parser.add_argument(
+        "--audio-mix-mode",
+        choices=("left", "right", "average", "select-best"),
+        default="left",
+        help=(
+            "When writing mono WAV from stereo board PCM, choose the source "
+            "channel. select-best matches the firmware block-energy selector."
+        ),
+    )
+    parser.add_argument(
         "--audio-bit-depth",
         type=int,
         default=16,
@@ -231,6 +240,14 @@ def parse_args() -> argparse.Namespace:
         "--list-ports",
         action="store_true",
         help="List serial ports and exit.",
+    )
+    parser.add_argument(
+        "--expand-binary-audio-csv",
+        action="store_true",
+        help=(
+            "Expand PCMB binary audio blocks into per-sample mic rows in the "
+            "combined/mic CSV files. This can create very large CSV files."
+        ),
     )
     return parser.parse_args()
 
@@ -305,6 +322,32 @@ def sanitize_text(data: bytes) -> str:
         else:
             chars.append(".")
     return "".join(chars).strip()
+
+
+def parse_metadata_comment(line: str) -> dict[str, str]:
+    """Parse firmware metadata comments such as '# capture_mode=audio_only,...'."""
+
+    text = line.strip()
+    if not text.startswith("#"):
+        return {}
+
+    text = text[1:].strip()
+    if not text:
+        return {}
+
+    metadata: dict[str, str] = {}
+    try:
+        parts = next(csv.reader([text]))
+    except csv.Error:
+        parts = text.split(",")
+
+    for part in parts:
+        key, sep, value = part.partition("=")
+        if sep:
+            key = key.strip()
+            if key:
+                metadata[key] = value.strip()
+    return metadata
 
 
 def decode_radar_payload(row: list[str]) -> str:
@@ -440,6 +483,7 @@ class AudioSessionWriter:
         self.distance_cm = args.distance_cm
         self.fs = args.audio_fs
         self.channels = args.audio_channels
+        self.mix_mode = args.audio_mix_mode
         self.bit_depth = args.audio_bit_depth
         self.session_sec = args.audio_session_sec
         self.max_frames = self.fs * self.session_sec
@@ -450,6 +494,10 @@ class AudioSessionWriter:
         self.frames = 0
         self.wav_file = None
         self.json_path: Path | None = None
+        self.capture_metadata: dict[str, str] = {}
+
+    def set_capture_metadata(self, metadata: dict[str, str]) -> None:
+        self.capture_metadata = dict(metadata)
 
     def write_row(self, row: list[str], now: datetime) -> None:
         if row[0].strip().lower() != "mic" or row[3].strip() != "1":
@@ -474,6 +522,11 @@ class AudioSessionWriter:
         if channels not in (1, 2):
             return
 
+        if channels == 2 and self.channels == 1:
+            for sample in self._mono_samples_from_stereo(samples):
+                self._write_sample(tick_ms, sample, sample, now)
+            return
+
         for offset in range(0, len(samples), channels):
             left = samples[offset]
             right = samples[offset + 1] if channels == 2 else 0
@@ -487,11 +540,35 @@ class AudioSessionWriter:
             self._open_session(tick_ms, now)
 
         if self.channels == 1:
-            self.wav_file.writeframesraw(struct.pack("<h", left))
+            self.wav_file.writeframesraw(struct.pack("<h", self._mono_sample(left, right)))
         else:
             self.wav_file.writeframesraw(struct.pack("<hh", left, right))
 
         self.frames += 1
+
+    def _mono_samples_from_stereo(self, samples: tuple[int, ...]) -> list[int]:
+        if self.mix_mode == "select-best":
+            left_energy = 0
+            right_energy = 0
+            for offset in range(0, len(samples), 2):
+                left = samples[offset]
+                right = samples[offset + 1]
+                left_energy += left * left
+                right_energy += right * right
+            selected_offset = 0 if left_energy >= right_energy else 1
+            return [samples[offset + selected_offset] for offset in range(0, len(samples), 2)]
+
+        return [
+            self._mono_sample(samples[offset], samples[offset + 1])
+            for offset in range(0, len(samples), 2)
+        ]
+
+    def _mono_sample(self, left: int, right: int) -> int:
+        if self.mix_mode == "right":
+            return right
+        if self.mix_mode == "average":
+            return int((left + right) / 2)
+        return left
 
     def close(self, complete: bool = False) -> None:
         if self.wav_file is None:
@@ -503,11 +580,13 @@ class AudioSessionWriter:
             "person_id": self.person_id,
             "fs": self.fs,
             "channels": self.channels,
+            "audio_mix_mode": self.mix_mode if self.channels == 1 else "stereo",
             "bit_depth": self.bit_depth,
             "scene": self.scene,
             "distance_cm": self.distance_cm,
             "start_tick_ms": self.start_tick_ms,
             "duration_s": duration_s,
+            "capture_metadata": dict(self.capture_metadata),
         }
 
         self.wav_file.close()
@@ -562,6 +641,10 @@ class RadarSessionWriter:
         self.raw_writer = None
         self.json_path: Path | None = None
         self.session_csv_paths: list[Path] = []
+        self.capture_metadata: dict[str, str] = {}
+
+    def set_capture_metadata(self, metadata: dict[str, str]) -> None:
+        self.capture_metadata = dict(metadata)
 
     def write_row(self, row: list[str], now: datetime) -> None:
         if row[0].strip().lower() != "radar":
@@ -645,6 +728,7 @@ class RadarSessionWriter:
             "scene": self.scene,
             "calibrated": self.calibrated,
             "notes": self.notes,
+            "capture_metadata": dict(self.capture_metadata),
         }
 
         self.csv_file.close()
@@ -754,6 +838,10 @@ class TrainingSessionExporter:
         (root / "radar").mkdir(parents=True, exist_ok=True)
         self.audio = AudioSessionWriter(args, root)
         self.radar = RadarSessionWriter(args, root)
+
+    def set_capture_metadata(self, metadata: dict[str, str]) -> None:
+        self.audio.set_capture_metadata(metadata)
+        self.radar.set_capture_metadata(metadata)
 
     def write_row(self, row: list[str]) -> None:
         now = datetime.now()
@@ -939,6 +1027,7 @@ def main() -> int:
         raw_file = raw_path.open("wb")
 
     if not args.no_split:
+        mic_file, mic_writer = open_writer(str(mic_path))
         radar_file, radar_writer = open_writer(str(radar_path))
 
     deadline = None if args.duration <= 0 else time.monotonic() + args.duration
@@ -947,6 +1036,7 @@ def main() -> int:
     binary_frames = 0
     radar_merged_path = None
     radar_merged_rows = 0
+    capture_metadata: dict[str, str] = {}
 
     def process_text_line(line: str) -> None:
         nonlocal rows, skipped
@@ -954,7 +1044,12 @@ def main() -> int:
         line = line.strip()
         if not line:
             return
-        if line.startswith("device,") or line.startswith("#"):
+        if line.startswith("#"):
+            capture_metadata.update(parse_metadata_comment(line))
+            if session_exporter is not None:
+                session_exporter.set_capture_metadata(capture_metadata)
+            return
+        if line.startswith("device,"):
             return
 
         try:
@@ -1019,6 +1114,21 @@ def main() -> int:
         if session_exporter is not None:
             session_exporter.audio.write_pcm_block(tick_ms, samples, channels, now)
 
+        if args.expand_binary_audio_csv:
+            for row in mic_rows_from_binary_frame(
+                tick_ms,
+                sequence,
+                block_index,
+                samples,
+                channels,
+                samples_per_channel,
+                driver_drop,
+                msg_drop,
+            ):
+                combined_writer.writerow(row)
+                if mic_writer is not None:
+                    mic_writer.writerow(row)
+
         rows += samples_per_channel
         binary_frames += 1
 
@@ -1028,6 +1138,7 @@ def main() -> int:
             print(f"Run output directory: {run_output_dir}")
             print(f"Combined CSV: {combined_path}")
             if not args.no_split:
+                print(f"MIC CSV: {mic_path}")
                 print(f"Radar debug CSV: {radar_path}")
             if session_exporter is not None:
                 print(f"Training sessions: {session_exporter.root}")

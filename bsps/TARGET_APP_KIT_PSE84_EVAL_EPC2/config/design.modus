@@ -107,12 +107,6 @@
                         <Alias value="CYBSP_ETH_RXD_1"/>
                     </Aliases>
                 </Block>
-                <Block location="ioss[0].port[11].pin[0]">
-                    <Aliases>
-                        <Alias value="CYBSP_BT_POWER"/>
-                        <Alias value="CYBSP_ETH_RXD_2"/>
-                    </Aliases>
-                </Block>
                 <Block location="ioss[0].port[11].pin[1]">
                     <Aliases>
                         <Alias value="CYBSP_ARD_D7"/>
@@ -1219,6 +1213,28 @@
                         <Param id="extended_drive_sel" value="false"/>
                         <Param id="inFlash" value="true"/>
                         <Param id="initialState" value="0"/>
+                        <Param id="isrTrigger" value="CY_GPIO_INTR_DISABLE"/>
+                        <Param id="nonSec" value="1"/>
+                        <Param id="pullUpRes" value="CY_GPIO_PULLUP_RES_DISABLE"/>
+                        <Param id="sioOutputBuffer" value="true"/>
+                        <Param id="slewRate" value="CY_GPIO_SLEW_FAST"/>
+                        <Param id="vtrip" value="CY_GPIO_VTRIP_CMOS"/>
+                    </Parameters>
+                </Personality>
+                <Personality template="pin" version="3.0" instance="Leb7Zavkim4">
+                    <Block location="ioss[0].port[11].pin[0]" locked="true">
+                        <Aliases>
+                            <Alias value="CYBSP_BT_POWER"/>
+                            <Alias value="CYBSP_ETH_RXD_2"/>
+                        </Aliases>
+                    </Block>
+                    <Parameters>
+                        <Param id="DriveModes" value="CY_GPIO_DM_STRONG_IN_OFF"/>
+                        <Param id="driveStrength" value="CY_GPIO_DRIVE_1_2"/>
+                        <Param id="driveStrengthTrim" value="CY_GPIO_DRIVE_STRENGTH_DEFAULT"/>
+                        <Param id="extended_drive_sel" value="false"/>
+                        <Param id="inFlash" value="true"/>
+                        <Param id="initialState" value="1"/>
                         <Param id="isrTrigger" value="CY_GPIO_INTR_DISABLE"/>
                         <Param id="nonSec" value="1"/>
                         <Param id="pullUpRes" value="CY_GPIO_PULLUP_RES_DISABLE"/>

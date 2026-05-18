@@ -12,6 +12,10 @@
         "locked-commit": "release-v2.2.0"
     },
     {
+        "asset-name": "btstack",
+        "locked-commit": "release-v4.1.5"
+    },
+    {
         "asset-name": "clib-support",
         "locked-commit": "release-v1.8.0"
     },

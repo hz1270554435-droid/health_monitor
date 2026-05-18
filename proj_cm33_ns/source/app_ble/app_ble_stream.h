@@ -13,6 +13,8 @@ cy_rslt_t app_ble_stream_init(void);
 cy_rslt_t app_ble_publish_realtime(
     const app_ble_realtime_sample_t *sample);
 cy_rslt_t app_ble_publish_event(const app_ble_event_t *event);
+cy_rslt_t app_ble_stream_enqueue_raw_command(const uint8_t *data,
+                                             uint16_t len);
 void app_ble_stream_process(void);
 
 #if defined(__cplusplus)

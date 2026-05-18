@@ -9,6 +9,10 @@
 
 #include "app_ble_cmd.h"
 #include "app_ble_config.h"
+#if (APP_BLE_STACK_ENABLE)
+#include "app_ble_core.h"
+#include "app_ble_gatt.h"
+#endif
 #include "app_ble_diag.h"
 #include "app_ble_protocol.h"
 
@@ -18,19 +22,46 @@ static QueueHandle_t ble_realtime_queue;
 static QueueHandle_t ble_event_queue;
 static TaskHandle_t ble_task_handle;
 
+#if (APP_BLE_STACK_ENABLE)
+typedef struct
+{
+    uint16_t len;
+    uint8_t data[APP_BLE_COMMAND_FRAME_MAX_LEN];
+} app_ble_raw_command_item_t;
+
+static QueueHandle_t ble_cmd_raw_queue;
+#endif
+
+#if (APP_BLE_FAKE_DATA_ENABLE)
 static uint32_t fake_last_realtime_ms;
 static uint32_t fake_last_event_ms;
-static uint32_t stat_last_print_ms;
 static uint32_t fake_event_id;
+#endif
+
+#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
 static bool fake_commands_done;
+#endif
+
+static uint32_t stat_last_print_ms;
 
 static void app_ble_stream_task(void *pvParameters);
 static uint32_t app_ble_stream_now_ms(void);
 static uint32_t app_ble_stream_now_s(void);
+static void app_ble_stream_process_raw_commands(void);
+#if (APP_BLE_STACK_ENABLE)
+static bool app_ble_stream_make_error_response_from_raw(
+    const app_ble_raw_command_item_t *item,
+    app_ble_error_t status,
+    app_ble_cmd_response_t *resp);
+static void app_ble_stream_send_cmd_response(
+    const app_ble_cmd_response_t *resp);
+#endif
 static void app_ble_stream_maybe_publish_fake(uint32_t now_ms);
 static void app_ble_stream_run_fake_commands_once(void);
+#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
 static void app_ble_stream_run_fake_command(const app_ble_command_t *cmd);
 static void app_ble_stream_make_time_sync_cmd(app_ble_command_t *cmd);
+#endif
 static void app_ble_stream_print_stat(uint32_t now_ms);
 
 cy_rslt_t app_ble_stream_init(void)
@@ -45,15 +76,34 @@ cy_rslt_t app_ble_stream_init(void)
     app_ble_diag_reset();
     app_ble_protocol_reset_sequences();
 
+#if (APP_BLE_STACK_ENABLE)
+    if (CY_RSLT_SUCCESS != app_ble_core_init())
+    {
+        app_ble_diag_set_last_error(APP_BLE_ERR_STACK_FAILED);
+        return CY_RSLT_TYPE_ERROR;
+    }
+#endif
+
     ble_realtime_queue = xQueueCreate(APP_BLE_REALTIME_QUEUE_DEPTH,
                                       sizeof(app_ble_realtime_sample_t));
     ble_event_queue = xQueueCreate(APP_BLE_EVENT_QUEUE_DEPTH,
                                    sizeof(app_ble_event_t));
+#if (APP_BLE_STACK_ENABLE)
+    ble_cmd_raw_queue = xQueueCreate(APP_BLE_CMD_RAW_QUEUE_DEPTH,
+                                     sizeof(app_ble_raw_command_item_t));
+#endif
     if ((NULL == ble_realtime_queue) || (NULL == ble_event_queue))
     {
         app_ble_diag_set_last_error(APP_BLE_ERR_QUEUE_FULL);
         return CY_RSLT_TYPE_ERROR;
     }
+#if (APP_BLE_STACK_ENABLE)
+    if (NULL == ble_cmd_raw_queue)
+    {
+        app_ble_diag_set_last_error(APP_BLE_ERR_QUEUE_FULL);
+        return CY_RSLT_TYPE_ERROR;
+    }
+#endif
 
     ret = xTaskCreate(app_ble_stream_task,
                       "ble_stage1",
@@ -110,6 +160,43 @@ cy_rslt_t app_ble_publish_event(const app_ble_event_t *event)
     return CY_RSLT_SUCCESS;
 }
 
+cy_rslt_t app_ble_stream_enqueue_raw_command(const uint8_t *data,
+                                             uint16_t len)
+{
+#if (APP_BLE_STACK_ENABLE)
+    app_ble_raw_command_item_t item;
+
+    if ((NULL == data) || (0u == len) ||
+        (APP_BLE_COMMAND_FRAME_MAX_LEN < len))
+    {
+        app_ble_diag_note_cmd_drop(APP_BLE_ERR_INVALID_ARG);
+        return (cy_rslt_t)APP_BLE_ERR_INVALID_ARG;
+    }
+
+    if (NULL == ble_cmd_raw_queue)
+    {
+        app_ble_diag_note_cmd_drop(APP_BLE_ERR_NOT_INIT);
+        return (cy_rslt_t)APP_BLE_ERR_NOT_INIT;
+    }
+
+    memset(&item, 0, sizeof(item));
+    item.len = len;
+    memcpy(item.data, data, len);
+
+    if (pdPASS != xQueueSend(ble_cmd_raw_queue, &item, 0u))
+    {
+        app_ble_diag_note_cmd_drop(APP_BLE_ERR_QUEUE_FULL);
+        return (cy_rslt_t)APP_BLE_ERR_QUEUE_FULL;
+    }
+
+    return CY_RSLT_SUCCESS;
+#else
+    (void)data;
+    (void)len;
+    return (cy_rslt_t)APP_BLE_ERR_CMD_NOT_READY;
+#endif
+}
+
 void app_ble_stream_process(void)
 {
     app_ble_realtime_sample_t sample;
@@ -117,9 +204,28 @@ void app_ble_stream_process(void)
     uint8_t frame[APP_BLE_CMD_RESPONSE_FRAME_MAX_LEN];
     uint16_t frame_len = 0u;
 
+    app_ble_stream_process_raw_commands();
+
     while ((NULL != ble_event_queue) &&
            (pdPASS == xQueueReceive(ble_event_queue, &event, 0u)))
     {
+#if (APP_BLE_STACK_ENABLE)
+        if (CY_RSLT_SUCCESS == app_ble_pack_event(&event,
+                                                  frame,
+                                                  sizeof(frame),
+                                                  &frame_len))
+        {
+            if (CY_RSLT_SUCCESS == app_ble_gatt_notify_event(frame,
+                                                             frame_len))
+            {
+                app_ble_diag_note_notify_ok();
+            }
+        }
+        else
+        {
+            app_ble_diag_note_notify_fail(APP_BLE_ERR_PACK_FAILED);
+        }
+#else
         if (CY_RSLT_SUCCESS == app_ble_pack_event(&event,
                                                   frame,
                                                   sizeof(frame),
@@ -146,6 +252,7 @@ void app_ble_stream_process(void)
         {
             app_ble_diag_note_notify_fail(APP_BLE_ERR_PACK_FAILED);
         }
+#endif
     }
 
     while ((NULL != ble_realtime_queue) &&
@@ -156,6 +263,13 @@ void app_ble_stream_process(void)
                                                      sizeof(frame),
                                                      &frame_len))
         {
+#if (APP_BLE_STACK_ENABLE)
+            if (CY_RSLT_SUCCESS == app_ble_gatt_notify_realtime(frame,
+                                                                frame_len))
+            {
+                app_ble_diag_note_notify_ok();
+            }
+#else
             app_ble_diag_note_notify_ok();
 #if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
             printf("[BLE_FAKE] realtime seq=%u rr=%u hr=%u state=%s "
@@ -167,6 +281,7 @@ void app_ble_stream_process(void)
                    (unsigned int)frame_len,
                    (unsigned int)frame[frame_len - 1u]);
 #endif
+#endif
         }
         else
         {
@@ -174,6 +289,167 @@ void app_ble_stream_process(void)
         }
     }
 }
+
+static void app_ble_stream_process_raw_commands(void)
+{
+#if (APP_BLE_STACK_ENABLE)
+    app_ble_raw_command_item_t item;
+    app_ble_command_t cmd;
+    app_ble_cmd_response_t resp;
+    app_ble_error_t decode_status;
+
+    while ((NULL != ble_cmd_raw_queue) &&
+           (pdPASS == xQueueReceive(ble_cmd_raw_queue, &item, 0u)))
+    {
+        memset(&cmd, 0, sizeof(cmd));
+        memset(&resp, 0, sizeof(resp));
+        app_ble_diag_note_cmd_rx();
+
+        decode_status = app_ble_unpack_command_status(item.data,
+                                                      item.len,
+                                                      &cmd);
+        if (APP_BLE_OK == decode_status)
+        {
+            if (CY_RSLT_SUCCESS != app_ble_cmd_handle(&cmd, &resp))
+            {
+                resp.seq = cmd.seq;
+                resp.command_id = cmd.command_id;
+                resp.ts_s = app_ble_stream_now_s();
+                resp.status = APP_BLE_ERR_INVALID_ARG;
+            }
+            app_ble_diag_note_cmd_result(resp.status);
+        }
+        else
+        {
+            if (APP_BLE_ERR_CRC_FAILED == decode_status)
+            {
+                app_ble_diag_note_cmd_crc_err();
+            }
+            else
+            {
+                app_ble_diag_note_cmd_result(decode_status);
+            }
+
+            if (!app_ble_stream_make_error_response_from_raw(&item,
+                                                             decode_status,
+                                                             &resp))
+            {
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+                printf("[BLE_CMD] id=UNKNOWN_CMD result=%s drop len=%u\r\n",
+                       app_ble_error_name(decode_status),
+                       (unsigned int)item.len);
+#endif
+                continue;
+            }
+        }
+
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+        if (((APP_BLE_CMD_START_MONITOR == resp.command_id) ||
+             (APP_BLE_CMD_STOP_MONITOR == resp.command_id)) &&
+            (APP_BLE_OK == resp.status))
+        {
+            printf("[BLE_CMD] id=%s result=%s monitor=%u\r\n",
+                   app_ble_cmd_name(resp.command_id),
+                   app_ble_error_name(resp.status),
+                   app_ble_cmd_monitor_is_requested() ? 1u : 0u);
+        }
+        else if ((APP_BLE_CMD_SET_ALERT_THRESHOLD == resp.command_id) &&
+                 (APP_BLE_OK == resp.status))
+        {
+            app_ble_alert_threshold_config_t threshold;
+
+            app_ble_cmd_get_alert_threshold_config(&threshold);
+            printf("[BLE_CMD] id=%s result=%s cough=%u warn=%u high=%u\r\n",
+                   app_ble_cmd_name(resp.command_id),
+                   app_ble_error_name(resp.status),
+                   (unsigned int)threshold.cough_prob_threshold,
+                   (unsigned int)threshold.warning_event_threshold,
+                   (unsigned int)threshold.high_risk_event_threshold);
+        }
+        else
+        {
+            printf("[BLE_CMD] id=%s result=%s\r\n",
+                   app_ble_cmd_name(resp.command_id),
+                   app_ble_error_name(resp.status));
+        }
+#endif
+        app_ble_stream_send_cmd_response(&resp);
+    }
+#endif
+}
+
+#if (APP_BLE_STACK_ENABLE)
+static bool app_ble_stream_make_error_response_from_raw(
+    const app_ble_raw_command_item_t *item,
+    app_ble_error_t status,
+    app_ble_cmd_response_t *resp)
+{
+    if ((NULL == item) || (NULL == resp) ||
+        (APP_BLE_COMMAND_FRAME_MIN_LEN > item->len))
+    {
+        return false;
+    }
+
+    if ((APP_BLE_PROTOCOL_MAGIC != item->data[0]) ||
+        (APP_BLE_PROTOCOL_VERSION != item->data[1]) ||
+        (APP_BLE_MSG_COMMAND != item->data[2]))
+    {
+        return false;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+    resp->seq = item->data[3];
+    resp->command_id = item->data[9];
+    resp->ts_s = app_ble_stream_now_s();
+    resp->status = status;
+
+    return true;
+}
+
+static void app_ble_stream_send_cmd_response(
+    const app_ble_cmd_response_t *resp)
+{
+    uint8_t frame[APP_BLE_CMD_RESPONSE_FRAME_MAX_LEN];
+    uint16_t frame_len = 0u;
+    cy_rslt_t result;
+
+    if (NULL == resp)
+    {
+        app_ble_diag_note_cmd_rsp_notify_fail(APP_BLE_ERR_INVALID_ARG);
+        return;
+    }
+
+    if (CY_RSLT_SUCCESS != app_ble_pack_cmd_response(resp,
+                                                     frame,
+                                                     sizeof(frame),
+                                                     &frame_len))
+    {
+        app_ble_diag_note_cmd_rsp_notify_fail(APP_BLE_ERR_PACK_FAILED);
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+        printf("[BLE_CMD_RSP] pack failed result=%s\r\n",
+               app_ble_error_name(APP_BLE_ERR_PACK_FAILED));
+#endif
+        return;
+    }
+
+    result = app_ble_gatt_notify_cmd_response(frame, frame_len);
+    if (CY_RSLT_SUCCESS == result)
+    {
+        app_ble_diag_note_cmd_rsp_notify_ok();
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+        printf("[BLE_CMD_RSP] notify ok len=%u\r\n",
+               (unsigned int)frame_len);
+#endif
+        return;
+    }
+
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+    printf("[BLE_CMD_RSP] notify skipped result=%s len=%u\r\n",
+           app_ble_error_name((app_ble_error_t)result),
+           (unsigned int)frame_len);
+#endif
+}
+#endif
 
 static void app_ble_stream_task(void *pvParameters)
 {
@@ -212,9 +488,37 @@ static uint32_t app_ble_stream_now_s(void)
 
 static void app_ble_stream_maybe_publish_fake(uint32_t now_ms)
 {
-#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
-    if ((0u == fake_last_realtime_ms) ||
-        ((now_ms - fake_last_realtime_ms) >= APP_BLE_REALTIME_PERIOD_MS))
+#if (APP_BLE_FAKE_DATA_ENABLE)
+    bool realtime_due = ((0u == fake_last_realtime_ms) ||
+        ((now_ms - fake_last_realtime_ms) >= APP_BLE_REALTIME_PERIOD_MS));
+    bool event_due = ((0u == fake_last_event_ms) ||
+        ((now_ms - fake_last_event_ms) >= APP_BLE_EVENT_FAKE_PERIOD_MS));
+
+#if (APP_BLE_STACK_ENABLE)
+    if (event_due)
+    {
+        app_ble_event_t event = {
+            .event_id = ++fake_event_id,
+            .ts_s = app_ble_stream_now_s(),
+            .event_type = APP_BLE_EVENT_COUGH,
+            .severity = 2u,
+            .confidence = 87u,
+            .duration_s = 1u,
+            .source_flags = (uint8_t)(APP_BLE_EVENT_SOURCE_AUDIO |
+                                      APP_BLE_EVENT_SOURCE_FUSION)
+        };
+
+        (void)app_ble_publish_event(&event);
+        fake_last_event_ms = now_ms;
+        if (realtime_due)
+        {
+            app_ble_diag_note_realtime_busy_drop();
+            realtime_due = false;
+        }
+    }
+#endif
+
+    if (realtime_due)
     {
         uint32_t tick_s = app_ble_stream_now_s();
         app_ble_realtime_sample_t sample = {
@@ -243,8 +547,8 @@ static void app_ble_stream_maybe_publish_fake(uint32_t now_ms)
         fake_last_realtime_ms = now_ms;
     }
 
-    if ((0u == fake_last_event_ms) ||
-        ((now_ms - fake_last_event_ms) >= APP_BLE_EVENT_FAKE_PERIOD_MS))
+#if (!APP_BLE_STACK_ENABLE)
+    if (event_due)
     {
         app_ble_event_t event = {
             .event_id = ++fake_event_id,
@@ -260,6 +564,7 @@ static void app_ble_stream_maybe_publish_fake(uint32_t now_ms)
         (void)app_ble_publish_event(&event);
         fake_last_event_ms = now_ms;
     }
+#endif
 #else
     (void)now_ms;
 #endif
@@ -296,6 +601,7 @@ static void app_ble_stream_run_fake_commands_once(void)
 #endif
 }
 
+#if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
 static void app_ble_stream_run_fake_command(const app_ble_command_t *cmd)
 {
     app_ble_cmd_response_t resp;
@@ -326,10 +632,23 @@ static void app_ble_stream_run_fake_command(const app_ble_command_t *cmd)
     }
 
 #if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
-    printf("[BLE_CMD] id=%s result=%s resp_len=%u\r\n",
-           app_ble_cmd_name(cmd->command_id),
-           app_ble_error_name(resp.status),
-           (unsigned int)frame_len);
+    if (((APP_BLE_CMD_START_MONITOR == cmd->command_id) ||
+         (APP_BLE_CMD_STOP_MONITOR == cmd->command_id)) &&
+        (APP_BLE_OK == resp.status))
+    {
+        printf("[BLE_CMD] id=%s result=%s monitor=%u resp_len=%u\r\n",
+               app_ble_cmd_name(cmd->command_id),
+               app_ble_error_name(resp.status),
+               app_ble_cmd_monitor_is_requested() ? 1u : 0u,
+               (unsigned int)frame_len);
+    }
+    else
+    {
+        printf("[BLE_CMD] id=%s result=%s resp_len=%u\r\n",
+               app_ble_cmd_name(cmd->command_id),
+               app_ble_error_name(resp.status),
+               (unsigned int)frame_len);
+    }
     if (APP_BLE_OK != resp.status)
     {
         printf("[BLE_ERR] code=%s detail=%s\r\n",
@@ -357,11 +676,24 @@ static void app_ble_stream_make_time_sync_cmd(app_ble_command_t *cmd)
     cmd->payload[2] = (uint8_t)((epoch_s >> 16u) & 0xFFu);
     cmd->payload[3] = (uint8_t)((epoch_s >> 24u) & 0xFFu);
 }
+#endif
 
 static void app_ble_stream_print_stat(uint32_t now_ms)
 {
 #if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
     app_ble_diag_t diag;
+    uint8_t monitor = app_ble_cmd_monitor_is_requested() ? 1u : 0u;
+    app_ble_alert_threshold_config_t threshold;
+#if (APP_BLE_STACK_ENABLE)
+    uint8_t rt_tx_busy = app_ble_gatt_is_realtime_tx_busy() ? 1u : 0u;
+    uint8_t evt_tx_busy = app_ble_gatt_is_event_tx_busy() ? 1u : 0u;
+    uint8_t cmd_rsp_tx_busy =
+        app_ble_gatt_is_cmd_response_tx_busy() ? 1u : 0u;
+#else
+    uint8_t rt_tx_busy = 0u;
+    uint8_t evt_tx_busy = 0u;
+    uint8_t cmd_rsp_tx_busy = 0u;
+#endif
 
     if ((0u != stat_last_print_ms) &&
         ((now_ms - stat_last_print_ms) < APP_BLE_STAT_PRINT_PERIOD_MS))
@@ -369,17 +701,50 @@ static void app_ble_stream_print_stat(uint32_t now_ms)
         return;
     }
 
+    app_ble_cmd_get_alert_threshold_config(&threshold);
+
     if (CY_RSLT_SUCCESS == app_ble_get_diag(&diag))
     {
-        printf("[BLE_STAT] conn=%u mtu=%u sent=%lu fail=%lu drop_rt=%lu "
-               "drop_evt=%lu cmd=%lu err=%u\r\n",
+        printf("[BLE_STAT] conn=%u mtu=%u notify_ok=%lu notify_fail=%lu "
+               "drop_rt=%lu no_sub_rt=%lu busy_rt=%lu oversize_rt=%lu "
+               "drop_evt=%lu no_sub_evt=%lu busy_evt=%lu oversize_evt=%lu "
+               "transport_err=%lu rt_tx_busy=%u evt_tx_busy=%u "
+               "cmd_rsp_tx_busy=%u monitor=%u thr_cough=%u thr_warn=%u "
+               "thr_high=%u cmd_rx=%lu cmd=%lu cmd_ok=%lu "
+               "cmd_unsupported=%lu cmd_not_ready=%lu cmd_denied=%lu "
+               "cmd_crc_err=%lu cmd_rsp_ok=%lu cmd_rsp_fail=%lu "
+               "cmd_rsp_no_sub=%lu cmd_drop=%lu err=%u\r\n",
                (unsigned int)diag.connected,
                (unsigned int)diag.mtu,
                (unsigned long)diag.notify_ok,
                (unsigned long)diag.notify_fail,
                (unsigned long)diag.realtime_drop,
+               (unsigned long)diag.realtime_no_sub,
+               (unsigned long)diag.realtime_busy_drop,
+               (unsigned long)diag.realtime_oversize_drop,
                (unsigned long)diag.event_drop,
+               (unsigned long)diag.event_no_sub,
+               (unsigned long)diag.event_busy_drop,
+               (unsigned long)diag.event_oversize_drop,
+               (unsigned long)diag.transport_err,
+               (unsigned int)rt_tx_busy,
+               (unsigned int)evt_tx_busy,
+               (unsigned int)cmd_rsp_tx_busy,
+               (unsigned int)monitor,
+               (unsigned int)threshold.cough_prob_threshold,
+               (unsigned int)threshold.warning_event_threshold,
+               (unsigned int)threshold.high_risk_event_threshold,
+               (unsigned long)diag.cmd_rx,
                (unsigned long)diag.cmd_count,
+               (unsigned long)diag.cmd_ok,
+               (unsigned long)diag.cmd_unsupported,
+               (unsigned long)diag.cmd_not_ready,
+               (unsigned long)diag.cmd_denied,
+               (unsigned long)diag.cmd_crc_err,
+               (unsigned long)diag.cmd_rsp_notify_ok,
+               (unsigned long)diag.cmd_rsp_notify_fail,
+               (unsigned long)diag.cmd_rsp_no_sub,
+               (unsigned long)diag.cmd_drop,
                (unsigned int)diag.last_error);
     }
 

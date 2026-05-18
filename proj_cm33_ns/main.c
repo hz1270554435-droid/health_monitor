@@ -111,6 +111,15 @@
 #define APP_MODEL_RESULT_MONITOR_ENABLE   (1u)
 #endif
 
+/* BLE bring-up 调试开关。
+ * 0：正常运行现有音频前处理 + CM55 推理链路；
+ * 1：临时暂停 AUDIO_PREPROCESS 模式下的 PDM、音频前处理、结果监控和 CM55 boot，
+ *    让串口和 CPU 资源优先留给 BLE stack/advertising 诊断。
+ */
+#ifndef APP_BLE_DEBUG_DISABLE_INFERENCE
+#define APP_BLE_DEBUG_DISABLE_INFERENCE   (0u)
+#endif
+
 #if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
      (APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) && \
      (APP_RUNTIME_MODE != APP_RUNTIME_MODE_MIC_SELF_TEST))
@@ -120,6 +129,11 @@
 #if ((APP_MODEL_RESULT_MONITOR_ENABLE != 0u) && \
      (APP_MODEL_RESULT_MONITOR_ENABLE != 1u))
 #error "Unsupported APP_MODEL_RESULT_MONITOR_ENABLE"
+#endif
+
+#if ((APP_BLE_DEBUG_DISABLE_INFERENCE != 0u) && \
+     (APP_BLE_DEBUG_DISABLE_INFERENCE != 1u))
+#error "Unsupported APP_BLE_DEBUG_DISABLE_INFERENCE"
 #endif
 
 /* 编译期限制 Debug UART 只使用已经计算并验证过 divider 的速率。 */
@@ -154,10 +168,16 @@ int main(void)
      */
 #if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) || \
      (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE))
+#if !((APP_BLE_DEBUG_DISABLE_INFERENCE) && \
+      (APP_RUNTIME_MODE == APP_RUNTIME_MODE_AUDIO_PREPROCESS))
     result = app_pdm_pcm_task_init();
     handle_app_error(result);
     printf("[BOOT] PDM PCM task created\r\n");
     fflush(stdout);
+#else
+    printf("[BOOT] BLE debug disabled PDM/inference path\r\n");
+    fflush(stdout);
+#endif
 #endif
 
 #if (((APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT) && \
@@ -173,7 +193,8 @@ int main(void)
     handle_app_error(result);
 #endif
 
-#if (APP_RUNTIME_MODE == APP_RUNTIME_MODE_AUDIO_PREPROCESS)
+#if ((APP_RUNTIME_MODE == APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
+     (!APP_BLE_DEBUG_DISABLE_INFERENCE))
     /* 正式业务模式：只创建一个音频输入前处理任务作为 PDM 队列消费者。
      * 该任务完成双通道转单声道、滑窗、log-mel 和归一化，然后把 float32 特征
      * 写入 CM33/CM55 共享内存。不要在该模式下再启动 app_get_data 或
@@ -243,6 +264,10 @@ int main(void)
     fflush(stdout);
 #endif
 
+#if (APP_BLE_DEBUG_DISABLE_INFERENCE)
+    printf("[BOOT] BLE debug inference chain disabled, CM55 boot skipped\r\n");
+    fflush(stdout);
+#else
     /* 启动 CM55。
      * CM55 侧模型推理任务会读取 app_audio_preprocess 写入的共享内存特征。
      * 测试/导出模式下 CM33 不发布正式特征，CM55 任务会保持轮询等待。
@@ -251,6 +276,7 @@ int main(void)
     printf("[BOOT] CM55 boot requested, addr=0x%08lx\r\n",
            (unsigned long)CM55_APP_BOOT_ADDR);
     fflush(stdout);
+#endif
 
     vTaskStartScheduler();
     configASSERT(0);
