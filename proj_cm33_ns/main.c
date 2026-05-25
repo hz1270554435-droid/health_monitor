@@ -48,6 +48,9 @@
 #if (APP_BLE_ENABLE)
 #include "app_ble_stream.h"
 #endif
+#if (APP_DISPLAY_ENABLE)
+#include "app_display.h"
+#endif
 #include "retarget_io_init.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -120,6 +123,16 @@
 #define APP_BLE_DEBUG_DISABLE_INFERENCE   (0u)
 #endif
 
+/* Optional Display/UI layer.
+ * Default off. When enabled, Stage 1 starts a low-priority null backend task
+ * that logs display snapshots/alerts only; it does not initialize real display
+ * hardware and does not touch BLE wire format, shared memory ABI, PDM buffers,
+ * radar UART raw buffers, or the CM55 inference path.
+ */
+#ifndef APP_DISPLAY_ENABLE
+#define APP_DISPLAY_ENABLE                (0u)
+#endif
+
 #if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
      (APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) && \
      (APP_RUNTIME_MODE != APP_RUNTIME_MODE_MIC_SELF_TEST))
@@ -134,6 +147,11 @@
 #if ((APP_BLE_DEBUG_DISABLE_INFERENCE != 0u) && \
      (APP_BLE_DEBUG_DISABLE_INFERENCE != 1u))
 #error "Unsupported APP_BLE_DEBUG_DISABLE_INFERENCE"
+#endif
+
+#if ((APP_DISPLAY_ENABLE != 0u) && \
+     (APP_DISPLAY_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_ENABLE"
 #endif
 
 /* 编译期限制 Debug UART 只使用已经计算并验证过 divider 的速率。 */
@@ -161,6 +179,29 @@ int main(void)
            (unsigned long)APP_DEBUG_UART_BAUD_RATE,
            (unsigned long)APP_MODEL_SHARED_VERSION);
     fflush(stdout);
+
+#if (APP_DISPLAY_ENABLE)
+    result = app_display_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] display init failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+
+    result = app_display_start();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] display start failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+    printf("[BOOT] display task created, backend=null, smoke=%lu\r\n",
+           (unsigned long)APP_DISPLAY_SMOKE_ENABLE);
+    fflush(stdout);
+#endif
 
     /* 创建 PDM/PCM 采集任务。
      * 该任务只负责启动硬件并由 ISR 持续产出 10 ms 双通道 PCM block；

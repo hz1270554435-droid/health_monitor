@@ -69,7 +69,7 @@ SOURCES+=
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES+=../shared source/app_ble
+INCLUDES+=../shared source/app_ble source/app_display
 
 # Add additional defines to the build process (without a leading -D).
 # Keep CR/LF conversion disabled: training export sends binary PCM frames over
@@ -107,6 +107,8 @@ APP_BLE_ENABLE?=0
 APP_BLE_FAKE_DATA_ENABLE?=0
 APP_BLE_STACK_ENABLE?=0
 APP_BLE_DEBUG_DISABLE_INFERENCE?=0
+APP_DISPLAY_ENABLE?=0
+APP_DISPLAY_SMOKE_ENABLE?=0
 
 ifneq ($(strip $(APP_DEBUG_UART_BAUD_RATE)),)
 DEFINES+=APP_DEBUG_UART_BAUD_RATE=$(APP_DEBUG_UART_BAUD_RATE)
@@ -144,6 +146,8 @@ DEFINES+=APP_BLE_ENABLE=$(APP_BLE_ENABLE)
 DEFINES+=APP_BLE_FAKE_DATA_ENABLE=$(APP_BLE_FAKE_DATA_ENABLE)
 DEFINES+=APP_BLE_STACK_ENABLE=$(APP_BLE_STACK_ENABLE)
 DEFINES+=APP_BLE_DEBUG_DISABLE_INFERENCE=$(APP_BLE_DEBUG_DISABLE_INFERENCE)
+DEFINES+=APP_DISPLAY_ENABLE=$(APP_DISPLAY_ENABLE)
+DEFINES+=APP_DISPLAY_SMOKE_ENABLE=$(APP_DISPLAY_SMOKE_ENABLE)
 
 ifneq ($(filter 1,$(APP_AUDIO_SPECTRUM_BACKEND) $(APP_AUDIO_SPECTRUM_COMPARE_ENABLE)),)
 COMPONENTS+=CMSIS_DSP
@@ -173,6 +177,11 @@ ifeq ($(APP_BLE_STACK_ENABLE),0)
 CY_IGNORE+=source/app_ble/app_ble_core.c
 CY_IGNORE+=source/app_ble/app_ble_gatt.c
 endif
+endif
+
+ifeq ($(APP_DISPLAY_ENABLE),0)
+CY_IGNORE+=source/app_display/app_display.c
+CY_IGNORE+=source/app_display/app_display_backend_null.c
 endif
 
 # Select softfp or hardfp floating point. Default is softfp.
