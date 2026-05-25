@@ -53,31 +53,61 @@ extern "C" {
 
 typedef struct
 {
-    /* 共享区 magic/version 尚未就绪或版本不匹配的次数。 */
+    /* 共享区 magic/version 尚未就绪或版本不匹配的次数。
+     * 用于统计结果观察任务因为共享协议未初始化或协议版本不一致而无法继续读取结果槽的情况。
+     */
     uint32_t shared_not_ready;
-    /* 观察到的 READY 结果数。同一 result_sequence 只计一次。 */
+    /* 观察到的 READY 结果数。同一 result_sequence 只计一次。
+     * 该计数反映监控任务实际“看见过多少条新结果”，而不是 CM55 总共产生了多少次推理输出。
+     */
     uint32_t results_seen;
-    /* result_state 为 WRITING 时跳过读取的次数。 */
+    /* result_state 为 WRITING 时跳过读取的次数。
+     * 该值升高说明监控任务较频繁撞上 CM55 正在写结果的窗口，属于正常并发保护现象。
+     */
     uint32_t result_writing;
-    /* 最近一次看到的 CM55 result_sequence。 */
+    /* 最近一次看到的 CM55 result_sequence。
+     * 用于判断监控任务当前追踪到哪一条结果，也可用于去重避免重复打印同一结果。
+     */
     uint32_t last_result_sequence;
-    /* 最近一次看到的输入序号。 */
+    /* 最近一次看到的输入序号。
+     * 表示最近被监控到的结果对应的是哪一帧输入特征，便于与 CM33 发布端序号对齐。
+     */
     uint32_t last_input_sequence;
-    /* OK 结果数量。 */
+    /* OK 结果数量。
+     * 统计 status=APP_MODEL_INFERENCE_STATUS_OK 的结果数，用于观察链路中成功推理的占比。
+     */
     uint32_t ok_results;
-    /* INVALID_INPUT 结果数量。 */
+    /* INVALID_INPUT 结果数量。
+     * 统计 CM55 因输入描述符非法而拒绝推理的次数，有助于排查共享内存协议或前处理参数不一致问题。
+     */
     uint32_t invalid_input_results;
-    /* MODEL_NOT_READY 结果数量。 */
+    /* MODEL_NOT_READY 结果数量。
+     * 主要出现在正式模型尚未接入或模型入口未准备好的联调阶段。
+     */
     uint32_t model_not_ready_results;
-    /* MODEL_ERROR 结果数量。 */
+    /* MODEL_ERROR 结果数量。
+     * 表示模型运行时内部发生异常，而不是输入本身格式错误。
+     */
     uint32_t model_error_results;
-    /* 已打印的 cough 事件数量。 */
+    /* 已打印的 cough 事件数量。
+     * 这是监控任务最终输出到 debug UART 的事件数，不等于所有看到的 OK 结果数。
+     */
     uint32_t events_printed;
-    /* 最近一次日志 printf 耗时，单位 ms；profile 关闭时保持 0。 */
+    /* 被 event-level energy gate 抑制的候选事件数量。
+     * 表示虽然结果满足一定候选条件，但因为能量或附加规则不达标而未打印/未上报。
+     */
+    uint32_t suppress_count_total;
+    /* 最近一次日志 printf 耗时，单位 ms；profile 关闭时保持 0。
+     * 用于评估串口打印对实时链路的扰动大小，帮助决定是否需要降低打印频率。
+     */
     uint32_t last_log_ms;
-    /* 最近一次结果状态，取 app_model_inference_status_t。 */
+    /* 最近一次结果状态，取 app_model_inference_status_t。
+     * 是一份“最近结果快照”，查看监控统计时通常应优先参考该字段。
+     */
     uint8_t last_status;
-    /* 是否已经看到过至少一个结果。 */
+    /* 是否已经看到过至少一个结果。
+     * 用于区分“当前结果状态为空”和“监控任务启动以来还从未看到过任何结果”。
+     */
     bool has_result;
 } app_model_result_monitor_stats_t;
 

@@ -7,6 +7,18 @@
 #include "app_model_smoke.h"
 #include APP_AUDIO_ACTIVE_MODEL_HEADER
 
+#ifndef APP_MODEL_INPUT_DUMP_ENABLE
+#define APP_MODEL_INPUT_DUMP_ENABLE             (0u)
+#endif
+
+#ifndef APP_MODEL_INPUT_DUMP_WINDOWS
+#define APP_MODEL_INPUT_DUMP_WINDOWS            (3u)
+#endif
+
+#if (APP_MODEL_INPUT_DUMP_ENABLE) && (APP_MODEL_INFERENCE_MAX_SCORES < 14u)
+#error "APP_MODEL_INPUT_DUMP_ENABLE requires at least 14 score slots"
+#endif
+
 /* 本文件是 CM55 侧模型任务框架。
  *
  * 数据边界：
@@ -24,6 +36,9 @@ static TaskHandle_t model_inference_task_handle = NULL;
 static app_model_inference_stats_t model_inference_stats;
 static float model_input_payload[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
 static bool model_runtime_initialized;
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+static uint32_t model_input_dump_results_written;
+#endif
 
 static bool app_model_inference_try_take_input(
     app_model_audio_feature_desc_t *desc,
@@ -39,6 +54,12 @@ static void app_model_inference_publish_result(
     const app_model_audio_feature_desc_t *desc,
     const app_model_inference_result_t *result,
     uint32_t inference_time_ms);
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+static void app_model_inference_fill_input_stats(
+    const app_model_audio_feature_desc_t *desc,
+    const float *payload,
+    app_model_inference_result_t *result);
+#endif
 static float app_model_inference_softmax_cough_prob(float output0,
                                                     float output1);
 static uint32_t app_model_inference_now_ms(void);
@@ -123,8 +144,10 @@ static bool app_model_inference_try_take_input(
     volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
     uint16_t payload_bytes;
 
+    /* 先失效本地 cache，确保读到的是 CM33 最近一次写入的共享区内容。 */
     APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
 
+    /* 共享区未初始化或协议版本不匹配时，直接跳过本轮轮询。 */
     if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
         (APP_MODEL_SHARED_VERSION != shared->version))
     {
@@ -132,11 +155,13 @@ static bool app_model_inference_try_take_input(
         return false;
     }
 
+    /* 只有当 CM33 已明确把状态切到 READY 时，CM55 才能尝试取走输入。 */
     if (APP_MODEL_SHARED_INPUT_READY != shared->input_state)
     {
         return false;
     }
 
+    /* 抢占输入槽所有权，告诉 CM33 当前帧正在被 CM55 读取。 */
     shared->input_state = APP_MODEL_SHARED_INPUT_READING;
     __DMB();
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
@@ -144,6 +169,7 @@ static bool app_model_inference_try_take_input(
     *desc = shared->audio;
     payload_bytes = desc->payload_bytes;
 
+    /* 描述符或 payload 非法时，发布 INVALID_INPUT 结果并把输入槽释放回 EMPTY。 */
     if (!app_model_inference_desc_is_valid(desc) ||
         (payload_capacity_bytes < payload_bytes))
     {
@@ -162,6 +188,7 @@ static bool app_model_inference_try_take_input(
         return false;
     }
 
+    /* 先复制到 CM55 本地缓冲，再做真正推理，避免长时间占用共享输入槽。 */
     memcpy((void *)payload, (const void *)&shared->audio_payload[0],
            payload_bytes);
 
@@ -176,6 +203,97 @@ static bool app_model_inference_try_take_input(
     model_inference_stats.inputs_consumed++;
     return true;
 }
+
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+static void app_model_inference_fill_input_stats(
+    const app_model_audio_feature_desc_t *desc,
+    const float *payload,
+    app_model_inference_result_t *result)
+{
+    const uint32_t fnv_offset_basis = 2166136261u;
+    const uint32_t fnv_prime = 16777619u;
+    uint32_t element_count;
+    uint32_t byte_count;
+    const uint8_t *payload_bytes;
+    float min_value;
+    float max_value;
+    double sum = 0.0;
+    double square_sum = 0.0;
+    float mean;
+    float variance;
+    float stddev;
+    uint32_t hash = fnv_offset_basis;
+    uint32_t floor_count = 0u;
+    uint32_t near_zero_count = 0u;
+
+    if ((NULL == desc) || (NULL == payload) || (NULL == result) ||
+        (model_input_dump_results_written >= APP_MODEL_INPUT_DUMP_WINDOWS))
+    {
+        return;
+    }
+
+    element_count = (uint32_t)desc->mel_bin_count *
+                    (uint32_t)desc->time_bin_count;
+    if (0u == element_count)
+    {
+        return;
+    }
+
+    byte_count = element_count * (uint32_t)sizeof(payload[0]);
+    payload_bytes = (const uint8_t *)payload;
+    for (uint32_t i = 0u; i < byte_count; i++)
+    {
+        hash ^= (uint32_t)payload_bytes[i];
+        hash *= fnv_prime;
+    }
+
+    min_value = payload[0];
+    max_value = payload[0];
+    for (uint32_t i = 0u; i < element_count; i++)
+    {
+        float value = payload[i];
+
+        if (value < min_value)
+        {
+            min_value = value;
+        }
+        if (max_value < value)
+        {
+            max_value = value;
+        }
+        if (value <= -79.9f)
+        {
+            floor_count++;
+        }
+        if (fabsf(value) <= 1.0e-3f)
+        {
+            near_zero_count++;
+        }
+        sum += value;
+        square_sum += ((double)value * (double)value);
+    }
+
+    mean = (float)(sum / (double)element_count);
+    variance = (float)((square_sum / (double)element_count) -
+                       ((double)mean * (double)mean));
+    if (0.0f > variance)
+    {
+        variance = 0.0f;
+    }
+    stddev = sqrtf(variance);
+
+    result->scores[5] = min_value;
+    result->scores[6] = max_value;
+    result->scores[7] = mean;
+    result->scores[8] = stddev;
+    result->scores[9] = (float)(hash & 0xffffu);
+    result->scores[10] = (float)floor_count;
+    result->scores[11] = (float)near_zero_count;
+    result->scores[12] = payload[0];
+    result->scores[13] = payload[element_count - 1u];
+    model_input_dump_results_written++;
+}
+#endif
 
 static bool app_model_inference_desc_is_valid(
     const app_model_audio_feature_desc_t *desc)
@@ -235,11 +353,13 @@ static app_model_inference_status_t app_model_inference_run_model(
      */
     float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
 
+    /* 任何一个关键输入为空，都说明调用链路不完整，直接按非法输入处理。 */
     if ((NULL == desc) || (NULL == payload) || (NULL == result))
     {
         return APP_MODEL_INFERENCE_STATUS_INVALID_INPUT;
     }
 
+    /* 模型运行时只做一次初始化；成功后通过静态标志避免每帧重复初始化。 */
     if (!model_runtime_initialized)
     {
         if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_INIT())
@@ -249,13 +369,25 @@ static app_model_inference_status_t app_model_inference_run_model(
         model_runtime_initialized = true;
     }
 
+    /* 每次推理前执行 soft reset，确保模型内部状态回到已知初始状态，
+     * 避免上一次窗口残留状态影响当前这一帧结果。
+     */
     if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_SOFT_RESET())
     {
         return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
     }
 
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+    /* 调试模式下，把输入统计写入 result->scores 的保留槽位，
+     * 便于在不额外打印大块特征的情况下快速核对输入分布。
+     */
+    app_model_inference_fill_input_stats(desc, payload, result);
+#endif
+
+    /* 真正调用导入后的模型计算入口。 */
     APP_AUDIO_ACTIVE_MODEL_COMPUTE(payload, output);
 
+    /* 把模型原始输出与辅助调试字段统一封装进共享结果结构。 */
     result->input_sequence = desc->sequence;
     result->timestamp_ms = app_model_inference_now_ms();
     result->class_count = APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT;

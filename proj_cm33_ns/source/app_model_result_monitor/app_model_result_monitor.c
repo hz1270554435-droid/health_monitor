@@ -45,6 +45,14 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_MODEL_PRINT_FLOAT_ENABLE             (1u)
 #endif
 
+#ifndef APP_MODEL_INPUT_DUMP_ENABLE
+#define APP_MODEL_INPUT_DUMP_ENABLE              (0u)
+#endif
+
+#ifndef APP_MODEL_INPUT_DUMP_WINDOWS
+#define APP_MODEL_INPUT_DUMP_WINDOWS             (3u)
+#endif
+
 #ifndef APP_MODEL_EVENT_THRESHOLD
 #define APP_MODEL_EVENT_THRESHOLD                (0.95f)
 #endif
@@ -59,6 +67,14 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 
 #ifndef APP_MODEL_EVENT_COOLDOWN_MS
 #define APP_MODEL_EVENT_COOLDOWN_MS              (1500u)
+#endif
+
+#ifndef APP_MODEL_EVENT_MIN_ENERGY
+#define APP_MODEL_EVENT_MIN_ENERGY               (0.0f)
+#endif
+
+#ifndef APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS
+#define APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS     APP_MODEL_LOG_RATE_LIMIT_MS
 #endif
 
 #ifndef APP_BLE_ENABLE
@@ -76,6 +92,12 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_MODEL_LOG_LEVEL_QUIET                (0u)
 #define APP_MODEL_LOG_LEVEL_STAT                 (1u)
 #define APP_MODEL_LOG_LEVEL_DEBUG                (2u)
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE || APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+#define APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE      (1u)
+#else
+#define APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE      (0u)
+#endif
 
 typedef struct
 {
@@ -99,12 +121,38 @@ typedef struct
     uint32_t prev_spectrum_windows_profiled;
     uint32_t prev_melbank_ms_total;
     uint32_t prev_melbank_windows_profiled;
+    uint32_t prev_suppress_count_total;
     uint32_t event_candidate_start_ms;
     uint32_t event_candidate_hits;
+    uint32_t last_suppress_log_ms;
     uint32_t last_event_ms;
+    float event_candidate_max_energy;
+    float last_event_max_energy;
+    float last_suppressed_energy;
+    float max_suppressed_energy_1s;
 } app_model_result_monitor_runtime_t;
 
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+#define APP_MODEL_EVENT_CONTEXT_DEPTH            (5u)
+
+typedef struct
+{
+    uint32_t t_ms;
+    uint32_t input_sequence;
+    uint32_t result_sequence;
+    float cough_prob;
+    float energy;
+    bool threshold_pass;
+    bool valid;
+} app_model_event_context_entry_t;
+#endif
+
 static app_model_result_monitor_runtime_t model_result_runtime;
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+static app_model_event_context_entry_t model_event_context[
+    APP_MODEL_EVENT_CONTEXT_DEPTH];
+static uint32_t model_event_context_write_index;
+#endif
 
 static const char *app_model_result_monitor_status_name(uint8_t status);
 static void app_model_result_monitor_print_float(float value);
@@ -115,18 +163,32 @@ static void app_model_result_monitor_update_status_counts(
 static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
     uint32_t result_sequence);
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+static void app_model_result_monitor_note_event_context(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms);
+static void app_model_result_monitor_print_event_context(uint32_t event_seq);
+#endif
 static void app_model_result_monitor_print_smoke_result(
     const app_model_inference_result_t *result);
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_DEBUG)
 static void app_model_result_monitor_print_demo_result(
-    const app_model_inference_result_t *result);
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence);
 #endif
 static void app_model_result_monitor_print_event(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
     const char *decision);
+static void app_model_result_monitor_print_suppress(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms,
+    float max_energy);
 static bool app_model_result_monitor_should_print_event(
     const app_model_inference_result_t *result,
+    uint32_t result_sequence,
     uint32_t now_ms);
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
 static void app_model_result_monitor_maybe_print_stat(
@@ -214,9 +276,12 @@ void app_model_result_monitor_task(void *pvParameters)
             app_model_inference_result_t result;
             uint32_t result_sequence = shared->result_sequence;
 
+            /* 先把结果槽复制到本地栈变量，避免后续打印过程反复直接访问共享区。 */
             memcpy(&result, (const void *)&shared->result, sizeof(result));
 
-            /* 复制后再确认一次状态和序号，避免刚好撞上 CM55 覆盖最新结果。 */
+            /* 复制后再确认一次状态和序号，避免刚好撞上 CM55 覆盖最新结果。
+             * 只有“状态仍是 READY 且 result_sequence 未变化”时，才认为这份副本有效。
+             */
             __DMB();
             APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
             if ((APP_MODEL_SHARED_RESULT_READY != shared->result_state) ||
@@ -248,20 +313,61 @@ void app_model_result_monitor_task(void *pvParameters)
                     (APP_MODEL_DEMO_COUGH_THRESHOLD <= result.scores[2]) ?
                     "COUGH" : "NON_COUGH";
 
+                /* 对正式业务结果，先更新运行时统计，再按日志级别决定是否打印。 */
                 app_model_result_monitor_note_live_result(&result,
                                                           result_sequence);
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+                app_model_result_monitor_note_event_context(
+                    &result,
+                    result_sequence,
+                    app_model_result_monitor_now_ms());
+#endif
 
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_DEBUG)
-                app_model_result_monitor_print_demo_result(&result);
+                app_model_result_monitor_print_demo_result(&result,
+                                                           result_sequence);
 #endif
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
                 if (app_model_result_monitor_should_print_event(
                         &result,
+                        result_sequence,
                         app_model_result_monitor_now_ms()))
                 {
                     app_model_result_monitor_print_event(&result,
                                                          result_sequence,
                                                          decision);
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+                    if (
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+                        app_audio_preprocess_event_feature_dump_can_emit()
+#else
+                        false
+#endif
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+                        || app_audio_preprocess_event_pcm_dump_can_emit()
+#endif
+                    )
+                    {
+                        app_model_result_monitor_print_event_context(
+                            result.input_sequence);
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+                        app_audio_preprocess_dump_event_pcm(
+                            result.input_sequence,
+                            result_sequence,
+                            model_result_runtime.event_id,
+                            result.scores[2],
+                            result.scores[3]);
+#endif
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+                        app_audio_preprocess_dump_event_feature(
+                            result.input_sequence,
+                            result_sequence,
+                            model_result_runtime.event_id,
+                            result.scores[2],
+                            result.scores[3]);
+#endif
+                    }
+#endif
                 }
 #endif
             }
@@ -387,6 +493,8 @@ static void app_model_result_monitor_print_deployment_info(void)
     app_model_result_monitor_print_float(APP_MODEL_DEMO_COUGH_THRESHOLD);
     printf(", event_threshold=");
     app_model_result_monitor_print_float(APP_MODEL_EVENT_THRESHOLD);
+    printf(", event_min_energy=");
+    app_model_result_monitor_print_float(APP_MODEL_EVENT_MIN_ENERGY);
     printf(", frontend_name=%s, APP_AUDIO_MODEL_SELECT=%lu, "
            "APP_MODEL_RUNTIME_PROFILE_ENABLE=%lu, APP_MODEL_LOG_LEVEL=%lu, "
            "APP_MODEL_LOG_RATE_LIMIT_MS=%lu, APP_MODEL_PRINT_FLOAT_ENABLE=%lu, "
@@ -419,6 +527,7 @@ static void app_model_result_monitor_update_status_counts(
         return;
     }
 
+    /* 把最近看到的结果按状态分类累计，便于快速判断当前主要故障类型。 */
     switch ((app_model_inference_status_t)result->status)
     {
         case APP_MODEL_INFERENCE_STATUS_OK:
@@ -451,6 +560,7 @@ static void app_model_result_monitor_note_live_result(
         return;
     }
 
+    /* 记录最近一次正式推理的关键观测值，供 1 秒统计与事件判决复用。 */
     model_result_runtime.last_input_sequence = result->input_sequence;
     model_result_runtime.last_result_sequence = result_sequence;
     model_result_runtime.last_cough_prob = result->scores[2];
@@ -459,6 +569,9 @@ static void app_model_result_monitor_note_live_result(
         model_result_runtime.max_cough_prob_1s = result->scores[2];
     }
 
+    /* 用 demo 阈值把每帧结果粗分为 cough / non_cough，
+     * 后续周期统计直接基于这里累加的计数输出。
+     */
     if (APP_MODEL_DEMO_COUGH_THRESHOLD <= result->scores[2])
     {
         model_result_runtime.decision_count_cough_1s++;
@@ -468,6 +581,7 @@ static void app_model_result_monitor_note_live_result(
         model_result_runtime.decision_count_non_cough_1s++;
     }
 
+    /* 同时累加推理耗时，用于观察 CM55 侧平均耗时和峰值耗时。 */
     model_result_runtime.infer_ms_total_1s += result->inference_time_ms;
     model_result_runtime.infer_ms_count_1s++;
     if (model_result_runtime.infer_ms_max_1s < result->inference_time_ms)
@@ -475,6 +589,78 @@ static void app_model_result_monitor_note_live_result(
         model_result_runtime.infer_ms_max_1s = result->inference_time_ms;
     }
 }
+
+#if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
+static void app_model_result_monitor_note_event_context(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms)
+{
+    app_model_event_context_entry_t *entry;
+
+    if (NULL == result)
+    {
+        return;
+    }
+
+    entry = &model_event_context[model_event_context_write_index];
+    model_event_context_write_index++;
+    if (APP_MODEL_EVENT_CONTEXT_DEPTH <= model_event_context_write_index)
+    {
+        model_event_context_write_index = 0u;
+    }
+
+    entry->t_ms = now_ms;
+    entry->input_sequence = result->input_sequence;
+    entry->result_sequence = result_sequence;
+    entry->cough_prob = result->scores[2];
+    entry->energy = result->scores[3];
+    entry->threshold_pass = (APP_MODEL_EVENT_THRESHOLD <= result->scores[2]);
+    entry->valid = true;
+}
+
+static void app_model_result_monitor_print_event_context(uint32_t event_seq)
+{
+    uint32_t log_start_ms = app_model_result_monitor_log_start();
+    bool first = true;
+
+    printf("[AUDIO_EVENT_CONTEXT] event_seq=%lu, recent=",
+           (unsigned long)event_seq);
+    for (uint32_t n = 0u; n < APP_MODEL_EVENT_CONTEXT_DEPTH; n++)
+    {
+        uint32_t index =
+            (model_event_context_write_index + n) %
+            APP_MODEL_EVENT_CONTEXT_DEPTH;
+        const app_model_event_context_entry_t *entry =
+            &model_event_context[index];
+
+        if (!entry->valid)
+        {
+            continue;
+        }
+
+        if (!first)
+        {
+            printf(";");
+        }
+        first = false;
+        printf("seq:%lu/result:%lu/t_ms:%lu/pass:%lu/prob:",
+               (unsigned long)entry->input_sequence,
+               (unsigned long)entry->result_sequence,
+               (unsigned long)entry->t_ms,
+               (unsigned long)(entry->threshold_pass ? 1u : 0u));
+        app_model_result_monitor_print_float(entry->cough_prob);
+        printf("/energy:");
+        app_model_result_monitor_print_float(entry->energy);
+    }
+    if (first)
+    {
+        printf("none");
+    }
+    printf("\r\n");
+    app_model_result_monitor_log_end(log_start_ms);
+}
+#endif
 
 static void app_model_result_monitor_print_smoke_result(
     const app_model_inference_result_t *result)
@@ -509,10 +695,14 @@ static void app_model_result_monitor_print_smoke_result(
 
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_DEBUG)
 static void app_model_result_monitor_print_demo_result(
-    const app_model_inference_result_t *result)
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence)
 {
     const char *decision;
     uint32_t log_start_ms;
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+    static uint32_t model_input_stats_printed;
+#endif
 
     if (NULL == result)
     {
@@ -536,6 +726,32 @@ static void app_model_result_monitor_print_demo_result(
     printf(", channel=%lu, infer_ms=%lu\r\n",
            (unsigned long)result->scores[4],
            (unsigned long)result->inference_time_ms);
+#if (APP_MODEL_INPUT_DUMP_ENABLE)
+    if (model_input_stats_printed < APP_MODEL_INPUT_DUMP_WINDOWS)
+    {
+        printf("[MODEL_INPUT_STATS] t_ms=%lu, input_seq=%lu, result_seq=%lu, "
+               "feature_min=",
+               (unsigned long)app_model_result_monitor_now_ms(),
+               (unsigned long)result->input_sequence,
+               (unsigned long)result_sequence);
+        app_model_result_monitor_print_float(result->scores[5]);
+        printf(", feature_max=");
+        app_model_result_monitor_print_float(result->scores[6]);
+        printf(", feature_mean=");
+        app_model_result_monitor_print_float(result->scores[7]);
+        printf(", feature_std=");
+        app_model_result_monitor_print_float(result->scores[8]);
+        printf(", hash_low16=%lu, floor80_count=%lu, near0_count=%lu, sample0=",
+               (unsigned long)result->scores[9],
+               (unsigned long)result->scores[10],
+               (unsigned long)result->scores[11]);
+        app_model_result_monitor_print_float(result->scores[12]);
+        printf(", sample_last=");
+        app_model_result_monitor_print_float(result->scores[13]);
+        printf("\r\n");
+        model_input_stats_printed++;
+    }
+#endif
     app_model_result_monitor_log_end(log_start_ms);
 }
 #endif
@@ -567,19 +783,74 @@ static void app_model_result_monitor_print_event(
            (unsigned long)result_sequence,
            decision);
     app_model_result_monitor_print_float(result->scores[3]);
+    printf(", max_energy=");
+    app_model_result_monitor_print_float(
+        model_result_runtime.last_event_max_energy);
     printf("\r\n");
     app_model_result_monitor_log_end(log_start_ms);
 }
 
+static void app_model_result_monitor_print_suppress(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms,
+    float max_energy)
+{
+#if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
+    uint32_t log_start_ms;
+
+    if (NULL == result)
+    {
+        return;
+    }
+
+    if ((0u != model_result_runtime.last_suppress_log_ms) &&
+        (0u < APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS) &&
+        ((now_ms - model_result_runtime.last_suppress_log_ms) <
+         APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS))
+    {
+        return;
+    }
+
+    model_result_runtime.last_suppress_log_ms = now_ms;
+
+    log_start_ms = app_model_result_monitor_log_start();
+    printf("[MODEL_SUPPRESS] t_ms=%lu, reason=low_energy, cough_prob=",
+           (unsigned long)now_ms);
+    app_model_result_monitor_print_float(result->scores[2]);
+    printf(", threshold=");
+    app_model_result_monitor_print_float(APP_MODEL_EVENT_THRESHOLD);
+    printf(", max_energy=");
+    app_model_result_monitor_print_float(max_energy);
+    printf(", min_energy=");
+    app_model_result_monitor_print_float(APP_MODEL_EVENT_MIN_ENERGY);
+    printf(", input_seq=%lu, result_seq=%lu, suppress_count_total=%lu, "
+           "decision=SUPPRESSED\r\n",
+           (unsigned long)result->input_sequence,
+           (unsigned long)result_sequence,
+           (unsigned long)model_result_monitor_stats.suppress_count_total);
+    app_model_result_monitor_log_end(log_start_ms);
+#else
+    (void)result;
+    (void)result_sequence;
+    (void)now_ms;
+    (void)max_energy;
+#endif
+}
+
 static bool app_model_result_monitor_should_print_event(
     const app_model_inference_result_t *result,
+    uint32_t result_sequence,
     uint32_t now_ms)
 {
+    float candidate_energy;
+
     if ((NULL == result) ||
         (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
     {
         model_result_runtime.event_candidate_hits = 0u;
         model_result_runtime.event_candidate_start_ms = 0u;
+        model_result_runtime.event_candidate_max_energy = 0.0f;
         return false;
     }
 
@@ -598,6 +869,14 @@ static bool app_model_result_monitor_should_print_event(
     {
         model_result_runtime.event_candidate_start_ms = now_ms;
         model_result_runtime.event_candidate_hits = 0u;
+        model_result_runtime.event_candidate_max_energy = 0.0f;
+    }
+
+    candidate_energy = result->scores[3];
+    if ((0u == model_result_runtime.event_candidate_hits) ||
+        (model_result_runtime.event_candidate_max_energy < candidate_energy))
+    {
+        model_result_runtime.event_candidate_max_energy = candidate_energy;
     }
 
     model_result_runtime.event_candidate_hits++;
@@ -606,8 +885,30 @@ static bool app_model_result_monitor_should_print_event(
         return false;
     }
 
+    candidate_energy = model_result_runtime.event_candidate_max_energy;
+    if (candidate_energy < APP_MODEL_EVENT_MIN_ENERGY)
+    {
+        model_result_monitor_stats.suppress_count_total++;
+        model_result_runtime.last_suppressed_energy = candidate_energy;
+        if (model_result_runtime.max_suppressed_energy_1s < candidate_energy)
+        {
+            model_result_runtime.max_suppressed_energy_1s = candidate_energy;
+        }
+        app_model_result_monitor_print_suppress(
+            result,
+            result_sequence,
+            now_ms,
+            candidate_energy);
+        model_result_runtime.event_candidate_hits = 0u;
+        model_result_runtime.event_candidate_start_ms = 0u;
+        model_result_runtime.event_candidate_max_energy = 0.0f;
+        return false;
+    }
+
+    model_result_runtime.last_event_max_energy = candidate_energy;
     model_result_runtime.event_candidate_hits = 0u;
     model_result_runtime.event_candidate_start_ms = 0u;
+    model_result_runtime.event_candidate_max_energy = 0.0f;
     model_result_runtime.last_event_ms = now_ms;
     return true;
 }
@@ -621,6 +922,7 @@ static void app_model_result_monitor_maybe_print_stat(
     app_audio_preprocess_stats_t audio_stats;
     app_pdm_pcm_stats_t pdm_stats;
     uint32_t dropped_delta;
+    uint32_t suppress_count_delta;
     uint32_t mel_count_delta;
     uint32_t mel_total_delta;
     uint32_t mel_ms_avg;
@@ -657,6 +959,8 @@ static void app_model_result_monitor_maybe_print_stat(
 
     dropped_delta = pdm_stats.dropped_total -
                     model_result_runtime.prev_dropped_total;
+    suppress_count_delta = model_result_monitor_stats.suppress_count_total -
+                           model_result_runtime.prev_suppress_count_total;
     mel_count_delta = audio_stats.mel_windows_profiled -
                       model_result_runtime.prev_mel_windows_profiled;
     mel_total_delta = audio_stats.mel_ms_total -
@@ -721,7 +1025,9 @@ static void app_model_result_monitor_maybe_print_stat(
            "total_ms_avg=%lu, dropped_total=%lu, dropped_delta_1s=%lu, "
            "dropped_queue=%lu, dropped_no_free=%lu, dropped_paused=%lu, "
            "pdm_error=%lu, ready=%lu, published=%lu, busy=%lu, gated=%lu, "
-           "queue_depth=%lu, seq_gap=%lu, model_not_ready=%lu, log_ms=%lu\r\n",
+           "queue_depth=%lu, seq_gap=%lu, model_not_ready=%lu, "
+           "suppress_count_total=%lu, suppress_count_delta_1s=%lu, "
+           "last_suppressed_energy=",
            (unsigned long)infer_ms_avg,
            (unsigned long)model_result_runtime.infer_ms_max_1s,
            (unsigned long)total_ms_avg,
@@ -738,11 +1044,21 @@ static void app_model_result_monitor_maybe_print_stat(
            (unsigned long)pdm_stats.queue_depth,
            (unsigned long)seq_gap,
            (unsigned long)model_result_monitor_stats.model_not_ready_results,
+           (unsigned long)model_result_monitor_stats.suppress_count_total,
+           (unsigned long)suppress_count_delta);
+    app_model_result_monitor_print_float(
+        model_result_runtime.last_suppressed_energy);
+    printf(", max_suppressed_energy_1s=");
+    app_model_result_monitor_print_float(
+        model_result_runtime.max_suppressed_energy_1s);
+    printf(", log_ms=%lu\r\n",
            (unsigned long)model_result_monitor_stats.last_log_ms);
     app_model_result_monitor_log_end(log_start_ms);
 
     model_result_runtime.last_stat_ms = now_ms;
     model_result_runtime.prev_dropped_total = pdm_stats.dropped_total;
+    model_result_runtime.prev_suppress_count_total =
+        model_result_monitor_stats.suppress_count_total;
     model_result_runtime.prev_mel_ms_total = audio_stats.mel_ms_total;
     model_result_runtime.prev_mel_windows_profiled =
         audio_stats.mel_windows_profiled;
@@ -766,6 +1082,7 @@ static void app_model_result_monitor_maybe_print_stat(
     model_result_runtime.infer_ms_total_1s = 0u;
     model_result_runtime.infer_ms_count_1s = 0u;
     model_result_runtime.infer_ms_max_1s = 0u;
+    model_result_runtime.max_suppressed_energy_1s = 0.0f;
 #else
     (void)shared;
     (void)now_ms;

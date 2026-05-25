@@ -1,11 +1,8 @@
 #include "app_audio_preprocess.h"
 
 #include <math.h>
-#include <string.h>
-
-#if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
 #include <stdio.h>
-#endif
+#include <string.h>
 
 #if ((APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_DFT) && \
      (APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_RFFT))
@@ -29,6 +26,38 @@
 
 #ifndef APP_MODEL_RUNTIME_PROFILE_ENABLE
 #define APP_MODEL_RUNTIME_PROFILE_ENABLE        (0u)
+#endif
+
+#ifndef APP_AUDIO_FEATURE_DUMP_ENABLE
+#define APP_AUDIO_FEATURE_DUMP_ENABLE           (0u)
+#endif
+
+#ifndef APP_AUDIO_FEATURE_DUMP_WINDOWS
+#define APP_AUDIO_FEATURE_DUMP_WINDOWS          (3u)
+#endif
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE && \
+     (0u == APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH))
+#error "APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH must be > 0"
+#endif
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE && \
+     (1u != APP_AUDIO_EVENT_PCM_DUMP_RING_DEPTH))
+#error "APP_AUDIO_EVENT_PCM_DUMP_RING_DEPTH currently supports only 1"
+#endif
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE || APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+#define APP_AUDIO_EVENT_ANY_DUMP_ENABLE          (1u)
+#else
+#define APP_AUDIO_EVENT_ANY_DUMP_ENABLE          (0u)
+#endif
+
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+#ifndef APP_AUDIO_EVENT_DUMP_LINE_DELAY_MS
+#define APP_AUDIO_EVENT_DUMP_LINE_DELAY_MS       (1u)
+#endif
+
+#define APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS      (640u)
 #endif
 
 /* 本文件是正式业务链路的唯一 MIC 输入前处理任务实现。
@@ -76,6 +105,66 @@ typedef struct
 } app_audio_preprocess_compare_stats_t;
 #endif
 
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+typedef struct
+{
+    uint32_t count;
+    uint32_t hash32;
+    float min_value;
+    float max_value;
+    float mean;
+    float stddev;
+} app_audio_event_feature_stats_t;
+#endif
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+typedef struct
+{
+    uint32_t sequence;
+    uint32_t timestamp_ms;
+    uint32_t count;
+    uint32_t payload_bytes;
+    float energy;
+    uint8_t selected_channel;
+    bool valid;
+    app_audio_event_feature_stats_t stats;
+    float feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+} app_audio_event_feature_frame_t;
+#endif
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+typedef struct
+{
+    uint32_t count;
+    uint32_t hash32;
+    int16_t min_value;
+    int16_t max_value;
+    float mean;
+    float rms;
+} app_audio_event_pcm_stats_t;
+
+typedef struct
+{
+    uint32_t sequence;
+    uint32_t timestamp_ms;
+    uint32_t sample_rate_hz;
+    uint32_t count;
+    float dc_removed_energy;
+    uint8_t selected_channel;
+    bool valid;
+    bool locked;
+    bool feature_valid;
+    app_audio_event_pcm_stats_t pcm_stats;
+#if (APP_AUDIO_EVENT_PCM_DUMP_INCLUDE_FEATURE)
+    app_audio_event_feature_stats_t feature_stats;
+#endif
+    int16_t pcm[APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES];
+#if (APP_AUDIO_EVENT_PCM_DUMP_INCLUDE_FEATURE)
+    float feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+#endif
+} app_audio_event_pcm_frame_t;
+#endif
+
 static TaskHandle_t audio_preprocess_task_handle = NULL;
 static app_audio_preprocess_config_t audio_preprocess_config;
 static app_audio_preprocess_plan_t audio_preprocess_plan;
@@ -99,6 +188,24 @@ static float model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
 static float compare_power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
 static float compare_model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
 static uint32_t compare_windows_reported;
+#endif
+#if (APP_AUDIO_FEATURE_DUMP_ENABLE)
+static uint32_t feature_dump_windows_reported;
+#endif
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+static app_audio_event_feature_frame_t event_feature_ring[
+    APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH];
+static app_audio_event_feature_frame_t event_feature_dump_buffer;
+static uint32_t event_feature_ring_write_index;
+static uint32_t event_feature_dumps_printed;
+#endif
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+static app_audio_event_pcm_frame_t event_pcm_snapshot;
+static uint32_t event_pcm_dumps_printed;
+static bool event_pcm_pending_valid;
+#endif
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+static char event_dump_line[APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS];
 #endif
 #if (APP_AUDIO_PREPROCESS_RFFT_REQUIRED)
 static arm_rfft_fast_instance_f32 audio_preprocess_rfft_instance;
@@ -139,7 +246,12 @@ static void app_audio_preprocess_power_to_db_and_normalize(float max_mel_energy)
 static void app_audio_preprocess_power_to_db_and_normalize_buffer(
     float *feature,
     float max_mel_energy);
-static bool app_audio_preprocess_uses_no_norm_frontend(void);
+static bool app_audio_preprocess_is_no_norm_profile(uint8_t frontend_profile);
+static bool app_audio_preprocess_rms_gain_enabled(uint8_t frontend_profile);
+static bool app_audio_preprocess_feature_zscore_enabled(uint8_t frontend_profile);
+static bool app_audio_preprocess_global_feature_norm_enabled(uint8_t frontend_profile);
+static void app_audio_preprocess_print_resolved_config(void);
+static void app_audio_preprocess_print_float_value(float value);
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
 static void app_audio_preprocess_record_stage_time(uint32_t elapsed_ms,
                                                    uint32_t *last_ms,
@@ -160,6 +272,44 @@ static void app_audio_preprocess_compare_update(float active,
 static void app_audio_preprocess_print_compare_result(
     const app_audio_preprocess_compare_stats_t *stats);
 static void app_audio_preprocess_print_float(float value);
+#endif
+#if (APP_AUDIO_FEATURE_DUMP_ENABLE)
+static void app_audio_preprocess_maybe_dump_feature_stats(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature);
+static void app_audio_preprocess_dump_print_float(float value);
+#endif
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+static bool app_audio_preprocess_event_feature_stats(
+    const float *feature,
+    uint32_t element_count,
+    app_audio_event_feature_stats_t *stats);
+static void app_audio_preprocess_event_print_hex_word(uint32_t value);
+static void app_audio_preprocess_event_dump_pace(void);
+static void app_audio_preprocess_event_dump_append_hex_word(size_t *used,
+                                                            uint32_t value);
+static void app_audio_preprocess_event_dump_append_hex_halfword(size_t *used,
+                                                                uint16_t value);
+static void app_audio_preprocess_event_dump_append_text(size_t *used,
+                                                        const char *text);
+#endif
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+static void app_audio_preprocess_event_feature_remember(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature);
+static bool app_audio_preprocess_event_feature_copy_to_dump_buffer(
+    uint32_t input_sequence);
+#endif
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+static void app_audio_preprocess_event_pcm_capture_pending(uint32_t timestamp_ms,
+                                                           uint8_t selected_channel);
+static bool app_audio_preprocess_event_pcm_stats(
+    const int16_t *pcm,
+    uint32_t sample_count,
+    app_audio_event_pcm_stats_t *stats);
+static void app_audio_preprocess_event_pcm_remember(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature);
 #endif
 static void app_audio_preprocess_init_shared_region(void);
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
@@ -206,6 +356,7 @@ void app_audio_preprocess_task(void *pvParameters)
 {
     (void)pvParameters;
 
+    /* 任务启动后先初始化共享区，再清空本地流状态，确保第一帧从干净状态开始。 */
     app_audio_preprocess_init_shared_region();
     app_audio_preprocess_reset_stream_state();
 
@@ -213,6 +364,7 @@ void app_audio_preprocess_task(void *pvParameters)
     {
         app_pdm_pcm_block_t block;
 
+        /* 正式业务链路阻塞等待 10 ms PCM block；不做忙轮询，避免无谓占用 CPU。 */
         if (!app_pdm_pcm_receive_block(&block, portMAX_DELAY))
         {
             continue;
@@ -220,6 +372,7 @@ void app_audio_preprocess_task(void *pvParameters)
 
         audio_preprocess_stats.blocks_received++;
 
+        /* 记录采集序号是否连续，用于排查队列拥塞、丢块或上游采集异常。 */
         if (audio_preprocess_stats.has_last_sequence &&
             (block.sequence != (audio_preprocess_stats.last_sequence + 1u)))
         {
@@ -233,6 +386,7 @@ void app_audio_preprocess_task(void *pvParameters)
             uint8_t selected_channel =
                 app_audio_preprocess_choose_channel(&block);
 
+            /* 把一整个双通道 block 转成单声道样本流，并依次推入 1 s 环形窗口。 */
             for (uint16_t i = 0; i < block.samples_per_channel; i++)
             {
                 uint16_t base = (uint16_t)(i * NUM_CHANNELS);
@@ -249,6 +403,7 @@ void app_audio_preprocess_task(void *pvParameters)
             {
                 uint32_t timestamp_ms = app_audio_preprocess_now_ms();
 
+                /* 当窗口步长达到要求后，提取一帧完整模型输入并尝试发布到共享区。 */
                 audio_preprocess_stats.windows_ready++;
                 if (app_audio_preprocess_extract_and_publish(timestamp_ms,
                                                              selected_channel))
@@ -262,6 +417,7 @@ void app_audio_preprocess_task(void *pvParameters)
             audio_preprocess_stats.invalid_blocks++;
         }
 
+        /* 无论 block 是否有效，最终都必须把采集块归还给上游缓冲池。 */
         app_pdm_pcm_release_block(block.block_index);
     }
 }
@@ -297,6 +453,7 @@ cy_rslt_t app_audio_preprocess_configure(
     audio_preprocess_config = *config;
     audio_preprocess_config_ready = true;
     app_audio_preprocess_reset_stream_state();
+    app_audio_preprocess_print_resolved_config();
 
     return CY_RSLT_SUCCESS;
 }
@@ -314,7 +471,12 @@ void app_audio_preprocess_get_default_config(
         return;
     }
 
+    /* 先整体清零，确保未显式赋值的兼容字段保持确定初值。 */
     memset(config, 0, sizeof(*config));
+
+    /* 这组默认值共同定义“板端正式前处理”的基线配置，
+     * 训练端若调整窗口、Mel 或 frontend profile，应同步更新这里。
+     */
     config->sample_rate_hz = SAMPLE_RATE_HZ;
     config->window_ms = APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS;
     config->window_hop_ms = APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS;
@@ -325,8 +487,12 @@ void app_audio_preprocess_get_default_config(
     config->mel_bin_count = APP_AUDIO_PREPROCESS_DEFAULT_MEL_BINS;
     config->mel_low_hz = APP_AUDIO_PREPROCESS_DEFAULT_MEL_LOW_HZ;
     config->mel_high_hz = APP_AUDIO_PREPROCESS_DEFAULT_MEL_HIGH_HZ;
+
+    /* 默认使用 SELECT_BEST，让每个 block 根据短时能量自动选择左右声道中较强的一路。 */
     config->channel_mix_mode = APP_AUDIO_CHANNEL_MIX_SELECT_BEST;
     config->fixed_delay_samples = 0;
+
+    /* frontend_profile 决定后续是否执行 RMS gain、z-score 以及具体 log-mel 对齐方式。 */
     config->frontend_profile = APP_AUDIO_PREPROCESS_DEFAULT_FRONTEND_PROFILE;
     config->energy_gate_threshold = APP_AUDIO_PREPROCESS_DEFAULT_ENERGY_GATE;
     config->normalize_target_rms = APP_AUDIO_PREPROCESS_DEFAULT_TARGET_RMS;
@@ -334,6 +500,8 @@ void app_audio_preprocess_get_default_config(
     config->log_epsilon = APP_AUDIO_PREPROCESS_DEFAULT_LOG_EPSILON;
     config->feature_mean = APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_MEAN;
     config->feature_std = APP_AUDIO_PREPROCESS_DEFAULT_FEATURE_STD;
+
+    /* 当前正式链路默认输出 float32 特征；量化字段先保留统一配置接口。 */
     config->quant_type = APP_MODEL_AUDIO_QUANT_FLOAT32;
     config->quant_scale = 1.0f;
     config->quant_zero_point = APP_AUDIO_PREPROCESS_DEFAULT_QUANT_ZERO;
@@ -346,6 +514,300 @@ void app_audio_preprocess_get_stats(app_audio_preprocess_stats_t *stats)
         *stats = audio_preprocess_stats;
     }
 }
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+bool app_audio_preprocess_event_feature_dump_can_emit(void)
+{
+    return (event_feature_dumps_printed <
+            APP_AUDIO_EVENT_FEATURE_DUMP_MAX_EVENTS);
+}
+
+void app_audio_preprocess_dump_event_feature(uint32_t input_sequence,
+                                             uint32_t result_sequence,
+                                             uint32_t event_index,
+                                             float cough_prob,
+                                             float event_energy)
+{
+    const uint32_t words_per_line = 20u;
+    uint32_t count;
+
+    if (!app_audio_preprocess_event_feature_dump_can_emit())
+    {
+        return;
+    }
+    event_feature_dumps_printed++;
+
+    if (!app_audio_preprocess_event_feature_copy_to_dump_buffer(
+            input_sequence))
+    {
+        printf("[AUDIO_FEATURE_FULL_MISS] seq=%lu, result_seq=%lu, "
+               "event_index=%lu, reason=not_in_recent_ring\r\n",
+               (unsigned long)input_sequence,
+               (unsigned long)result_sequence,
+               (unsigned long)event_index);
+        fflush(stdout);
+        return;
+    }
+
+    count = event_feature_dump_buffer.count;
+    printf("[AUDIO_FEATURE_FULL_BEGIN] seq=%lu, result_seq=%lu, "
+           "event_index=%lu, cough_prob=",
+           (unsigned long)event_feature_dump_buffer.sequence,
+           (unsigned long)result_sequence,
+           (unsigned long)event_index);
+    app_audio_preprocess_print_float_value(cough_prob);
+    printf(", energy=");
+    app_audio_preprocess_print_float_value(event_energy);
+    printf(", feature_energy=");
+    app_audio_preprocess_print_float_value(event_feature_dump_buffer.energy);
+    printf(", selected_channel=%lu, count=%lu, feature_min=",
+           (unsigned long)event_feature_dump_buffer.selected_channel,
+           (unsigned long)count);
+    app_audio_preprocess_print_float_value(
+        event_feature_dump_buffer.stats.min_value);
+    printf(", feature_max=");
+    app_audio_preprocess_print_float_value(
+        event_feature_dump_buffer.stats.max_value);
+    printf(", feature_mean=");
+    app_audio_preprocess_print_float_value(
+        event_feature_dump_buffer.stats.mean);
+    printf(", feature_std=");
+    app_audio_preprocess_print_float_value(
+        event_feature_dump_buffer.stats.stddev);
+    printf(", hash32=");
+    app_audio_preprocess_event_print_hex_word(
+        event_feature_dump_buffer.stats.hash32);
+    printf("\r\n");
+    app_audio_preprocess_event_dump_pace();
+
+    for (uint32_t offset = 0u; offset < count; offset += words_per_line)
+    {
+        uint32_t line_count = count - offset;
+
+        if (words_per_line < line_count)
+        {
+            line_count = words_per_line;
+        }
+
+        size_t used = (size_t)snprintf(
+            event_dump_line,
+            sizeof(event_dump_line),
+            "[AUDIO_FEATURE_FULL_DATA_HEX] seq=%lu, offset=%lu, "
+            "count=%lu, words=",
+            (unsigned long)event_feature_dump_buffer.sequence,
+            (unsigned long)offset,
+            (unsigned long)line_count);
+        for (uint32_t i = 0u; i < line_count; i++)
+        {
+            uint32_t word = 0u;
+
+            memcpy(&word,
+                   &event_feature_dump_buffer.feature[offset + i],
+                   sizeof(word));
+            if (0u < i)
+            {
+                app_audio_preprocess_event_dump_append_text(&used, ",");
+            }
+            app_audio_preprocess_event_dump_append_hex_word(&used, word);
+        }
+        printf("%s\r\n", event_dump_line);
+        app_audio_preprocess_event_dump_pace();
+    }
+
+    printf("[AUDIO_FEATURE_FULL_END] seq=%lu, count=%lu\r\n",
+           (unsigned long)event_feature_dump_buffer.sequence,
+           (unsigned long)count);
+    app_audio_preprocess_event_dump_pace();
+    fflush(stdout);
+}
+#endif
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+bool app_audio_preprocess_event_pcm_dump_can_emit(void)
+{
+    return (event_pcm_dumps_printed < APP_AUDIO_EVENT_PCM_DUMP_MAX_EVENTS);
+}
+
+void app_audio_preprocess_dump_event_pcm(uint32_t input_sequence,
+                                         uint32_t result_sequence,
+                                         uint32_t event_index,
+                                         float cough_prob,
+                                         float event_energy)
+{
+    const uint32_t words_per_line = 40u;
+    uint32_t count;
+
+    if (!app_audio_preprocess_event_pcm_dump_can_emit())
+    {
+        return;
+    }
+
+    event_pcm_dumps_printed++;
+    event_pcm_snapshot.locked = true;
+
+    if ((!event_pcm_snapshot.valid) ||
+        (event_pcm_snapshot.sequence != input_sequence) ||
+        (APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES < event_pcm_snapshot.count))
+    {
+        printf("[AUDIO_PCM_FULL_MISS] seq=%lu, result_seq=%lu, "
+               "event_index=%lu, reason=not_in_recent_snapshot\r\n",
+               (unsigned long)input_sequence,
+               (unsigned long)result_sequence,
+               (unsigned long)event_index);
+        fflush(stdout);
+        event_pcm_snapshot.locked = false;
+        return;
+    }
+
+    count = event_pcm_snapshot.count;
+    printf("[AUDIO_PCM_FULL_BEGIN] seq=%lu, result_seq=%lu, "
+           "event_index=%lu, cough_prob=",
+           (unsigned long)event_pcm_snapshot.sequence,
+           (unsigned long)result_sequence,
+           (unsigned long)event_index);
+    app_audio_preprocess_print_float_value(cough_prob);
+    printf(", energy=");
+    app_audio_preprocess_print_float_value(event_energy);
+    printf(", dc_removed_energy=");
+    app_audio_preprocess_print_float_value(event_pcm_snapshot.dc_removed_energy);
+    printf(", selected_channel=%lu, sample_rate=%lu, count=%lu, "
+           "pcm_stage=mono_selected_before_dc_removal, "
+           "pcm_format=int16_mono_le, pc_scale=pcm_int16/32768.0, "
+           "pcm_min=%ld, pcm_max=%ld, pcm_mean=",
+           (unsigned long)event_pcm_snapshot.selected_channel,
+           (unsigned long)event_pcm_snapshot.sample_rate_hz,
+           (unsigned long)count,
+           (long)event_pcm_snapshot.pcm_stats.min_value,
+           (long)event_pcm_snapshot.pcm_stats.max_value);
+    app_audio_preprocess_print_float_value(event_pcm_snapshot.pcm_stats.mean);
+    printf(", pcm_rms=");
+    app_audio_preprocess_print_float_value(event_pcm_snapshot.pcm_stats.rms);
+    printf(", hash32=");
+    app_audio_preprocess_event_print_hex_word(
+        event_pcm_snapshot.pcm_stats.hash32);
+    printf(", same_event_feature_available=%lu\r\n",
+           (unsigned long)(event_pcm_snapshot.feature_valid ? 1u : 0u));
+    app_audio_preprocess_event_dump_pace();
+
+    for (uint32_t offset = 0u; offset < count; offset += words_per_line)
+    {
+        uint32_t line_count = count - offset;
+
+        if (words_per_line < line_count)
+        {
+            line_count = words_per_line;
+        }
+
+        size_t used = (size_t)snprintf(
+            event_dump_line,
+            sizeof(event_dump_line),
+            "[AUDIO_PCM_FULL_DATA_HEX] seq=%lu, offset=%lu, "
+            "count=%lu, words=",
+            (unsigned long)event_pcm_snapshot.sequence,
+            (unsigned long)offset,
+            (unsigned long)line_count);
+        for (uint32_t i = 0u; i < line_count; i++)
+        {
+            if (0u < i)
+            {
+                app_audio_preprocess_event_dump_append_text(&used, ",");
+            }
+            app_audio_preprocess_event_dump_append_hex_halfword(
+                &used,
+                (uint16_t)event_pcm_snapshot.pcm[offset + i]);
+        }
+        printf("%s\r\n", event_dump_line);
+        app_audio_preprocess_event_dump_pace();
+    }
+
+    printf("[AUDIO_PCM_FULL_END] seq=%lu, count=%lu\r\n",
+           (unsigned long)event_pcm_snapshot.sequence,
+           (unsigned long)count);
+    app_audio_preprocess_event_dump_pace();
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_INCLUDE_FEATURE)
+    if (event_pcm_snapshot.feature_valid)
+    {
+        const uint32_t feature_words_per_line = 20u;
+        uint32_t feature_count = event_pcm_snapshot.feature_stats.count;
+
+        printf("[AUDIO_FEATURE_FULL_BEGIN] seq=%lu, result_seq=%lu, "
+               "event_index=%lu, cough_prob=",
+               (unsigned long)event_pcm_snapshot.sequence,
+               (unsigned long)result_sequence,
+               (unsigned long)event_index);
+        app_audio_preprocess_print_float_value(cough_prob);
+        printf(", energy=");
+        app_audio_preprocess_print_float_value(event_energy);
+        printf(", feature_energy=");
+        app_audio_preprocess_print_float_value(
+            event_pcm_snapshot.dc_removed_energy);
+        printf(", selected_channel=%lu, count=%lu, feature_min=",
+               (unsigned long)event_pcm_snapshot.selected_channel,
+               (unsigned long)feature_count);
+        app_audio_preprocess_print_float_value(
+            event_pcm_snapshot.feature_stats.min_value);
+        printf(", feature_max=");
+        app_audio_preprocess_print_float_value(
+            event_pcm_snapshot.feature_stats.max_value);
+        printf(", feature_mean=");
+        app_audio_preprocess_print_float_value(
+            event_pcm_snapshot.feature_stats.mean);
+        printf(", feature_std=");
+        app_audio_preprocess_print_float_value(
+            event_pcm_snapshot.feature_stats.stddev);
+        printf(", hash32=");
+        app_audio_preprocess_event_print_hex_word(
+            event_pcm_snapshot.feature_stats.hash32);
+        printf("\r\n");
+        app_audio_preprocess_event_dump_pace();
+
+        for (uint32_t offset = 0u; offset < feature_count;
+             offset += feature_words_per_line)
+        {
+            uint32_t line_count = feature_count - offset;
+
+            if (feature_words_per_line < line_count)
+            {
+                line_count = feature_words_per_line;
+            }
+
+            size_t used = (size_t)snprintf(
+                event_dump_line,
+                sizeof(event_dump_line),
+                "[AUDIO_FEATURE_FULL_DATA_HEX] seq=%lu, offset=%lu, "
+                "count=%lu, words=",
+                (unsigned long)event_pcm_snapshot.sequence,
+                (unsigned long)offset,
+                (unsigned long)line_count);
+            for (uint32_t i = 0u; i < line_count; i++)
+            {
+                uint32_t word = 0u;
+
+                memcpy(&word,
+                       &event_pcm_snapshot.feature[offset + i],
+                       sizeof(word));
+                if (0u < i)
+                {
+                    app_audio_preprocess_event_dump_append_text(&used, ",");
+                }
+                app_audio_preprocess_event_dump_append_hex_word(&used, word);
+            }
+            printf("%s\r\n", event_dump_line);
+            app_audio_preprocess_event_dump_pace();
+        }
+
+        printf("[AUDIO_FEATURE_FULL_END] seq=%lu, count=%lu\r\n",
+               (unsigned long)event_pcm_snapshot.sequence,
+               (unsigned long)feature_count);
+        app_audio_preprocess_event_dump_pace();
+    }
+#endif
+
+    fflush(stdout);
+    event_pcm_snapshot.locked = false;
+}
+#endif
 
 static cy_rslt_t app_audio_preprocess_validate_and_plan(
     const app_audio_preprocess_config_t *config,
@@ -668,6 +1130,10 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
 #endif
 
     app_audio_preprocess_copy_ordered_window();
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+    app_audio_preprocess_event_pcm_capture_pending(timestamp_ms,
+                                                   selected_channel);
+#endif
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
     stage_start_ms = app_audio_preprocess_now_ms();
 #endif
@@ -848,9 +1314,9 @@ static void app_audio_preprocess_copy_ordered_window(void)
 
 static bool app_audio_preprocess_condition_window(float *energy)
 {
-    /* 去直流和 RMS 归一化。
-     * energy_gate_threshold 使用归一化前能量，这样静音不会被 normalize_max_gain
-     * 放大后误判为有效语音。
+    /* 去直流和可选 RMS 归一化。
+     * energy_gate_threshold 使用 RMS 归一化前能量，这样静音不会被
+     * normalize_max_gain 放大后误判为有效语音。
      */
     double sum = 0.0;
     double square_sum = 0.0;
@@ -878,7 +1344,8 @@ static bool app_audio_preprocess_condition_window(float *energy)
         return false;
     }
 
-    if (app_audio_preprocess_uses_no_norm_frontend())
+    if (!app_audio_preprocess_rms_gain_enabled(
+            audio_preprocess_config.frontend_profile))
     {
         return true;
     }
@@ -1076,7 +1543,8 @@ static void app_audio_preprocess_power_to_db_and_normalize_buffer(
         square_sum += ((double)db * (double)db);
     }
 
-    if (app_audio_preprocess_uses_no_norm_frontend())
+    if (!app_audio_preprocess_feature_zscore_enabled(
+            audio_preprocess_config.frontend_profile))
     {
         return;
     }
@@ -1097,10 +1565,95 @@ static void app_audio_preprocess_power_to_db_and_normalize_buffer(
     }
 }
 
-static bool app_audio_preprocess_uses_no_norm_frontend(void)
+static bool app_audio_preprocess_is_no_norm_profile(uint8_t frontend_profile)
 {
     return ((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_BOARD_HTK_NO_NORM_V1 ==
-            audio_preprocess_config.frontend_profile);
+            frontend_profile);
+}
+
+static bool app_audio_preprocess_rms_gain_enabled(uint8_t frontend_profile)
+{
+    if (app_audio_preprocess_is_no_norm_profile(frontend_profile))
+    {
+        return false;
+    }
+
+    return ((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE ==
+            frontend_profile);
+}
+
+static bool app_audio_preprocess_feature_zscore_enabled(uint8_t frontend_profile)
+{
+    if (app_audio_preprocess_is_no_norm_profile(frontend_profile))
+    {
+        return false;
+    }
+
+    return ((uint8_t)APP_AUDIO_PREPROCESS_FRONTEND_PROFILE_V2_ZSCORE ==
+            frontend_profile);
+}
+
+static bool app_audio_preprocess_global_feature_norm_enabled(
+    uint8_t frontend_profile)
+{
+    (void)frontend_profile;
+
+    return false;
+}
+
+static void app_audio_preprocess_print_resolved_config(void)
+{
+    uint8_t frontend_profile = audio_preprocess_config.frontend_profile;
+
+    printf("[AUDIO_PREPROCESS_INFO] frontend_profile=%lu, frontend_name=%s, "
+           "rms_gain_enable=%lu, feature_zscore_enable=%lu, "
+           "global_feature_norm_enable=%lu, normalize_target_rms=",
+           (unsigned long)frontend_profile,
+           APP_AUDIO_ACTIVE_FRONTEND_NAME,
+           (unsigned long)app_audio_preprocess_rms_gain_enabled(frontend_profile),
+           (unsigned long)app_audio_preprocess_feature_zscore_enabled(
+               frontend_profile),
+           (unsigned long)app_audio_preprocess_global_feature_norm_enabled(
+               frontend_profile));
+    app_audio_preprocess_print_float_value(
+        audio_preprocess_config.normalize_target_rms);
+    printf(", normalize_max_gain=");
+    app_audio_preprocess_print_float_value(
+        audio_preprocess_config.normalize_max_gain);
+    printf(", feature_mean=");
+    app_audio_preprocess_print_float_value(audio_preprocess_config.feature_mean);
+    printf(", feature_std=");
+    app_audio_preprocess_print_float_value(audio_preprocess_config.feature_std);
+    printf(", power_to_db_mode=ref_max_top_db_80, power_ref_mode=max, "
+           "log_epsilon=");
+    app_audio_preprocess_print_float_value(audio_preprocess_config.log_epsilon);
+    printf(", energy_gate_threshold=");
+    app_audio_preprocess_print_float_value(
+        audio_preprocess_config.energy_gate_threshold);
+    printf("\r\n");
+}
+
+static void app_audio_preprocess_print_float_value(float value)
+{
+    const char *sign = "";
+    uint32_t whole;
+    uint32_t frac;
+
+    if (0.0f > value)
+    {
+        sign = "-";
+        value = -value;
+    }
+
+    whole = (uint32_t)value;
+    frac = (uint32_t)(((value - (float)whole) * 1000000.0f) + 0.5f);
+    if (1000000u <= frac)
+    {
+        whole++;
+        frac -= 1000000u;
+    }
+
+    printf("%s%lu.%06lu", sign, (unsigned long)whole, (unsigned long)frac);
 }
 
 #if (APP_MODEL_RUNTIME_PROFILE_ENABLE)
@@ -1308,8 +1861,527 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
     shared->input_state = APP_MODEL_SHARED_INPUT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
 
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+    app_audio_preprocess_event_feature_remember(&desc, model_input_feature);
+#endif
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+    app_audio_preprocess_event_pcm_remember(&desc, model_input_feature);
+#endif
+
+#if (APP_AUDIO_FEATURE_DUMP_ENABLE)
+    app_audio_preprocess_maybe_dump_feature_stats(&desc, model_input_feature);
+#endif
+
     return true;
 }
+
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+static bool app_audio_preprocess_event_feature_stats(
+    const float *feature,
+    uint32_t element_count,
+    app_audio_event_feature_stats_t *stats)
+{
+    const uint32_t fnv_offset_basis = 2166136261u;
+    const uint32_t fnv_prime = 16777619u;
+    uint32_t byte_count;
+    const uint8_t *feature_bytes;
+    double sum = 0.0;
+    double square_sum = 0.0;
+    float variance;
+
+    if ((NULL == feature) || (NULL == stats) || (0u == element_count) ||
+        (APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS < element_count))
+    {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->count = element_count;
+    stats->hash32 = fnv_offset_basis;
+    stats->min_value = feature[0];
+    stats->max_value = feature[0];
+
+    byte_count = element_count * (uint32_t)sizeof(feature[0]);
+    feature_bytes = (const uint8_t *)feature;
+    for (uint32_t i = 0u; i < byte_count; i++)
+    {
+        stats->hash32 ^= (uint32_t)feature_bytes[i];
+        stats->hash32 *= fnv_prime;
+    }
+
+    for (uint32_t i = 0u; i < element_count; i++)
+    {
+        float value = feature[i];
+
+        if (value < stats->min_value)
+        {
+            stats->min_value = value;
+        }
+        if (stats->max_value < value)
+        {
+            stats->max_value = value;
+        }
+        sum += value;
+        square_sum += ((double)value * (double)value);
+    }
+
+    stats->mean = (float)(sum / (double)element_count);
+    variance = (float)((square_sum / (double)element_count) -
+                       ((double)stats->mean * (double)stats->mean));
+    if (0.0f > variance)
+    {
+        variance = 0.0f;
+    }
+    stats->stddev = sqrtf(variance);
+
+    return true;
+}
+#endif
+
+#if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
+static void app_audio_preprocess_event_feature_remember(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature)
+{
+    uint32_t element_count;
+    app_audio_event_feature_frame_t *slot;
+
+    if ((NULL == desc) || (NULL == feature))
+    {
+        return;
+    }
+
+    element_count = (uint32_t)desc->mel_bin_count *
+                    (uint32_t)desc->time_bin_count;
+    if ((0u == element_count) ||
+        (APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS < element_count))
+    {
+        return;
+    }
+
+    slot = &event_feature_ring[event_feature_ring_write_index];
+    event_feature_ring_write_index++;
+    if (APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH <=
+        event_feature_ring_write_index)
+    {
+        event_feature_ring_write_index = 0u;
+    }
+
+    slot->valid = false;
+    memset(slot, 0, sizeof(*slot));
+    slot->sequence = desc->sequence;
+    slot->timestamp_ms = desc->timestamp_ms;
+    slot->count = element_count;
+    slot->payload_bytes = element_count * (uint32_t)sizeof(feature[0]);
+    slot->energy = desc->energy;
+    slot->selected_channel = desc->selected_channel;
+    memcpy(slot->feature, feature, slot->payload_bytes);
+    if (!app_audio_preprocess_event_feature_stats(
+            slot->feature,
+            element_count,
+            &slot->stats))
+    {
+        return;
+    }
+    slot->valid = true;
+}
+
+static bool app_audio_preprocess_event_feature_copy_to_dump_buffer(
+    uint32_t input_sequence)
+{
+    for (uint32_t i = 0u; i < APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH; i++)
+    {
+        app_audio_event_feature_frame_t *slot = &event_feature_ring[i];
+
+        if (slot->valid && (slot->sequence == input_sequence))
+        {
+            memcpy(&event_feature_dump_buffer,
+                   slot,
+                   sizeof(event_feature_dump_buffer));
+            return (event_feature_dump_buffer.valid &&
+                    (event_feature_dump_buffer.sequence == input_sequence) &&
+                    (event_feature_dump_buffer.count <=
+                     APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS));
+        }
+    }
+
+    return false;
+}
+#endif
+
+#if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)
+static void app_audio_preprocess_event_dump_pace(void)
+{
+    fflush(stdout);
+#if (APP_AUDIO_EVENT_DUMP_LINE_DELAY_MS > 0u)
+    vTaskDelay(pdMS_TO_TICKS(APP_AUDIO_EVENT_DUMP_LINE_DELAY_MS));
+#endif
+}
+
+static void app_audio_preprocess_event_dump_append_text(size_t *used,
+                                                        const char *text)
+{
+    int written;
+
+    if ((NULL == used) || (NULL == text) ||
+        (*used >= APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS))
+    {
+        return;
+    }
+
+    written = snprintf(&event_dump_line[*used],
+                       APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used,
+                       "%s",
+                       text);
+    if (0 < written)
+    {
+        size_t advance = (size_t)written;
+        size_t remaining = APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used;
+
+        *used += (advance < remaining) ? advance : (remaining - 1u);
+    }
+}
+
+static void app_audio_preprocess_event_dump_append_hex_word(size_t *used,
+                                                            uint32_t value)
+{
+    int written;
+
+    if ((NULL == used) || (*used >= APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS))
+    {
+        return;
+    }
+
+    written = snprintf(&event_dump_line[*used],
+                       APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used,
+                       "0x%08lx",
+                       (unsigned long)value);
+    if (0 < written)
+    {
+        size_t advance = (size_t)written;
+        size_t remaining = APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used;
+
+        *used += (advance < remaining) ? advance : (remaining - 1u);
+    }
+}
+
+static void app_audio_preprocess_event_dump_append_hex_halfword(size_t *used,
+                                                                uint16_t value)
+{
+    int written;
+
+    if ((NULL == used) || (*used >= APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS))
+    {
+        return;
+    }
+
+    written = snprintf(&event_dump_line[*used],
+                       APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used,
+                       "0x%04lx",
+                       (unsigned long)value);
+    if (0 < written)
+    {
+        size_t advance = (size_t)written;
+        size_t remaining = APP_AUDIO_EVENT_DUMP_LINE_MAX_CHARS - *used;
+
+        *used += (advance < remaining) ? advance : (remaining - 1u);
+    }
+}
+
+static void app_audio_preprocess_event_print_hex_word(uint32_t value)
+{
+    printf("0x%08lx", (unsigned long)value);
+}
+#endif
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_ENABLE)
+static void app_audio_preprocess_event_pcm_capture_pending(uint32_t timestamp_ms,
+                                                           uint8_t selected_channel)
+{
+    uint16_t start = mono_ring_write_index;
+
+    if ((!app_audio_preprocess_event_pcm_dump_can_emit()) ||
+        event_pcm_snapshot.locked ||
+        (audio_preprocess_plan.window_samples >
+         APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES))
+    {
+        return;
+    }
+
+    event_pcm_snapshot.valid = false;
+    event_pcm_snapshot.feature_valid = false;
+    event_pcm_snapshot.sequence = 0u;
+    event_pcm_snapshot.timestamp_ms = timestamp_ms;
+    event_pcm_snapshot.sample_rate_hz = audio_preprocess_config.sample_rate_hz;
+    event_pcm_snapshot.count = audio_preprocess_plan.window_samples;
+    event_pcm_snapshot.dc_removed_energy = 0.0f;
+    event_pcm_snapshot.selected_channel = selected_channel;
+
+    for (uint16_t i = 0u; i < audio_preprocess_plan.window_samples; i++)
+    {
+        uint16_t index =
+            (uint16_t)((start + i) % audio_preprocess_plan.window_samples);
+
+        event_pcm_snapshot.pcm[i] = mono_ring[index];
+    }
+
+    if (!app_audio_preprocess_event_pcm_stats(
+            event_pcm_snapshot.pcm,
+            event_pcm_snapshot.count,
+            &event_pcm_snapshot.pcm_stats))
+    {
+        event_pcm_pending_valid = false;
+        return;
+    }
+
+    event_pcm_pending_valid = true;
+    event_pcm_snapshot.valid = true;
+}
+
+static bool app_audio_preprocess_event_pcm_stats(
+    const int16_t *pcm,
+    uint32_t sample_count,
+    app_audio_event_pcm_stats_t *stats)
+{
+    const uint32_t fnv_offset_basis = 2166136261u;
+    const uint32_t fnv_prime = 16777619u;
+    uint32_t byte_count;
+    const uint8_t *pcm_bytes;
+    int64_t sum = 0;
+    double square_sum = 0.0;
+
+    if ((NULL == pcm) || (NULL == stats) || (0u == sample_count) ||
+        (APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES < sample_count))
+    {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->count = sample_count;
+    stats->hash32 = fnv_offset_basis;
+    stats->min_value = pcm[0];
+    stats->max_value = pcm[0];
+
+    byte_count = sample_count * (uint32_t)sizeof(pcm[0]);
+    pcm_bytes = (const uint8_t *)pcm;
+    for (uint32_t i = 0u; i < byte_count; i++)
+    {
+        stats->hash32 ^= (uint32_t)pcm_bytes[i];
+        stats->hash32 *= fnv_prime;
+    }
+
+    for (uint32_t i = 0u; i < sample_count; i++)
+    {
+        int16_t value = pcm[i];
+
+        if (value < stats->min_value)
+        {
+            stats->min_value = value;
+        }
+        if (stats->max_value < value)
+        {
+            stats->max_value = value;
+        }
+        sum += value;
+        square_sum += ((double)value * (double)value);
+    }
+
+    stats->mean = (float)((double)sum / (double)sample_count);
+    stats->rms = sqrtf((float)(square_sum / (double)sample_count));
+
+    return true;
+}
+
+static void app_audio_preprocess_event_pcm_remember(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature)
+{
+    uint32_t element_count;
+
+    if ((NULL == desc) || (!event_pcm_pending_valid) ||
+        event_pcm_snapshot.locked)
+    {
+        return;
+    }
+
+    event_pcm_snapshot.sequence = desc->sequence;
+    event_pcm_snapshot.dc_removed_energy = desc->energy;
+    event_pcm_snapshot.selected_channel = desc->selected_channel;
+
+#if (APP_AUDIO_EVENT_PCM_DUMP_INCLUDE_FEATURE)
+    event_pcm_snapshot.feature_valid = false;
+    if (NULL != feature)
+    {
+        element_count = (uint32_t)desc->mel_bin_count *
+                        (uint32_t)desc->time_bin_count;
+        if ((0u < element_count) &&
+            (APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS >= element_count))
+        {
+            memcpy(event_pcm_snapshot.feature,
+                   feature,
+                   element_count * (uint32_t)sizeof(feature[0]));
+            event_pcm_snapshot.feature_valid =
+                app_audio_preprocess_event_feature_stats(
+                    event_pcm_snapshot.feature,
+                    element_count,
+                    &event_pcm_snapshot.feature_stats);
+        }
+    }
+#else
+    (void)feature;
+    element_count = 0u;
+    (void)element_count;
+#endif
+
+    event_pcm_snapshot.valid = true;
+    event_pcm_pending_valid = false;
+}
+
+#endif
+
+#if (APP_AUDIO_FEATURE_DUMP_ENABLE)
+static void app_audio_preprocess_maybe_dump_feature_stats(
+    const app_model_audio_feature_desc_t *desc,
+    const float *feature)
+{
+    const uint32_t fnv_offset_basis = 2166136261u;
+    const uint32_t fnv_prime = 16777619u;
+    uint32_t element_count;
+    uint32_t byte_count;
+    const uint8_t *feature_bytes;
+    float min_value;
+    float max_value;
+    double sum = 0.0;
+    double square_sum = 0.0;
+    float mean;
+    float variance;
+    float stddev;
+    uint32_t hash = fnv_offset_basis;
+    uint32_t floor_count = 0u;
+    uint32_t near_zero_count = 0u;
+    uint32_t sample_last_index;
+
+    if ((NULL == desc) || (NULL == feature) ||
+        ((0u < APP_AUDIO_FEATURE_DUMP_WINDOWS) &&
+         (APP_AUDIO_FEATURE_DUMP_WINDOWS <= feature_dump_windows_reported)))
+    {
+        return;
+    }
+
+    element_count = (uint32_t)desc->mel_bin_count *
+                    (uint32_t)desc->time_bin_count;
+    if (0u == element_count)
+    {
+        return;
+    }
+
+    byte_count = element_count * (uint32_t)sizeof(feature[0]);
+    feature_bytes = (const uint8_t *)feature;
+    for (uint32_t i = 0u; i < byte_count; i++)
+    {
+        hash ^= (uint32_t)feature_bytes[i];
+        hash *= fnv_prime;
+    }
+
+    min_value = feature[0];
+    max_value = feature[0];
+    for (uint32_t i = 0u; i < element_count; i++)
+    {
+        float value = feature[i];
+
+        if (value < min_value)
+        {
+            min_value = value;
+        }
+        if (max_value < value)
+        {
+            max_value = value;
+        }
+        if (value <= -79.9f)
+        {
+            floor_count++;
+        }
+        if (fabsf(value) <= 1.0e-3f)
+        {
+            near_zero_count++;
+        }
+        sum += value;
+        square_sum += ((double)value * (double)value);
+    }
+
+    mean = (float)(sum / (double)element_count);
+    variance = (float)((square_sum / (double)element_count) -
+                       ((double)mean * (double)mean));
+    if (0.0f > variance)
+    {
+        variance = 0.0f;
+    }
+    stddev = sqrtf(variance);
+    sample_last_index = element_count - 1u;
+
+    feature_dump_windows_reported++;
+    printf("[AUDIO_FEATURE_CM33] seq=%lu, energy=",
+           (unsigned long)desc->sequence);
+    app_audio_preprocess_dump_print_float(desc->energy);
+    printf(", selected_channel=%lu, count=%lu, feature_min=",
+           (unsigned long)desc->selected_channel,
+           (unsigned long)element_count);
+    app_audio_preprocess_dump_print_float(min_value);
+    printf(", feature_max=");
+    app_audio_preprocess_dump_print_float(max_value);
+    printf(", feature_mean=");
+    app_audio_preprocess_dump_print_float(mean);
+    printf(", feature_std=");
+    app_audio_preprocess_dump_print_float(stddev);
+    printf(", hash_low16=%lu, floor80_count=%lu, near0_count=%lu, f0=",
+           (unsigned long)(hash & 0xffffu),
+           (unsigned long)floor_count,
+           (unsigned long)near_zero_count);
+    app_audio_preprocess_dump_print_float(feature[0]);
+    printf(", f1=");
+    app_audio_preprocess_dump_print_float(feature[(1u < element_count) ?
+                                                  1u : sample_last_index]);
+    printf(", f2=");
+    app_audio_preprocess_dump_print_float(feature[(2u < element_count) ?
+                                                  2u : sample_last_index]);
+    printf(", f39=");
+    app_audio_preprocess_dump_print_float(feature[(39u < element_count) ?
+                                                  39u : sample_last_index]);
+    printf(", f40=");
+    app_audio_preprocess_dump_print_float(feature[(40u < element_count) ?
+                                                  40u : sample_last_index]);
+    printf(", f100=");
+    app_audio_preprocess_dump_print_float(feature[(100u < element_count) ?
+                                                  100u : sample_last_index]);
+    printf(", sample_last=");
+    app_audio_preprocess_dump_print_float(feature[sample_last_index]);
+    printf("\r\n");
+}
+
+static void app_audio_preprocess_dump_print_float(float value)
+{
+    const char *sign = "";
+    uint32_t whole;
+    uint32_t frac;
+
+    if (0.0f > value)
+    {
+        sign = "-";
+        value = -value;
+    }
+
+    whole = (uint32_t)value;
+    frac = (uint32_t)(((value - (float)whole) * 1000000.0f) + 0.5f);
+    if (1000000u <= frac)
+    {
+        whole++;
+        frac -= 1000000u;
+    }
+
+    printf("%s%lu.%06lu", sign, (unsigned long)whole, (unsigned long)frac);
+}
+#endif
 
 static uint32_t app_audio_preprocess_ms_to_samples(uint32_t sample_rate_hz,
                                                    uint16_t ms)
