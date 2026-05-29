@@ -69,7 +69,7 @@ SOURCES+=
 
 # Like SOURCES, but for include directories. Value should be paths to
 # directories (without a leading -I).
-INCLUDES+=../shared source/app_ble source/app_display
+INCLUDES+=../shared source/app_ble source/app_display source/app_monitor_summary
 
 # Add additional defines to the build process (without a leading -D).
 # Keep CR/LF conversion disabled: training export sends binary PCM frames over
@@ -109,6 +109,10 @@ APP_BLE_STACK_ENABLE?=0
 APP_BLE_DEBUG_DISABLE_INFERENCE?=0
 APP_DISPLAY_ENABLE?=0
 APP_DISPLAY_SMOKE_ENABLE?=0
+APP_DISPLAY_DEBUG_PAGE_ENABLE?=0
+APP_DISPLAY_SUMMARY_ENABLE?=0
+APP_MONITOR_SUMMARY_ENABLE?=0
+APP_MONITOR_SUMMARY_DIAG_ENABLE?=0
 
 ifneq ($(strip $(APP_DEBUG_UART_BAUD_RATE)),)
 DEFINES+=APP_DEBUG_UART_BAUD_RATE=$(APP_DEBUG_UART_BAUD_RATE)
@@ -148,6 +152,10 @@ DEFINES+=APP_BLE_STACK_ENABLE=$(APP_BLE_STACK_ENABLE)
 DEFINES+=APP_BLE_DEBUG_DISABLE_INFERENCE=$(APP_BLE_DEBUG_DISABLE_INFERENCE)
 DEFINES+=APP_DISPLAY_ENABLE=$(APP_DISPLAY_ENABLE)
 DEFINES+=APP_DISPLAY_SMOKE_ENABLE=$(APP_DISPLAY_SMOKE_ENABLE)
+DEFINES+=APP_DISPLAY_DEBUG_PAGE_ENABLE=$(APP_DISPLAY_DEBUG_PAGE_ENABLE)
+DEFINES+=APP_DISPLAY_SUMMARY_ENABLE=$(APP_DISPLAY_SUMMARY_ENABLE)
+DEFINES+=APP_MONITOR_SUMMARY_ENABLE=$(APP_MONITOR_SUMMARY_ENABLE)
+DEFINES+=APP_MONITOR_SUMMARY_DIAG_ENABLE=$(APP_MONITOR_SUMMARY_DIAG_ENABLE)
 
 ifneq ($(filter 1,$(APP_AUDIO_SPECTRUM_BACKEND) $(APP_AUDIO_SPECTRUM_COMPARE_ENABLE)),)
 COMPONENTS+=CMSIS_DSP
@@ -182,6 +190,15 @@ endif
 ifeq ($(APP_DISPLAY_ENABLE),0)
 CY_IGNORE+=source/app_display/app_display.c
 CY_IGNORE+=source/app_display/app_display_backend_null.c
+CY_IGNORE+=source/app_display/app_display_summary_adapter.c
+else
+ifeq ($(APP_DISPLAY_SUMMARY_ENABLE),0)
+CY_IGNORE+=source/app_display/app_display_summary_adapter.c
+endif
+endif
+
+ifeq ($(APP_MONITOR_SUMMARY_ENABLE),0)
+CY_IGNORE+=source/app_monitor_summary/app_monitor_summary.c
 endif
 
 # Select softfp or hardfp floating point. Default is softfp.

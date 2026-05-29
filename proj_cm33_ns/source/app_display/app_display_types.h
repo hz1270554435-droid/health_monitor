@@ -40,6 +40,25 @@ typedef enum
     E84_DISPLAY_ALERT_COUNT
 } e84_display_alert_t;
 
+typedef enum
+{
+    E84_DISPLAY_PAGE_BOOT = 0,
+    E84_DISPLAY_PAGE_HOME,
+    E84_DISPLAY_PAGE_ALERT,
+    E84_DISPLAY_PAGE_DEBUG,
+    E84_DISPLAY_PAGE_COUNT
+} e84_display_page_t;
+
+typedef enum
+{
+    E84_DISPLAY_SEVERITY_NONE = 0,
+    E84_DISPLAY_SEVERITY_INFO,
+    E84_DISPLAY_SEVERITY_ATTENTION,
+    E84_DISPLAY_SEVERITY_WARNING,
+    E84_DISPLAY_SEVERITY_ERROR,
+    E84_DISPLAY_SEVERITY_COUNT
+} e84_display_severity_t;
+
 #define E84_DISPLAY_FLAG_AUDIO_VALID       (1u << 0)
 #define E84_DISPLAY_FLAG_RADAR_VALID       (1u << 1)
 #define E84_DISPLAY_FLAG_FUSION_VALID      (1u << 2)
@@ -66,9 +85,37 @@ typedef struct
     uint32_t flags;
 } e84_display_snapshot_t;
 
+typedef struct
+{
+    e84_display_alert_t code;
+    e84_display_severity_t severity;
+    const char *title;
+    const char *short_message;
+    uint32_t raised_timestamp_ms;
+    uint32_t timeout_ms;
+    bool dismissible;
+    bool latched;
+} e84_display_alert_presentation_t;
+
+typedef struct
+{
+    e84_display_page_t current_page;
+    e84_display_page_t previous_page;
+    e84_display_health_state_t health_state;
+    e84_display_alert_presentation_t alert;
+    e84_display_snapshot_t snapshot;
+    uint32_t display_dropped_commands;
+    uint32_t last_refresh_timestamp_ms;
+    const char *refresh_reason;
+    bool smoke_enabled;
+    bool dirty;
+} e84_display_view_model_t;
+
 const char *e84_display_health_state_name(
     e84_display_health_state_t state);
 const char *e84_display_alert_name(e84_display_alert_t alert);
+const char *e84_display_page_name(e84_display_page_t page);
+const char *e84_display_severity_name(e84_display_severity_t severity);
 
 #if defined(__cplusplus)
 }

@@ -45,6 +45,22 @@ extern "C" {
 #define APP_DISPLAY_NULL_LOG_MIN_PERIOD_MS       (2000u)
 #endif
 
+#ifndef APP_DISPLAY_ALERT_DEFAULT_TIMEOUT_MS
+#define APP_DISPLAY_ALERT_DEFAULT_TIMEOUT_MS     (5000u)
+#endif
+
+#ifndef APP_DISPLAY_DEBUG_PAGE_ENABLE
+#define APP_DISPLAY_DEBUG_PAGE_ENABLE            (0u)
+#endif
+
+#ifndef APP_DISPLAY_SUMMARY_ENABLE
+#define APP_DISPLAY_SUMMARY_ENABLE               (0u)
+#endif
+
+#ifndef APP_DISPLAY_SUMMARY_PERIOD_MS
+#define APP_DISPLAY_SUMMARY_PERIOD_MS            (1000u)
+#endif
+
 #ifndef APP_DISPLAY_SMOKE_ENABLE
 #define APP_DISPLAY_SMOKE_ENABLE                 (0u)
 #endif
@@ -68,6 +84,16 @@ extern "C" {
 #if ((APP_DISPLAY_SMOKE_ENABLE != 0u) && \
      (APP_DISPLAY_SMOKE_ENABLE != 1u))
 #error "Unsupported APP_DISPLAY_SMOKE_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_DEBUG_PAGE_ENABLE != 0u) && \
+     (APP_DISPLAY_DEBUG_PAGE_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_DEBUG_PAGE_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_SUMMARY_ENABLE != 0u) && \
+     (APP_DISPLAY_SUMMARY_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_SUMMARY_ENABLE"
 #endif
 
 #if (APP_DISPLAY_ENABLE)

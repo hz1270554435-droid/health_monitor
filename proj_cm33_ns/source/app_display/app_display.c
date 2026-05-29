@@ -10,11 +10,16 @@
 #include "queue.h"
 #include "task.h"
 
+#if (APP_DISPLAY_SUMMARY_ENABLE && !APP_DISPLAY_SMOKE_ENABLE)
+#include "app_display_summary_adapter.h"
+#endif
+
 typedef enum
 {
     APP_DISPLAY_CMD_SNAPSHOT = 0,
     APP_DISPLAY_CMD_ALERT_RAISE,
-    APP_DISPLAY_CMD_ALERT_CLEAR
+    APP_DISPLAY_CMD_ALERT_CLEAR,
+    APP_DISPLAY_CMD_DEBUG_SET
 } app_display_cmd_type_t;
 
 typedef struct
@@ -25,6 +30,7 @@ typedef struct
     uint8_t severity;
     uint8_t confidence;
     uint32_t flags;
+    bool debug_enabled;
 } app_display_cmd_t;
 
 cy_rslt_t app_display_backend_null_init(void);
@@ -37,17 +43,50 @@ void app_display_backend_null_render_alert(e84_display_alert_t alert,
                                            uint8_t confidence,
                                            uint32_t flags,
                                            uint32_t now_ms);
+void app_display_backend_null_render_view(
+    const e84_display_view_model_t *view,
+    bool force);
 
 static QueueHandle_t display_queue;
 static TaskHandle_t display_task_handle;
 static e84_display_snapshot_t current_snapshot;
+static e84_display_view_model_t current_view;
 static uint32_t display_dropped_commands;
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+static bool debug_page_requested;
+#endif
 
 static void app_display_task(void *pvParameters);
 static cy_rslt_t app_display_enqueue(const app_display_cmd_t *cmd);
 static bool app_display_snapshot_is_valid(
     const e84_display_snapshot_t *snapshot);
 static uint32_t app_display_now_ms(void);
+static void app_display_view_init(uint32_t now_ms);
+static bool app_display_reduce_snapshot(
+    const e84_display_snapshot_t *snapshot,
+    uint32_t now_ms);
+static bool app_display_reduce_alert_raise(e84_display_alert_t alert,
+                                           uint8_t severity,
+                                           uint32_t flags,
+                                           uint32_t now_ms);
+static bool app_display_reduce_alert_clear(e84_display_alert_t alert,
+                                           uint32_t now_ms,
+                                           const char *reason);
+static bool app_display_reduce_alert_timeout(uint32_t now_ms,
+                                             e84_display_alert_t *alert);
+static bool app_display_build_view_model(uint32_t now_ms,
+                                         const char *reason);
+static e84_display_page_t app_display_select_page(void);
+static e84_display_severity_t app_display_normalize_severity(
+    e84_display_alert_t alert,
+    uint8_t severity);
+static e84_display_severity_t app_display_default_alert_severity(
+    e84_display_alert_t alert);
+static const char *app_display_alert_title(e84_display_alert_t alert);
+static const char *app_display_alert_message(e84_display_alert_t alert);
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE && APP_DISPLAY_SMOKE_ENABLE)
+static cy_rslt_t app_display_set_debug_page(bool enabled);
+#endif
 #if (APP_DISPLAY_SMOKE_ENABLE)
 static void app_display_smoke_tick(uint32_t now_ms);
 static void app_display_smoke_make_snapshot(
@@ -69,6 +108,7 @@ cy_rslt_t app_display_init(void)
     current_snapshot.timestamp_ms = app_display_now_ms();
     current_snapshot.health_state = E84_DISPLAY_HEALTH_INIT;
     current_snapshot.active_alert = E84_DISPLAY_ALERT_NONE;
+    app_display_view_init(current_snapshot.timestamp_ms);
 
     display_queue = xQueueCreate(APP_DISPLAY_QUEUE_DEPTH,
                                  sizeof(app_display_cmd_t));
@@ -232,6 +272,51 @@ const char *e84_display_alert_name(e84_display_alert_t alert)
     }
 }
 
+const char *e84_display_page_name(e84_display_page_t page)
+{
+    switch (page)
+    {
+        case E84_DISPLAY_PAGE_BOOT:
+            return "BOOT";
+
+        case E84_DISPLAY_PAGE_HOME:
+            return "HOME";
+
+        case E84_DISPLAY_PAGE_ALERT:
+            return "ALERT";
+
+        case E84_DISPLAY_PAGE_DEBUG:
+            return "DEBUG";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
+const char *e84_display_severity_name(e84_display_severity_t severity)
+{
+    switch (severity)
+    {
+        case E84_DISPLAY_SEVERITY_NONE:
+            return "NONE";
+
+        case E84_DISPLAY_SEVERITY_INFO:
+            return "INFO";
+
+        case E84_DISPLAY_SEVERITY_ATTENTION:
+            return "ATTENTION";
+
+        case E84_DISPLAY_SEVERITY_WARNING:
+            return "WARNING";
+
+        case E84_DISPLAY_SEVERITY_ERROR:
+            return "ERROR";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
 static void app_display_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -249,17 +334,22 @@ static void app_display_task(void *pvParameters)
             switch (cmd.type)
             {
                 case APP_DISPLAY_CMD_SNAPSHOT:
-                    current_snapshot = cmd.snapshot;
+                {
+                    bool force_view =
+                        app_display_reduce_snapshot(&cmd.snapshot, now_ms);
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+                    app_display_backend_null_render_view(&current_view,
+                                                         force_view);
                     break;
+                }
 
                 case APP_DISPLAY_CMD_ALERT_RAISE:
-                    current_snapshot.timestamp_ms = now_ms;
-                    current_snapshot.active_alert = cmd.alert;
-                    current_snapshot.flags |=
-                        (cmd.flags | E84_DISPLAY_FLAG_ALERT_LATCHED);
+                    (void)app_display_reduce_alert_raise(cmd.alert,
+                                                         cmd.severity,
+                                                         cmd.flags,
+                                                         now_ms);
                     app_display_backend_null_render_alert(cmd.alert,
                                                           "raise",
                                                           cmd.severity,
@@ -269,18 +359,14 @@ static void app_display_task(void *pvParameters)
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+                    app_display_backend_null_render_view(&current_view,
+                                                         true);
                     break;
 
                 case APP_DISPLAY_CMD_ALERT_CLEAR:
-                    if ((E84_DISPLAY_ALERT_NONE == cmd.alert) ||
-                        (current_snapshot.active_alert == cmd.alert))
-                    {
-                        current_snapshot.timestamp_ms = now_ms;
-                        current_snapshot.active_alert =
-                            E84_DISPLAY_ALERT_NONE;
-                        current_snapshot.flags &=
-                            ~E84_DISPLAY_FLAG_ALERT_LATCHED;
-                    }
+                    (void)app_display_reduce_alert_clear(cmd.alert,
+                                                         now_ms,
+                                                         "alert_clear");
                     app_display_backend_null_render_alert(cmd.alert,
                                                           "clear",
                                                           0u,
@@ -290,6 +376,20 @@ static void app_display_task(void *pvParameters)
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+                    app_display_backend_null_render_view(&current_view,
+                                                         true);
+                    break;
+
+                case APP_DISPLAY_CMD_DEBUG_SET:
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+                    debug_page_requested = cmd.debug_enabled;
+                    (void)app_display_build_view_model(now_ms,
+                                                       cmd.debug_enabled ?
+                                                       "debug_enter" :
+                                                       "debug_exit");
+                    app_display_backend_null_render_view(&current_view,
+                                                         true);
+#endif
                     break;
 
                 default:
@@ -298,10 +398,28 @@ static void app_display_task(void *pvParameters)
         }
         else
         {
+            e84_display_alert_t timeout_alert = E84_DISPLAY_ALERT_NONE;
+            uint32_t now_ms = app_display_now_ms();
+
+            if (app_display_reduce_alert_timeout(now_ms, &timeout_alert))
+            {
+                app_display_backend_null_render_alert(timeout_alert,
+                                                      "timeout",
+                                                      0u,
+                                                      0u,
+                                                      0u,
+                                                      now_ms);
+                app_display_backend_null_render_snapshot(&current_snapshot,
+                                                         true);
+                app_display_backend_null_render_view(&current_view, true);
+            }
 #if (APP_DISPLAY_SMOKE_ENABLE)
-            app_display_smoke_tick(app_display_now_ms());
+            app_display_smoke_tick(now_ms);
+#elif (APP_DISPLAY_SUMMARY_ENABLE)
+            (void)app_display_summary_adapter_tick(now_ms);
 #else
             app_display_backend_null_render_snapshot(&current_snapshot, false);
+            app_display_backend_null_render_view(&current_view, false);
 #endif
         }
     }
@@ -348,6 +466,296 @@ static uint32_t app_display_now_ms(void)
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+static void app_display_view_init(uint32_t now_ms)
+{
+    memset(&current_view, 0, sizeof(current_view));
+    current_view.current_page = E84_DISPLAY_PAGE_BOOT;
+    current_view.previous_page = E84_DISPLAY_PAGE_BOOT;
+    current_view.health_state = E84_DISPLAY_HEALTH_INIT;
+    current_view.alert.code = E84_DISPLAY_ALERT_NONE;
+    current_view.alert.severity = E84_DISPLAY_SEVERITY_NONE;
+    current_view.alert.title = app_display_alert_title(
+        E84_DISPLAY_ALERT_NONE);
+    current_view.alert.short_message = app_display_alert_message(
+        E84_DISPLAY_ALERT_NONE);
+    current_view.snapshot = current_snapshot;
+    current_view.last_refresh_timestamp_ms = now_ms;
+    current_view.refresh_reason = "init";
+    current_view.smoke_enabled = (APP_DISPLAY_SMOKE_ENABLE != 0u);
+    current_view.dirty = true;
+}
+
+static bool app_display_reduce_snapshot(
+    const e84_display_snapshot_t *snapshot,
+    uint32_t now_ms)
+{
+    if (NULL == snapshot)
+    {
+        return false;
+    }
+
+    current_snapshot = *snapshot;
+    if (E84_DISPLAY_ALERT_NONE != current_view.alert.code)
+    {
+        current_snapshot.active_alert = current_view.alert.code;
+        if (current_view.alert.latched)
+        {
+            current_snapshot.flags |= E84_DISPLAY_FLAG_ALERT_LATCHED;
+        }
+    }
+
+    return app_display_build_view_model(now_ms, "snapshot");
+}
+
+static bool app_display_reduce_alert_raise(e84_display_alert_t alert,
+                                           uint8_t severity,
+                                           uint32_t flags,
+                                           uint32_t now_ms)
+{
+    bool latched =
+        (0u != (flags & E84_DISPLAY_FLAG_ALERT_LATCHED)) ||
+        (E84_DISPLAY_ALERT_SYSTEM_ERROR == alert);
+
+    current_view.alert.code = alert;
+    current_view.alert.severity =
+        app_display_normalize_severity(alert, severity);
+    current_view.alert.title = app_display_alert_title(alert);
+    current_view.alert.short_message = app_display_alert_message(alert);
+    current_view.alert.raised_timestamp_ms = now_ms;
+    current_view.alert.timeout_ms = APP_DISPLAY_ALERT_DEFAULT_TIMEOUT_MS;
+    current_view.alert.dismissible = !latched;
+    current_view.alert.latched = latched;
+
+    current_snapshot.timestamp_ms = now_ms;
+    current_snapshot.active_alert = alert;
+    if (latched)
+    {
+        current_snapshot.flags |= E84_DISPLAY_FLAG_ALERT_LATCHED;
+    }
+    else
+    {
+        current_snapshot.flags &= ~E84_DISPLAY_FLAG_ALERT_LATCHED;
+    }
+
+    return app_display_build_view_model(now_ms, "alert_raise");
+}
+
+static bool app_display_reduce_alert_clear(e84_display_alert_t alert,
+                                           uint32_t now_ms,
+                                           const char *reason)
+{
+    if ((E84_DISPLAY_ALERT_NONE == alert) ||
+        (current_view.alert.code == alert))
+    {
+        current_view.alert.code = E84_DISPLAY_ALERT_NONE;
+        current_view.alert.severity = E84_DISPLAY_SEVERITY_NONE;
+        current_view.alert.title = app_display_alert_title(
+            E84_DISPLAY_ALERT_NONE);
+        current_view.alert.short_message = app_display_alert_message(
+            E84_DISPLAY_ALERT_NONE);
+        current_view.alert.raised_timestamp_ms = 0u;
+        current_view.alert.timeout_ms = 0u;
+        current_view.alert.dismissible = false;
+        current_view.alert.latched = false;
+
+        current_snapshot.timestamp_ms = now_ms;
+        current_snapshot.active_alert = E84_DISPLAY_ALERT_NONE;
+        current_snapshot.flags &= ~E84_DISPLAY_FLAG_ALERT_LATCHED;
+    }
+
+    return app_display_build_view_model(now_ms, reason);
+}
+
+static bool app_display_reduce_alert_timeout(uint32_t now_ms,
+                                             e84_display_alert_t *alert)
+{
+    uint32_t elapsed_ms;
+
+    if (NULL != alert)
+    {
+        *alert = E84_DISPLAY_ALERT_NONE;
+    }
+
+    if ((E84_DISPLAY_ALERT_NONE == current_view.alert.code) ||
+        current_view.alert.latched ||
+        (0u == current_view.alert.timeout_ms))
+    {
+        return false;
+    }
+
+    elapsed_ms = now_ms - current_view.alert.raised_timestamp_ms;
+    if (elapsed_ms < current_view.alert.timeout_ms)
+    {
+        return false;
+    }
+
+    if (NULL != alert)
+    {
+        *alert = current_view.alert.code;
+    }
+
+    (void)app_display_reduce_alert_clear(current_view.alert.code,
+                                         now_ms,
+                                         "alert_timeout");
+    return true;
+}
+
+static bool app_display_build_view_model(uint32_t now_ms,
+                                         const char *reason)
+{
+    e84_display_page_t old_page = current_view.current_page;
+
+    current_view.previous_page = old_page;
+    current_view.current_page = app_display_select_page();
+    current_view.health_state = current_snapshot.health_state;
+    current_view.snapshot = current_snapshot;
+    current_view.display_dropped_commands = display_dropped_commands;
+    current_view.last_refresh_timestamp_ms = now_ms;
+    current_view.refresh_reason = (NULL != reason) ? reason : "unknown";
+    current_view.smoke_enabled = (APP_DISPLAY_SMOKE_ENABLE != 0u);
+    current_view.dirty = true;
+
+    return (old_page != current_view.current_page);
+}
+
+static e84_display_page_t app_display_select_page(void)
+{
+    if ((E84_DISPLAY_ALERT_NONE != current_view.alert.code) &&
+        (current_view.alert.severity >= E84_DISPLAY_SEVERITY_WARNING))
+    {
+        return E84_DISPLAY_PAGE_ALERT;
+    }
+
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+    if (debug_page_requested)
+    {
+        return E84_DISPLAY_PAGE_DEBUG;
+    }
+#endif
+
+    if (E84_DISPLAY_HEALTH_INIT == current_snapshot.health_state)
+    {
+        return E84_DISPLAY_PAGE_BOOT;
+    }
+
+    return E84_DISPLAY_PAGE_HOME;
+}
+
+static e84_display_severity_t app_display_normalize_severity(
+    e84_display_alert_t alert,
+    uint8_t severity)
+{
+    e84_display_severity_t normalized;
+    e84_display_severity_t alert_default =
+        app_display_default_alert_severity(alert);
+
+    if (severity >= (uint8_t)E84_DISPLAY_SEVERITY_COUNT)
+    {
+        normalized = alert_default;
+    }
+    else
+    {
+        normalized = (e84_display_severity_t)severity;
+    }
+
+    if (normalized < alert_default)
+    {
+        normalized = alert_default;
+    }
+
+    return normalized;
+}
+
+static e84_display_severity_t app_display_default_alert_severity(
+    e84_display_alert_t alert)
+{
+    switch (alert)
+    {
+        case E84_DISPLAY_ALERT_SENSOR_LOST:
+        case E84_DISPLAY_ALERT_SYSTEM_ERROR:
+            return E84_DISPLAY_SEVERITY_ERROR;
+
+        case E84_DISPLAY_ALERT_COUGH_BURST:
+        case E84_DISPLAY_ALERT_RESP_RATE_ABNORMAL:
+        case E84_DISPLAY_ALERT_HEART_RATE_ABNORMAL:
+        case E84_DISPLAY_ALERT_BREATHING_GAP:
+            return E84_DISPLAY_SEVERITY_WARNING;
+
+        case E84_DISPLAY_ALERT_NONE:
+        default:
+            return E84_DISPLAY_SEVERITY_NONE;
+    }
+}
+
+static const char *app_display_alert_title(e84_display_alert_t alert)
+{
+    switch (alert)
+    {
+        case E84_DISPLAY_ALERT_COUGH_BURST:
+            return "Frequent cough detected";
+
+        case E84_DISPLAY_ALERT_RESP_RATE_ABNORMAL:
+            return "Respiration needs attention";
+
+        case E84_DISPLAY_ALERT_HEART_RATE_ABNORMAL:
+            return "Heart rate needs attention";
+
+        case E84_DISPLAY_ALERT_BREATHING_GAP:
+            return "Breathing gap detected";
+
+        case E84_DISPLAY_ALERT_SENSOR_LOST:
+            return "Sensor signal lost";
+
+        case E84_DISPLAY_ALERT_SYSTEM_ERROR:
+            return "System error";
+
+        case E84_DISPLAY_ALERT_NONE:
+        default:
+            return "No active alert";
+    }
+}
+
+static const char *app_display_alert_message(e84_display_alert_t alert)
+{
+    switch (alert)
+    {
+        case E84_DISPLAY_ALERT_COUGH_BURST:
+            return "Cough burst pattern detected";
+
+        case E84_DISPLAY_ALERT_RESP_RATE_ABNORMAL:
+            return "Breathing rate outside normal range";
+
+        case E84_DISPLAY_ALERT_HEART_RATE_ABNORMAL:
+            return "Heart rate outside normal range";
+
+        case E84_DISPLAY_ALERT_BREATHING_GAP:
+            return "Breathing pause candidate";
+
+        case E84_DISPLAY_ALERT_SENSOR_LOST:
+            return "Check radar or audio sensor status";
+
+        case E84_DISPLAY_ALERT_SYSTEM_ERROR:
+            return "Display is showing a system alert";
+
+        case E84_DISPLAY_ALERT_NONE:
+        default:
+            return "Daily status";
+    }
+}
+
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE && APP_DISPLAY_SMOKE_ENABLE)
+static cy_rslt_t app_display_set_debug_page(bool enabled)
+{
+    app_display_cmd_t cmd;
+
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.type = APP_DISPLAY_CMD_DEBUG_SET;
+    cmd.debug_enabled = enabled;
+
+    return app_display_enqueue(&cmd);
+}
+#endif
+
 #if (APP_DISPLAY_SMOKE_ENABLE)
 static void app_display_smoke_tick(uint32_t now_ms)
 {
@@ -355,6 +763,10 @@ static void app_display_smoke_tick(uint32_t now_ms)
     static uint32_t snapshot_step;
     static uint32_t last_alert_start_ms;
     static bool alert_active;
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+    static uint32_t last_debug_start_ms;
+    static bool debug_active;
+#endif
 
     if ((0u == last_snapshot_ms) ||
         ((now_ms - last_snapshot_ms) >=
@@ -387,8 +799,16 @@ static void app_display_smoke_tick(uint32_t now_ms)
         {
             alert_active = true;
             last_alert_start_ms = now_ms;
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+            if (debug_active)
+            {
+                debug_active = false;
+                (void)app_display_set_debug_page(false);
+            }
+#endif
             (void)app_display_raise_alert(E84_DISPLAY_ALERT_COUGH_BURST,
-                                          2u,
+                                          (uint8_t)
+                                          E84_DISPLAY_SEVERITY_WARNING,
                                           85u,
                                           E84_DISPLAY_FLAG_AUDIO_VALID |
                                           E84_DISPLAY_FLAG_FUSION_VALID);
@@ -400,6 +820,31 @@ static void app_display_smoke_tick(uint32_t now_ms)
         alert_active = false;
         (void)app_display_clear_alert(E84_DISPLAY_ALERT_COUGH_BURST);
     }
+
+#if (APP_DISPLAY_DEBUG_PAGE_ENABLE)
+    if (!alert_active)
+    {
+        if (!debug_active)
+        {
+            bool debug_due =
+                ((0u == last_debug_start_ms) && (now_ms >= 6000u)) ||
+                ((0u != last_debug_start_ms) &&
+                 ((now_ms - last_debug_start_ms) >= 30000u));
+
+            if (debug_due)
+            {
+                debug_active = true;
+                last_debug_start_ms = now_ms;
+                (void)app_display_set_debug_page(true);
+            }
+        }
+        else if ((now_ms - last_debug_start_ms) >= 3000u)
+        {
+            debug_active = false;
+            (void)app_display_set_debug_page(false);
+        }
+    }
+#endif
 }
 
 static void app_display_smoke_make_snapshot(
@@ -411,6 +856,7 @@ static void app_display_smoke_make_snapshot(
         E84_DISPLAY_HEALTH_INIT,
         E84_DISPLAY_HEALTH_NORMAL,
         E84_DISPLAY_HEALTH_ATTENTION,
+        E84_DISPLAY_HEALTH_SENSOR_LOST,
         E84_DISPLAY_HEALTH_WARNING,
         E84_DISPLAY_HEALTH_NORMAL
     };
@@ -459,6 +905,19 @@ static void app_display_smoke_make_snapshot(
             snapshot->cough_count_5min = 5u;
             snapshot->audio_quality = 78u;
             snapshot->fusion_confidence = 91u;
+            break;
+
+        case E84_DISPLAY_HEALTH_SENSOR_LOST:
+            snapshot->radar_presence = false;
+            snapshot->breath_rate_bpm = 0.0f;
+            snapshot->heart_rate_bpm = 0.0f;
+            snapshot->radar_quality = 10u;
+            snapshot->mic_cough_prob = 0.05f;
+            snapshot->audio_quality = 88u;
+            snapshot->fusion_confidence = 25u;
+            snapshot->flags &= ~(E84_DISPLAY_FLAG_RADAR_VALID |
+                                 E84_DISPLAY_FLAG_RR_VALID |
+                                 E84_DISPLAY_FLAG_HR_VALID);
             break;
 
         case E84_DISPLAY_HEALTH_NORMAL:

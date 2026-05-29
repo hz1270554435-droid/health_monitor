@@ -5,6 +5,7 @@
 
 #include "app_audio_preprocess.h"
 #include "app_audio_deployment_config.h"
+#include "app_monitor_summary.h"
 
 /* CM33 结果观察任务。
  *
@@ -85,8 +86,8 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_BLE_FAKE_DATA_ENABLE                 (0u)
 #endif
 
-#ifndef APP_BLE_STACK_ENABLE
-#define APP_BLE_STACK_ENABLE                     (0u)
+#ifndef APP_MONITOR_SUMMARY_AUDIO_STALE_MS
+#define APP_MONITOR_SUMMARY_AUDIO_STALE_MS        (2000u)
 #endif
 
 #define APP_MODEL_LOG_LEVEL_QUIET                (0u)
@@ -162,7 +163,9 @@ static void app_model_result_monitor_update_status_counts(
     const app_model_inference_result_t *result);
 static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
-    uint32_t result_sequence);
+    uint32_t result_sequence,
+    uint32_t now_ms);
+static void app_model_result_monitor_bridge_summary(uint32_t now_ms);
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
 static void app_model_result_monitor_note_event_context(
     const app_model_inference_result_t *result,
@@ -315,7 +318,8 @@ void app_model_result_monitor_task(void *pvParameters)
 
                 /* 对正式业务结果，先更新运行时统计，再按日志级别决定是否打印。 */
                 app_model_result_monitor_note_live_result(&result,
-                                                          result_sequence);
+                                                          result_sequence,
+                                                          now_ms);
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
                 app_model_result_monitor_note_event_context(
                     &result,
@@ -408,6 +412,7 @@ void app_model_result_monitor_task(void *pvParameters)
         }
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
+        app_model_result_monitor_bridge_summary(app_model_result_monitor_now_ms());
         app_model_result_monitor_maybe_print_stat(
             shared,
             app_model_result_monitor_now_ms());
@@ -553,7 +558,8 @@ static void app_model_result_monitor_update_status_counts(
 
 static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
-    uint32_t result_sequence)
+    uint32_t result_sequence,
+    uint32_t now_ms)
 {
     if (NULL == result)
     {
@@ -564,10 +570,15 @@ static void app_model_result_monitor_note_live_result(
     model_result_runtime.last_input_sequence = result->input_sequence;
     model_result_runtime.last_result_sequence = result_sequence;
     model_result_runtime.last_cough_prob = result->scores[2];
+    model_result_monitor_stats.has_live_result = true;
+    model_result_monitor_stats.last_cough_prob = result->scores[2];
+    model_result_monitor_stats.last_result_time_ms = now_ms;
     if (model_result_runtime.max_cough_prob_1s < result->scores[2])
     {
         model_result_runtime.max_cough_prob_1s = result->scores[2];
     }
+    model_result_monitor_stats.max_cough_prob_1s =
+        model_result_runtime.max_cough_prob_1s;
 
     /* 用 demo 阈值把每帧结果粗分为 cough / non_cough，
      * 后续周期统计直接基于这里累加的计数输出。
@@ -580,6 +591,10 @@ static void app_model_result_monitor_note_live_result(
     {
         model_result_runtime.decision_count_non_cough_1s++;
     }
+    model_result_monitor_stats.decision_count_cough_1s =
+        model_result_runtime.decision_count_cough_1s;
+    model_result_monitor_stats.decision_count_non_cough_1s =
+        model_result_runtime.decision_count_non_cough_1s;
 
     /* 同时累加推理耗时，用于观察 CM55 侧平均耗时和峰值耗时。 */
     model_result_runtime.infer_ms_total_1s += result->inference_time_ms;
@@ -588,6 +603,73 @@ static void app_model_result_monitor_note_live_result(
     {
         model_result_runtime.infer_ms_max_1s = result->inference_time_ms;
     }
+}
+
+static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
+{
+#if (APP_MONITOR_SUMMARY_ENABLE)
+    app_monitor_audio_input_t audio;
+    app_monitor_device_input_t device;
+    app_model_result_monitor_stats_t stats;
+    uint32_t now_ms_local = now_ms;
+    uint8_t cough_prob_x100;
+
+    memset(&audio, 0, sizeof(audio));
+    memset(&device, 0, sizeof(device));
+    memset(&stats, 0, sizeof(stats));
+
+    app_model_result_monitor_get_stats(&stats);
+
+    if (stats.last_cough_prob <= 0.0f)
+    {
+        cough_prob_x100 = 0u;
+    }
+    else if (stats.last_cough_prob >= 1.0f)
+    {
+        cough_prob_x100 = 100u;
+    }
+    else
+    {
+        cough_prob_x100 = (uint8_t)((stats.last_cough_prob * 100.0f) + 0.5f);
+    }
+
+    audio.valid = stats.has_live_result &&
+                  (APP_MODEL_INFERENCE_STATUS_OK == stats.last_status);
+    audio.ready = stats.has_result &&
+                  (APP_MODEL_INFERENCE_STATUS_MODEL_NOT_READY != stats.last_status);
+    audio.stale = (!stats.has_live_result) ||
+                  ((0u != stats.last_result_time_ms) &&
+                   ((now_ms_local - stats.last_result_time_ms) >
+                    APP_MONITOR_SUMMARY_AUDIO_STALE_MS));
+    audio.cough_prob_x100 = cough_prob_x100;
+    audio.event_threshold_x100 = 0u;
+    audio.cough_confirmed = (0u != stats.last_event_id);
+    audio.cough_density_high = false;
+    audio.model_status = stats.last_status;
+    audio.input_sequence = stats.last_input_sequence;
+    audio.result_sequence = stats.last_result_sequence;
+    audio.age_ms = (0u != stats.last_result_time_ms) ?
+                   (now_ms_local - stats.last_result_time_ms) : 0u;
+    audio.audio_quality = audio.valid ? 100u : 0u;
+    audio.mic_quality_poor = false;
+    audio.reason_flags = 0u;
+
+    device.monitor_requested = true;
+    device.ble_connected = false;
+    device.time_synced = false;
+    device.model_ready = stats.has_live_result &&
+                         (APP_MODEL_INFERENCE_STATUS_OK == stats.last_status);
+    device.shared_memory_ready = stats.has_result;
+    device.session_active = stats.has_live_result;
+    device.uptime_ms = now_ms_local;
+    device.device_reason_flags = 0u;
+
+    (void)app_monitor_summary_update_audio(&audio);
+    (void)app_monitor_summary_update_device(&device);
+    (void)app_monitor_summary_tick(now_ms_local);
+#else
+    (void)now_ms;
+#endif
 }
 
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
@@ -770,6 +852,7 @@ static void app_model_result_monitor_print_event(
 
     model_result_runtime.event_id++;
     model_result_monitor_stats.events_printed++;
+    model_result_monitor_stats.last_event_id = model_result_runtime.event_id;
 
     log_start_ms = app_model_result_monitor_log_start();
     printf("[MODEL_EVENT] t_ms=%lu, event_id=%lu, cough_prob=",
@@ -1079,6 +1162,9 @@ static void app_model_result_monitor_maybe_print_stat(
     model_result_runtime.max_cough_prob_1s = 0.0f;
     model_result_runtime.decision_count_cough_1s = 0u;
     model_result_runtime.decision_count_non_cough_1s = 0u;
+    model_result_monitor_stats.max_cough_prob_1s = 0.0f;
+    model_result_monitor_stats.decision_count_cough_1s = 0u;
+    model_result_monitor_stats.decision_count_non_cough_1s = 0u;
     model_result_runtime.infer_ms_total_1s = 0u;
     model_result_runtime.infer_ms_count_1s = 0u;
     model_result_runtime.infer_ms_max_1s = 0u;

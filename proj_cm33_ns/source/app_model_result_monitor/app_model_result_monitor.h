@@ -57,6 +57,11 @@ typedef struct
      * 用于统计结果观察任务因为共享协议未初始化或协议版本不一致而无法继续读取结果槽的情况。
      */
     uint32_t shared_not_ready;
+    /* 最近一次看到共享区 ready 的时间戳，单位 ms。
+     * 仅在结果观察任务看到新的 READY 结果副本并接受后更新，用于旁路 summary
+     * bridge 估计“最近 live 观测距离当前多久”。
+     */
+    uint32_t last_result_time_ms;
     /* 观察到的 READY 结果数。同一 result_sequence 只计一次。
      * 该计数反映监控任务实际“看见过多少条新结果”，而不是 CM55 总共产生了多少次推理输出。
      */
@@ -105,10 +110,26 @@ typedef struct
      * 是一份“最近结果快照”，查看监控统计时通常应优先参考该字段。
      */
     uint8_t last_status;
+    /* 最近一次正式 live 推理的 cough 概率，来自 result.scores[2]。
+     * smoke/fixed-vector 结果不会更新该字段，避免 display 把离线 smoke
+     * 误当作真实业务状态。
+     */
+    float last_cough_prob;
+    /* 当前统计窗口内观察到的最大 cough 概率。该值随 MODEL_STAT 周期重置。 */
+    float max_cough_prob_1s;
+    /* 当前统计窗口内按 demo threshold 判为 cough / non_cough 的帧数。
+     * 这些是低频展示/诊断计数，不是正式 1min/5min cough summary。
+     */
+    uint32_t decision_count_cough_1s;
+    uint32_t decision_count_non_cough_1s;
+    /* 最近一次打印的 cough event id。仅用于只读展示/诊断。 */
+    uint32_t last_event_id;
     /* 是否已经看到过至少一个结果。
      * 用于区分“当前结果状态为空”和“监控任务启动以来还从未看到过任何结果”。
      */
     bool has_result;
+    /* 是否已经看到至少一个正式 live 结果。 */
+    bool has_live_result;
 } app_model_result_monitor_stats_t;
 
 cy_rslt_t app_model_result_monitor_task_init(void);
