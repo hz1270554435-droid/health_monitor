@@ -420,6 +420,12 @@ typedef struct
     bool has_last_sequence;
 } app_audio_preprocess_stats_t;
 
+/* CM33_NS owns app-model shared boot/reset initialization.
+ * These helpers are intentionally not private audio-task initialization.
+ */
+cy_rslt_t app_model_shared_boot_init_cm33_owner(void);
+bool app_model_shared_boot_is_ready(void);
+
 cy_rslt_t app_audio_preprocess_task_init(void);
 void app_audio_preprocess_task(void *pvParameters);
 

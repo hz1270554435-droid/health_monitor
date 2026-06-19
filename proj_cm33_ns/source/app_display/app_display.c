@@ -10,7 +10,8 @@
 #include "queue.h"
 #include "task.h"
 
-#if (APP_DISPLAY_SUMMARY_ENABLE && !APP_DISPLAY_SMOKE_ENABLE)
+#if (APP_DISPLAY_SUMMARY_ENABLE && !APP_DISPLAY_SMOKE_ENABLE && \
+     !APP_DISPLAY_FINAL_MOCK_ENABLE)
 #include "app_display_summary_adapter.h"
 #endif
 
@@ -94,6 +95,22 @@ static void app_display_smoke_make_snapshot(
     uint32_t now_ms,
     uint32_t step);
 #endif
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE)
+static void app_display_final_mock_tick(uint32_t now_ms);
+static void app_display_final_mock_make_snapshot(
+    e84_display_snapshot_t *snapshot,
+    uint32_t now_ms,
+    uint32_t step);
+#endif
+#if (APP_DISPLAY_LCD_ENABLE)
+static cy_rslt_t app_display_backend_lcd_init(void);
+#if (APP_DISPLAY_LCD_SMOKE_ONLY)
+static void app_display_lcd_smoke_tick(uint32_t now_ms);
+#endif
+#if (APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY)
+static void app_display_lcd_backlight_smoke_tick(uint32_t now_ms);
+#endif
+#endif
 
 cy_rslt_t app_display_init(void)
 {
@@ -117,7 +134,27 @@ cy_rslt_t app_display_init(void)
         return CY_RSLT_TYPE_ERROR;
     }
 
+#if (APP_DISPLAY_LCD_ENABLE)
+    printf("[DISPLAY_BACKEND_SELECT] backend=lcd\r\n");
+    fflush(stdout);
+    result = app_display_backend_lcd_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[DISPLAY_LCD_INIT] result=fail reason=%s code=0x%08lx\r\n",
+               app_display_backend_lcd_last_fail_reason(),
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    else
+    {
+        printf("[DISPLAY_LCD_INIT] result=OK\r\n");
+        fflush(stdout);
+    }
+#else
+    printf("[DISPLAY_BACKEND_SELECT] backend=null\r\n");
+    fflush(stdout);
     result = app_display_backend_null_init();
+#endif
     if (CY_RSLT_SUCCESS != result)
     {
         return result;
@@ -317,6 +354,31 @@ const char *e84_display_severity_name(e84_display_severity_t severity)
     }
 }
 
+const char *e84_display_radar_source_state_name(
+    e84_display_radar_source_state_t state)
+{
+    switch (state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return "NORMAL";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "UNAVAILABLE";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "STALE";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "INVALID";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "LOW_QUALITY";
+
+        default:
+            return "UNKNOWN";
+    }
+}
+
 static void app_display_task(void *pvParameters)
 {
     (void)pvParameters;
@@ -337,9 +399,14 @@ static void app_display_task(void *pvParameters)
                 {
                     bool force_view =
                         app_display_reduce_snapshot(&cmd.snapshot, now_ms);
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE)
+                    force_view = true;
+#endif
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+#endif
                     app_display_backend_null_render_view(&current_view,
                                                          force_view);
                     break;
@@ -356,9 +423,11 @@ static void app_display_task(void *pvParameters)
                                                           cmd.confidence,
                                                           cmd.flags,
                                                           now_ms);
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+#endif
                     app_display_backend_null_render_view(&current_view,
                                                          true);
                     break;
@@ -373,9 +442,11 @@ static void app_display_task(void *pvParameters)
                                                           0u,
                                                           0u,
                                                           now_ms);
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
                     app_display_backend_null_render_snapshot(
                         &current_snapshot,
                         true);
+#endif
                     app_display_backend_null_render_view(&current_view,
                                                          true);
                     break;
@@ -409,11 +480,19 @@ static void app_display_task(void *pvParameters)
                                                       0u,
                                                       0u,
                                                       now_ms);
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
                 app_display_backend_null_render_snapshot(&current_snapshot,
                                                          true);
+#endif
                 app_display_backend_null_render_view(&current_view, true);
             }
-#if (APP_DISPLAY_SMOKE_ENABLE)
+#if (APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY)
+            app_display_lcd_backlight_smoke_tick(now_ms);
+#elif (APP_DISPLAY_LCD_SMOKE_ONLY)
+            app_display_lcd_smoke_tick(now_ms);
+#elif (APP_DISPLAY_FINAL_MOCK_ENABLE)
+            app_display_final_mock_tick(now_ms);
+#elif (APP_DISPLAY_SMOKE_ENABLE)
             app_display_smoke_tick(now_ms);
 #elif (APP_DISPLAY_SUMMARY_ENABLE)
             (void)app_display_summary_adapter_tick(now_ms);
@@ -930,5 +1009,296 @@ static void app_display_smoke_make_snapshot(
     }
 }
 #endif /* APP_DISPLAY_SMOKE_ENABLE */
+
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE)
+static void app_display_final_mock_tick(uint32_t now_ms)
+{
+    static uint32_t last_snapshot_ms;
+    static uint32_t snapshot_step;
+
+    if ((0u == last_snapshot_ms) ||
+        ((now_ms - last_snapshot_ms) >=
+         APP_DISPLAY_FINAL_MOCK_PERIOD_MS))
+    {
+        e84_display_snapshot_t snapshot;
+
+        app_display_final_mock_make_snapshot(&snapshot,
+                                             now_ms,
+                                             snapshot_step);
+        (void)app_display_publish_snapshot(&snapshot);
+        last_snapshot_ms = now_ms;
+        snapshot_step++;
+    }
+}
+
+static void app_display_final_mock_make_snapshot(
+    e84_display_snapshot_t *snapshot,
+    uint32_t now_ms,
+    uint32_t step)
+{
+    /* 7 scenarios cycling through radar source states. */
+    uint32_t scenario = step % 7u;
+
+    memset(snapshot, 0, sizeof(*snapshot));
+    snapshot->timestamp_ms = now_ms;
+    snapshot->active_alert = E84_DISPLAY_ALERT_NONE;
+    snapshot->ble_connected = false;
+
+    /* Cough model is not board-verified in current phase. */
+    snapshot->cough_model_not_verified = true;
+    snapshot->flags = E84_DISPLAY_FLAG_AUDIO_VALID |
+                      E84_DISPLAY_FLAG_COUGH_MODEL_NOT_VERIFIED;
+
+    switch (scenario)
+    {
+        case 0u: /* real_radar_valid: NORMAL health, real radar */
+            snapshot->health_state = E84_DISPLAY_HEALTH_NORMAL;
+            snapshot->radar_presence = true;
+            snapshot->breath_rate_bpm = 16.8f;
+            snapshot->heart_rate_bpm = 71.0f;
+            snapshot->radar_quality = 90u;
+            snapshot->distance_cm = 120u;
+            snapshot->mic_cough_prob = 0.08f;
+            snapshot->audio_quality = 92u;
+            snapshot->fusion_confidence = 86u;
+            snapshot->cough_count_5min = (uint16_t)(step % 2u);
+            snapshot->radar_source_state = E84_DISPLAY_RADAR_SOURCE_NORMAL;
+            snapshot->flags |= E84_DISPLAY_FLAG_RADAR_VALID |
+                               E84_DISPLAY_FLAG_FUSION_VALID |
+                               E84_DISPLAY_FLAG_RR_VALID |
+                               E84_DISPLAY_FLAG_HR_VALID;
+            break;
+
+        case 1u: /* attention: radar valid, cough elevated */
+            snapshot->health_state = E84_DISPLAY_HEALTH_ATTENTION;
+            snapshot->radar_presence = true;
+            snapshot->breath_rate_bpm = 17.8f;
+            snapshot->heart_rate_bpm = 72.0f;
+            snapshot->radar_quality = 88u;
+            snapshot->distance_cm = 115u;
+            snapshot->mic_cough_prob = 0.64f;
+            snapshot->cough_count_1min = 1u;
+            snapshot->cough_count_5min = 2u;
+            snapshot->audio_quality = 91u;
+            snapshot->fusion_confidence = 82u;
+            snapshot->radar_source_state = E84_DISPLAY_RADAR_SOURCE_NORMAL;
+            snapshot->flags |= E84_DISPLAY_FLAG_RADAR_VALID |
+                               E84_DISPLAY_FLAG_FUSION_VALID |
+                               E84_DISPLAY_FLAG_RR_VALID |
+                               E84_DISPLAY_FLAG_HR_VALID;
+            break;
+
+        case 2u: /* warning: radar valid, cough high */
+            snapshot->health_state = E84_DISPLAY_HEALTH_WARNING;
+            snapshot->radar_presence = true;
+            snapshot->breath_rate_bpm = 22.4f;
+            snapshot->heart_rate_bpm = 88.0f;
+            snapshot->radar_quality = 76u;
+            snapshot->distance_cm = 105u;
+            snapshot->mic_cough_prob = 0.86f;
+            snapshot->cough_count_1min = 3u;
+            snapshot->cough_count_5min = 6u;
+            snapshot->audio_quality = 80u;
+            snapshot->fusion_confidence = 91u;
+            snapshot->radar_source_state = E84_DISPLAY_RADAR_SOURCE_NORMAL;
+            snapshot->flags |= E84_DISPLAY_FLAG_RADAR_VALID |
+                               E84_DISPLAY_FLAG_FUSION_VALID |
+                               E84_DISPLAY_FLAG_RR_VALID |
+                               E84_DISPLAY_FLAG_HR_VALID;
+            break;
+
+        case 3u: /* radar_unavailable: no radar source */
+            snapshot->health_state = E84_DISPLAY_HEALTH_SENSOR_LOST;
+            snapshot->radar_presence = false;
+            snapshot->breath_rate_bpm = 0.0f;
+            snapshot->heart_rate_bpm = 0.0f;
+            snapshot->radar_quality = 0u;
+            snapshot->mic_cough_prob = 0.12f;
+            snapshot->cough_count_1min = 0u;
+            snapshot->cough_count_5min = 1u;
+            snapshot->audio_quality = 89u;
+            snapshot->fusion_confidence = 30u;
+            snapshot->radar_source_state =
+                E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE;
+            break;
+
+        case 4u: /* radar_stale: radar data too old */
+            snapshot->health_state = E84_DISPLAY_HEALTH_ATTENTION;
+            snapshot->radar_presence = false;
+            snapshot->breath_rate_bpm = 0.0f;
+            snapshot->heart_rate_bpm = 0.0f;
+            snapshot->radar_quality = 45u;
+            snapshot->mic_cough_prob = 0.35f;
+            snapshot->cough_count_1min = 1u;
+            snapshot->cough_count_5min = 2u;
+            snapshot->audio_quality = 88u;
+            snapshot->fusion_confidence = 40u;
+            snapshot->radar_source_state = E84_DISPLAY_RADAR_SOURCE_STALE;
+            snapshot->flags |= E84_DISPLAY_FLAG_RADAR_VALID;
+            break;
+
+        case 5u: /* radar_low_quality: radar signal poor */
+            snapshot->health_state = E84_DISPLAY_HEALTH_NORMAL;
+            snapshot->radar_presence = false;
+            snapshot->breath_rate_bpm = 0.0f;
+            snapshot->heart_rate_bpm = 0.0f;
+            snapshot->radar_quality = 20u;
+            snapshot->mic_cough_prob = 0.15f;
+            snapshot->cough_count_1min = 0u;
+            snapshot->cough_count_5min = 0u;
+            snapshot->audio_quality = 90u;
+            snapshot->fusion_confidence = 35u;
+            snapshot->radar_source_state =
+                E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY;
+            snapshot->flags |= E84_DISPLAY_FLAG_RADAR_VALID;
+            break;
+
+        case 6u: /* radar_invalid: radar data malformed or quality zero */
+            snapshot->health_state = E84_DISPLAY_HEALTH_NORMAL;
+            snapshot->radar_presence = false;
+            snapshot->breath_rate_bpm = 0.0f;
+            snapshot->heart_rate_bpm = 0.0f;
+            snapshot->radar_quality = 0u;
+            snapshot->mic_cough_prob = 0.10f;
+            snapshot->cough_count_1min = 0u;
+            snapshot->cough_count_5min = 0u;
+            snapshot->audio_quality = 91u;
+            snapshot->fusion_confidence = 0u;
+            snapshot->radar_source_state =
+                E84_DISPLAY_RADAR_SOURCE_INVALID;
+            break;
+
+        default:
+            snapshot->health_state = E84_DISPLAY_HEALTH_INIT;
+            snapshot->radar_source_state =
+                E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE;
+            break;
+    }
+}
+#endif /* APP_DISPLAY_FINAL_MOCK_ENABLE */
+
+#if (APP_DISPLAY_LCD_ENABLE)
+/* LCD backend wrapper - delegates to app_display_backend_lcd.c */
+static cy_rslt_t app_display_backend_lcd_init(void)
+{
+    printf("[DISPLAY_LCD_INIT] begin\r\n");
+    fflush(stdout);
+    return app_display_backend_lcd_hw_init();
+}
+
+#if (APP_DISPLAY_LCD_SMOKE_ONLY)
+static void app_display_lcd_smoke_tick(uint32_t now_ms)
+{
+    static uint32_t last_smoke_ms;
+    static uint32_t smoke_tick_count;
+    static bool smoke_init_ok;
+
+    if ((0u == last_smoke_ms) ||
+        ((now_ms - last_smoke_ms) >= 2000u))
+    {
+        last_smoke_ms = now_ms;
+        smoke_tick_count++;
+
+        if (!smoke_init_ok)
+        {
+            /* LCD already initialized in app_display_init */
+            smoke_init_ok = true;
+            printf("[DISPLAY_LCD_SMOKE] init=ok draw=pending tick=%lu\r\n",
+                   (unsigned long)smoke_tick_count);
+            fflush(stdout);
+        }
+
+        /* Draw a simple smoke screen */
+        e84_display_snapshot_t smoke_snapshot;
+        memset(&smoke_snapshot, 0, sizeof(smoke_snapshot));
+        smoke_snapshot.timestamp_ms = now_ms;
+        smoke_snapshot.health_state = E84_DISPLAY_HEALTH_NORMAL;
+        smoke_snapshot.radar_source_state = E84_DISPLAY_RADAR_SOURCE_NORMAL;
+        smoke_snapshot.radar_presence = true;
+        smoke_snapshot.breath_rate_bpm = 16.8f;
+        smoke_snapshot.heart_rate_bpm = 71.0f;
+        smoke_snapshot.radar_quality = 90u;
+        smoke_snapshot.distance_cm = 120u;
+        smoke_snapshot.cough_model_not_verified = true;
+        smoke_snapshot.flags = E84_DISPLAY_FLAG_AUDIO_VALID |
+                               E84_DISPLAY_FLAG_RADAR_VALID |
+                               E84_DISPLAY_FLAG_RR_VALID |
+                               E84_DISPLAY_FLAG_HR_VALID |
+                               E84_DISPLAY_FLAG_COUGH_MODEL_NOT_VERIFIED;
+
+        cy_rslt_t draw_result =
+            app_display_backend_lcd_render_snapshot(&smoke_snapshot, true);
+
+        if (CY_RSLT_SUCCESS == draw_result)
+        {
+            printf("[DISPLAY_LCD_SMOKE] init=ok draw=ok tick=%lu\r\n",
+                   (unsigned long)smoke_tick_count);
+        }
+        else
+        {
+            printf("[DISPLAY_LCD_SMOKE] init=ok draw=fail "
+                   "reason=frame_transfer_failed tick=%lu\r\n",
+                   (unsigned long)smoke_tick_count);
+        }
+        fflush(stdout);
+    }
+}
+#endif /* APP_DISPLAY_LCD_SMOKE_ONLY */
+
+#if (APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY)
+static void app_display_lcd_backlight_smoke_tick(uint32_t now_ms)
+{
+    static uint32_t last_smoke_ms;
+    static uint32_t smoke_tick_count;
+    static bool backlight_tested;
+
+    if ((0u == last_smoke_ms) ||
+        ((now_ms - last_smoke_ms) >= 3000u))
+    {
+        last_smoke_ms = now_ms;
+        smoke_tick_count++;
+
+        if (!backlight_tested)
+        {
+            backlight_tested = true;
+            printf("[DISPLAY_LCD_BACKLIGHT] begin\r\n");
+            fflush(stdout);
+
+            /* Step 1: Assert STBYB HIGH (P0.0) - display standby control */
+            printf("[DISPLAY_LCD_BACKLIGHT] stbyb_port=0 stbyb_pin=0\r\n");
+            fflush(stdout);
+            Cy_GPIO_Pin_FastInit(GPIO_PRT0, 0u,
+                                 CY_GPIO_DM_STRONG_IN_OFF, 1u,
+                                 HSIOM_SEL_GPIO);
+            Cy_GPIO_Write(GPIO_PRT0, 0u, 1u);
+            Cy_SysLib_Delay(50u);
+            printf("[DISPLAY_LCD_BACKLIGHT] stbyb=high result=ok\r\n");
+            fflush(stdout);
+
+            /* Step 2: Try backlight on P20.6 HIGH */
+            printf("[DISPLAY_LCD_BACKLIGHT] bl_port=20 bl_pin=6\r\n");
+            fflush(stdout);
+            Cy_GPIO_Pin_FastInit(GPIO_PRT20, 6u,
+                                 CY_GPIO_DM_STRONG_IN_OFF, 1u,
+                                 HSIOM_SEL_GPIO);
+            Cy_GPIO_Write(GPIO_PRT20, 6u, 1u);
+            printf("[DISPLAY_LCD_BACKLIGHT] bl=high result=ok\r\n");
+            fflush(stdout);
+
+            /* Step 3: Also try LOW in case active-low */
+            /* (leave HIGH for now, user can test LOW separately) */
+
+            printf("[DISPLAY_LCD_BACKLIGHT] set=on result=ok\r\n");
+            fflush(stdout);
+        }
+
+        printf("[DISPLAY_LCD_BACKLIGHT] tick=%lu status=on\r\n",
+               (unsigned long)smoke_tick_count);
+        fflush(stdout);
+    }
+}
+#endif /* APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY */
+
+#endif /* APP_DISPLAY_LCD_ENABLE */
 
 #endif /* APP_DISPLAY_ENABLE */

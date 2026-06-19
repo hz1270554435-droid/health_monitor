@@ -5,7 +5,16 @@
 
 #include "app_audio_preprocess.h"
 #include "app_audio_deployment_config.h"
+#include "app_model_ipc_smoke.h"
 #include "app_monitor_summary.h"
+
+#if (APP_MODEL_INFERENCE_MAX_SCORES < 5u)
+#error "app_model_result_monitor requires at least 5 score slots"
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE) && (APP_MODEL_INFERENCE_MAX_SCORES < 14u)
+#error "APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE requires at least 14 score slots"
+#endif
 
 /* CM33 结果观察任务。
  *
@@ -86,6 +95,15 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_BLE_FAKE_DATA_ENABLE                 (0u)
 #endif
 
+#ifndef APP_BLE_STACK_ENABLE
+#define APP_BLE_STACK_ENABLE                     (0u)
+#endif
+
+#if (APP_BLE_ENABLE)
+#include "app_ble_cmd.h"
+#include "app_ble_diag.h"
+#endif
+
 #ifndef APP_MONITOR_SUMMARY_AUDIO_STALE_MS
 #define APP_MONITOR_SUMMARY_AUDIO_STALE_MS        (2000u)
 #endif
@@ -149,6 +167,10 @@ typedef struct
 #endif
 
 static app_model_result_monitor_runtime_t model_result_runtime;
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static uint32_t ipc_smoke_result_check_logs;
+static uint32_t ipc_smoke_result_partial_rejected;
+#endif
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
 static app_model_event_context_entry_t model_event_context[
     APP_MODEL_EVENT_CONTEXT_DEPTH];
@@ -166,6 +188,8 @@ static void app_model_result_monitor_note_live_result(
     uint32_t result_sequence,
     uint32_t now_ms);
 static void app_model_result_monitor_bridge_summary(uint32_t now_ms);
+static bool app_model_result_monitor_has_live_scores(
+    const app_model_inference_result_t *result);
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
 static void app_model_result_monitor_note_event_context(
     const app_model_inference_result_t *result,
@@ -175,6 +199,12 @@ static void app_model_result_monitor_print_event_context(uint32_t event_seq);
 #endif
 static void app_model_result_monitor_print_smoke_result(
     const app_model_inference_result_t *result);
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static void app_model_result_monitor_check_ipc_smoke_result(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms);
+#endif
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_DEBUG)
 static void app_model_result_monitor_print_demo_result(
     const app_model_inference_result_t *result,
@@ -194,9 +224,15 @@ static bool app_model_result_monitor_should_print_event(
     uint32_t result_sequence,
     uint32_t now_ms);
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
+#if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
+static void app_model_result_monitor_maybe_print_ipc_smoke_stat(
+    const volatile app_model_shared_region_t *shared,
+    uint32_t now_ms);
+#else
 static void app_model_result_monitor_maybe_print_stat(
     const volatile app_model_shared_region_t *shared,
     uint32_t now_ms);
+#endif
 #endif
 static void app_model_result_monitor_print_idle_diag(
     const volatile app_model_shared_region_t *shared);
@@ -233,10 +269,40 @@ void app_model_result_monitor_task(void *pvParameters)
 
     for (;;)
     {
-        volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+        volatile app_model_shared_region_t *shared;
         static uint32_t last_idle_diag_ms;
+        static uint32_t last_boot_gate_diag_ms;
+        static bool boot_gate_diag_printed;
         uint32_t now_ms = app_model_result_monitor_now_ms();
 
+        /* Do not invalidate or inspect retained shared contents until the
+         * CM33 boot owner has completed the magic-last reset sequence.
+         */
+        if (!app_model_shared_boot_is_ready())
+        {
+            if ((!boot_gate_diag_printed) ||
+                ((now_ms - last_boot_gate_diag_ms) >=
+                 APP_MODEL_RESULT_MONITOR_IDLE_DIAG_MS))
+            {
+#if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
+                uint32_t log_start_ms =
+                    app_model_result_monitor_log_start();
+
+                printf("[IPC_BOOT_GATE] core=CM33 task=model_result "
+                       "t_ms=%lu ready=0\r\n",
+                       (unsigned long)now_ms);
+                fflush(stdout);
+                app_model_result_monitor_log_end(log_start_ms);
+#endif
+                last_boot_gate_diag_ms = now_ms;
+                boot_gate_diag_printed = true;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(APP_MODEL_RESULT_MONITOR_POLL_MS));
+            continue;
+        }
+
+        shared = APP_MODEL_SHARED_REGION;
         APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
 
         if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
@@ -277,7 +343,11 @@ void app_model_result_monitor_task(void *pvParameters)
               shared->result_sequence)))
         {
             app_model_inference_result_t result;
-            uint32_t result_sequence = shared->result_sequence;
+            uint32_t result_sequence;
+
+            /* Acquire CM55 result writes before copying result fields. */
+            __DMB();
+            result_sequence = shared->result_sequence;
 
             /* 先把结果槽复制到本地栈变量，避免后续打印过程反复直接访问共享区。 */
             memcpy(&result, (const void *)&shared->result, sizeof(result));
@@ -290,6 +360,25 @@ void app_model_result_monitor_task(void *pvParameters)
             if ((APP_MODEL_SHARED_RESULT_READY != shared->result_state) ||
                 (result_sequence != shared->result_sequence))
             {
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+                ipc_smoke_result_partial_rejected++;
+                if (ipc_smoke_result_check_logs < APP_MODEL_IPC_SMOKE_LOG_LIMIT)
+                {
+                    app_model_ipc_smoke_log_lock();
+                    printf("[IPC_RESULT_REJECT] core=CM33 epoch=%lu t_ms=%lu "
+                           "reason=unstable_copy, "
+                           "seq_before=%lu, seq_after=%lu, state_after=%lu, "
+                           "partial_result_accepted=0, partial_rejected_total=%lu\r\n",
+                           (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+                           (unsigned long)app_model_result_monitor_now_ms(),
+                           (unsigned long)result_sequence,
+                           (unsigned long)shared->result_sequence,
+                           (unsigned long)shared->result_state,
+                           (unsigned long)ipc_smoke_result_partial_rejected);
+                    fflush(stdout);
+                    app_model_ipc_smoke_log_unlock();
+                }
+#endif
                 vTaskDelay(pdMS_TO_TICKS(APP_MODEL_RESULT_MONITOR_POLL_MS));
                 continue;
             }
@@ -303,14 +392,19 @@ void app_model_result_monitor_task(void *pvParameters)
             model_result_monitor_stats.last_status = result.status;
             app_model_result_monitor_update_status_counts(&result);
 
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+            app_model_result_monitor_check_ipc_smoke_result(&result,
+                                                            result_sequence,
+                                                            now_ms);
+#endif
+
             if ((APP_MODEL_INFERENCE_STATUS_OK == result.status) &&
                 (APP_MODEL_RESULT_SEQUENCE_SMOKE_BASE <= result_sequence) &&
                 (2u <= result.class_count))
             {
                 app_model_result_monitor_print_smoke_result(&result);
             }
-            else if ((APP_MODEL_INFERENCE_STATUS_OK == result.status) &&
-                     (2u <= result.class_count))
+            else if (app_model_result_monitor_has_live_scores(&result))
             {
                 const char *decision =
                     (APP_MODEL_DEMO_COUGH_THRESHOLD <= result.scores[2]) ?
@@ -395,6 +489,7 @@ void app_model_result_monitor_task(void *pvParameters)
             }
 
 #if (APP_MODEL_RESULT_MONITOR_CLEAR_AFTER_READ)
+            __DMB();
             shared->result_state = APP_MODEL_SHARED_RESULT_EMPTY;
             __DMB();
             APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
@@ -413,9 +508,15 @@ void app_model_result_monitor_task(void *pvParameters)
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
         app_model_result_monitor_bridge_summary(app_model_result_monitor_now_ms());
+#if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
+        app_model_result_monitor_maybe_print_ipc_smoke_stat(
+            shared,
+            app_model_result_monitor_now_ms());
+#else
         app_model_result_monitor_maybe_print_stat(
             shared,
             app_model_result_monitor_now_ms());
+#endif
 #endif
 
         vTaskDelay(pdMS_TO_TICKS(APP_MODEL_RESULT_MONITOR_POLL_MS));
@@ -556,6 +657,17 @@ static void app_model_result_monitor_update_status_counts(
     }
 }
 
+static bool app_model_result_monitor_has_live_scores(
+    const app_model_inference_result_t *result)
+{
+    /* class_count covers the two model logits. scores[2..4] are fixed
+     * auxiliary slots guarded by APP_MODEL_INFERENCE_MAX_SCORES above.
+     */
+    return ((NULL != result) &&
+            (APP_MODEL_INFERENCE_STATUS_OK == result->status) &&
+            (2u <= result->class_count));
+}
+
 static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
@@ -613,6 +725,8 @@ static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
     app_model_result_monitor_stats_t stats;
     uint32_t now_ms_local = now_ms;
     uint8_t cough_prob_x100;
+    uint8_t event_threshold_x100 =
+        (uint8_t)((APP_MODEL_EVENT_THRESHOLD * 100.0f) + 0.5f);
 
     memset(&audio, 0, sizeof(audio));
     memset(&device, 0, sizeof(device));
@@ -642,9 +756,11 @@ static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
                    ((now_ms_local - stats.last_result_time_ms) >
                     APP_MONITOR_SUMMARY_AUDIO_STALE_MS));
     audio.cough_prob_x100 = cough_prob_x100;
-    audio.event_threshold_x100 = 0u;
-    audio.cough_confirmed = (0u != stats.last_event_id);
-    audio.cough_density_high = false;
+    audio.event_threshold_x100 =
+        (100u < event_threshold_x100) ? 100u : event_threshold_x100;
+    audio.cough_confirmed = (cough_prob_x100 >= audio.event_threshold_x100);
+    audio.cough_density_high =
+        (stats.decision_count_cough_1s >= APP_MODEL_EVENT_MIN_HITS);
     audio.model_status = stats.last_status;
     audio.input_sequence = stats.last_input_sequence;
     audio.result_sequence = stats.last_result_sequence;
@@ -654,9 +770,15 @@ static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
     audio.mic_quality_poor = false;
     audio.reason_flags = 0u;
 
+#if (APP_BLE_ENABLE)
+    device.monitor_requested = app_ble_cmd_monitor_is_requested();
+    device.ble_connected = app_ble_is_connected();
+    device.time_synced = app_ble_cmd_time_is_synced();
+#else
     device.monitor_requested = true;
     device.ble_connected = false;
     device.time_synced = false;
+#endif
     device.model_ready = stats.has_live_result &&
                          (APP_MODEL_INFERENCE_STATUS_OK == stats.last_status);
     device.shared_memory_ready = stats.has_result;
@@ -774,6 +896,79 @@ static void app_model_result_monitor_print_smoke_result(
            (unsigned long)result->inference_time_ms);
     app_model_result_monitor_log_end(log_start_ms);
 }
+
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static void app_model_result_monitor_check_ipc_smoke_result(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms)
+{
+    uint32_t expected_hash;
+    uint32_t observed_hash;
+    uint32_t cm55_expected_hash;
+    uint32_t result_sequence_mismatch;
+    uint32_t payload_hash_mismatch;
+    uint32_t cm55_payload_mismatch;
+    uint32_t cm55_sentinel_mismatch;
+    uint32_t cm55_sequence_mismatch;
+    uint32_t stale_result_accepted;
+    uint32_t partial_result_accepted = 0u;
+
+    if ((NULL == result) ||
+        (APP_MODEL_INFERENCE_STATUS_OK != result->status) ||
+        (2u > result->class_count))
+    {
+        return;
+    }
+
+    expected_hash = app_model_ipc_smoke_expected_hash(
+        result->input_sequence,
+        APP_MODEL_AUDIO_MODEL_FLOAT_COUNT);
+    observed_hash = app_model_ipc_smoke_hash_from_halves(result->scores[5],
+                                                         result->scores[6]);
+    cm55_expected_hash = app_model_ipc_smoke_hash_from_halves(result->scores[7],
+                                                              result->scores[8]);
+    result_sequence_mismatch =
+        (result_sequence != result->input_sequence) ? 1u : 0u;
+    payload_hash_mismatch = (observed_hash != expected_hash) ? 1u : 0u;
+    cm55_payload_mismatch = (uint32_t)(result->scores[9] + 0.5f);
+    cm55_sentinel_mismatch = (uint32_t)(result->scores[10] + 0.5f);
+    cm55_sequence_mismatch = (uint32_t)(result->scores[11] + 0.5f);
+    stale_result_accepted =
+        ((0u == result->input_sequence) ||
+         (cm55_expected_hash != expected_hash)) ? 1u : 0u;
+
+    if (ipc_smoke_result_check_logs < APP_MODEL_IPC_SMOKE_LOG_LIMIT)
+    {
+        ipc_smoke_result_check_logs++;
+        app_model_ipc_smoke_log_lock();
+        printf("[IPC_RESULT_CHECK] core=CM33 epoch=%lu t_ms=%lu input_seq=%lu "
+               "result_seq=%lu, expected_hash32=0x%08lx, "
+               "observed_hash32=0x%08lx, cm55_expected_hash32=0x%08lx, "
+               "result_sequence_mismatch=%lu, payload_hash_mismatch=%lu, "
+               "cm55_payload_mismatch=%lu, cm55_sentinel_mismatch=%lu, "
+               "cm55_sequence_mismatch=%lu, stale_result_accepted=%lu, "
+               "partial_result_accepted=%lu, partial_rejected_total=%lu\r\n",
+               (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+               (unsigned long)now_ms,
+               (unsigned long)result->input_sequence,
+               (unsigned long)result_sequence,
+               (unsigned long)expected_hash,
+               (unsigned long)observed_hash,
+               (unsigned long)cm55_expected_hash,
+               (unsigned long)result_sequence_mismatch,
+               (unsigned long)payload_hash_mismatch,
+               (unsigned long)cm55_payload_mismatch,
+               (unsigned long)cm55_sentinel_mismatch,
+               (unsigned long)cm55_sequence_mismatch,
+               (unsigned long)stale_result_accepted,
+               (unsigned long)partial_result_accepted,
+               (unsigned long)ipc_smoke_result_partial_rejected);
+        fflush(stdout);
+        app_model_ipc_smoke_log_unlock();
+    }
+}
+#endif
 
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_DEBUG)
 static void app_model_result_monitor_print_demo_result(
@@ -997,6 +1192,52 @@ static bool app_model_result_monitor_should_print_event(
 }
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
+#if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
+static void app_model_result_monitor_maybe_print_ipc_smoke_stat(
+    const volatile app_model_shared_region_t *shared,
+    uint32_t now_ms)
+{
+    app_audio_preprocess_stats_t audio_stats;
+    app_pdm_pcm_stats_t pdm_stats;
+    uint32_t dropped_delta;
+    uint32_t seq_gap;
+
+    if ((NULL == shared) ||
+        (0u == APP_MODEL_LOG_RATE_LIMIT_MS) ||
+        ((now_ms - model_result_runtime.last_stat_ms) <
+         APP_MODEL_LOG_RATE_LIMIT_MS))
+    {
+        return;
+    }
+
+    app_audio_preprocess_get_stats(&audio_stats);
+    app_pdm_pcm_get_stats(&pdm_stats);
+    dropped_delta = pdm_stats.dropped_total -
+                    model_result_runtime.prev_dropped_total;
+    seq_gap = (shared->producer_sequence >= shared->result_sequence) ?
+              (shared->producer_sequence - shared->result_sequence) : 0u;
+
+    app_model_ipc_smoke_log_lock();
+    printf("[MODEL_STAT] core=CM33 epoch=%lu t_ms=%lu input_seq=%lu "
+           "result_seq=%lu busy=%lu dropped_delta_1s=%lu pdm_error=%lu "
+           "queue_depth=%lu seq_gap=%lu model_not_ready=%lu\r\n",
+           (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+           (unsigned long)now_ms,
+           (unsigned long)shared->producer_sequence,
+           (unsigned long)shared->result_sequence,
+           (unsigned long)audio_stats.shared_busy,
+           (unsigned long)dropped_delta,
+           (unsigned long)pdm_stats.pdm_error_count,
+           (unsigned long)pdm_stats.queue_depth,
+           (unsigned long)seq_gap,
+           (unsigned long)model_result_monitor_stats.model_not_ready_results);
+    fflush(stdout);
+    app_model_ipc_smoke_log_unlock();
+
+    model_result_runtime.last_stat_ms = now_ms;
+    model_result_runtime.prev_dropped_total = pdm_stats.dropped_total;
+}
+#else
 static void app_model_result_monitor_maybe_print_stat(
     const volatile app_model_shared_region_t *shared,
     uint32_t now_ms)
@@ -1174,6 +1415,7 @@ static void app_model_result_monitor_maybe_print_stat(
     (void)now_ms;
 #endif
 }
+#endif
 #endif
 
 static void app_model_result_monitor_print_idle_diag(

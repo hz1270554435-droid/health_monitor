@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "app_audio_deployment_config.h"
+#include "app_model_ipc_smoke.h"
 #include "app_model_smoke.h"
 #include APP_AUDIO_ACTIVE_MODEL_HEADER
 
@@ -17,6 +18,10 @@
 
 #if (APP_MODEL_INPUT_DUMP_ENABLE) && (APP_MODEL_INFERENCE_MAX_SCORES < 14u)
 #error "APP_MODEL_INPUT_DUMP_ENABLE requires at least 14 score slots"
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE) && (APP_MODEL_INFERENCE_MAX_SCORES < 14u)
+#error "APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE requires at least 14 score slots"
 #endif
 
 /* 本文件是 CM55 侧模型任务框架。
@@ -39,6 +44,14 @@ static bool model_runtime_initialized;
 #if (APP_MODEL_INPUT_DUMP_ENABLE)
 static uint32_t model_input_dump_results_written;
 #endif
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static uint32_t ipc_smoke_last_payload_hash;
+static uint32_t ipc_smoke_last_expected_hash;
+static uint32_t ipc_smoke_last_payload_mismatch;
+static uint32_t ipc_smoke_last_sentinel_mismatch;
+static uint32_t ipc_smoke_last_sequence_mismatch;
+static uint32_t ipc_smoke_last_producer_sequence;
+#endif
 
 static bool app_model_inference_try_take_input(
     app_model_audio_feature_desc_t *desc,
@@ -59,6 +72,12 @@ static void app_model_inference_fill_input_stats(
     const app_model_audio_feature_desc_t *desc,
     const float *payload,
     app_model_inference_result_t *result);
+#endif
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static void app_model_inference_check_ipc_payload(
+    const app_model_audio_feature_desc_t *desc,
+    const float *payload,
+    uint32_t producer_sequence);
 #endif
 static float app_model_inference_softmax_cough_prob(float output0,
                                                     float output1);
@@ -161,10 +180,17 @@ static bool app_model_inference_try_take_input(
         return false;
     }
 
+    /* Acquire CM33 writes before trusting descriptor or payload. */
+    __DMB();
+
     /* 抢占输入槽所有权，告诉 CM33 当前帧正在被 CM55 读取。 */
     shared->input_state = APP_MODEL_SHARED_INPUT_READING;
     __DMB();
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+#if (APP_MODEL_IPC_SMOKE_CM55_DELAY_MS > 0u)
+    vTaskDelay(pdMS_TO_TICKS(APP_MODEL_IPC_SMOKE_CM55_DELAY_MS));
+#endif
 
     *desc = shared->audio;
     payload_bytes = desc->payload_bytes;
@@ -191,6 +217,12 @@ static bool app_model_inference_try_take_input(
     /* 先复制到 CM55 本地缓冲，再做真正推理，避免长时间占用共享输入槽。 */
     memcpy((void *)payload, (const void *)&shared->audio_payload[0],
            payload_bytes);
+
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+    app_model_inference_check_ipc_payload(desc,
+                                          payload,
+                                          shared->producer_sequence);
+#endif
 
     /* 已经复制到 CM55 本地缓冲后立即释放输入槽。
      * 这样 CM33 可以继续发布下一帧，真正模型推理耗时不会阻塞前处理写入。
@@ -295,6 +327,57 @@ static void app_model_inference_fill_input_stats(
 }
 #endif
 
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static void app_model_inference_check_ipc_payload(
+    const app_model_audio_feature_desc_t *desc,
+    const float *payload,
+    uint32_t producer_sequence)
+{
+    uint32_t element_count;
+    uint32_t mid_index;
+    uint32_t last_index;
+    uint32_t observed_hash;
+    uint32_t expected_hash;
+    float expected_first;
+    float expected_middle;
+    float expected_last;
+
+    if ((NULL == desc) || (NULL == payload))
+    {
+        return;
+    }
+
+    element_count = (uint32_t)desc->mel_bin_count *
+                    (uint32_t)desc->time_bin_count;
+    if (0u == element_count)
+    {
+        return;
+    }
+
+    mid_index = app_model_ipc_smoke_mid_index(element_count);
+    last_index = app_model_ipc_smoke_last_index(element_count);
+    observed_hash = app_model_ipc_smoke_hash_payload(payload, element_count);
+    expected_hash = app_model_ipc_smoke_expected_hash(desc->sequence,
+                                                      element_count);
+    expected_first = app_model_ipc_smoke_payload_value(desc->sequence, 0u);
+    expected_middle = app_model_ipc_smoke_payload_value(desc->sequence,
+                                                        mid_index);
+    expected_last = app_model_ipc_smoke_payload_value(desc->sequence,
+                                                      last_index);
+
+    ipc_smoke_last_payload_hash = observed_hash;
+    ipc_smoke_last_expected_hash = expected_hash;
+    ipc_smoke_last_payload_mismatch = (observed_hash != expected_hash) ? 1u : 0u;
+    ipc_smoke_last_sentinel_mismatch =
+        (!app_model_ipc_smoke_float_equal(payload[0], expected_first) ||
+         !app_model_ipc_smoke_float_equal(payload[mid_index], expected_middle) ||
+         !app_model_ipc_smoke_float_equal(payload[last_index], expected_last)) ? 1u : 0u;
+    ipc_smoke_last_sequence_mismatch =
+        (producer_sequence != desc->sequence) ? 1u : 0u;
+    ipc_smoke_last_producer_sequence = producer_sequence;
+}
+#endif
+
 static bool app_model_inference_desc_is_valid(
     const app_model_audio_feature_desc_t *desc)
 {
@@ -359,6 +442,33 @@ static app_model_inference_status_t app_model_inference_run_model(
         return APP_MODEL_INFERENCE_STATUS_INVALID_INPUT;
     }
 
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+    result->input_sequence = desc->sequence;
+    result->timestamp_ms = app_model_inference_now_ms();
+    result->class_count = 2u;
+    result->scores[0] = 0.0f;
+    result->scores[1] = 0.0f;
+    result->scores[2] = 0.0f;
+    result->scores[3] = desc->energy;
+    result->scores[4] = (float)desc->selected_channel;
+    result->scores[5] = (float)app_model_ipc_smoke_hash_low16(
+        ipc_smoke_last_payload_hash);
+    result->scores[6] = (float)app_model_ipc_smoke_hash_high16(
+        ipc_smoke_last_payload_hash);
+    result->scores[7] = (float)app_model_ipc_smoke_hash_low16(
+        ipc_smoke_last_expected_hash);
+    result->scores[8] = (float)app_model_ipc_smoke_hash_high16(
+        ipc_smoke_last_expected_hash);
+    result->scores[9] = (float)ipc_smoke_last_payload_mismatch;
+    result->scores[10] = (float)ipc_smoke_last_sentinel_mismatch;
+    result->scores[11] = (float)ipc_smoke_last_sequence_mismatch;
+    result->scores[12] = (float)app_model_ipc_smoke_hash_low16(
+        ipc_smoke_last_producer_sequence);
+    result->scores[13] = (float)app_model_ipc_smoke_hash_high16(
+        ipc_smoke_last_producer_sequence);
+    return APP_MODEL_INFERENCE_STATUS_OK;
+#endif
+
     /* 模型运行时只做一次初始化；成功后通过静态标志避免每帧重复初始化。 */
     if (!model_runtime_initialized)
     {
@@ -419,6 +529,8 @@ static void app_model_inference_publish_result(
     shared->result_state = APP_MODEL_SHARED_RESULT_WRITING;
     shared->result = local_result;
     shared->result_sequence = desc->sequence;
+
+    /* Release complete result contents before publishing READY. */
     __DMB();
     shared->result_state = APP_MODEL_SHARED_RESULT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));

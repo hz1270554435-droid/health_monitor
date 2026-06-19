@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_model_ipc_smoke.h"
+
 #if ((APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_DFT) && \
      (APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_RFFT))
 #error "Unsupported APP_AUDIO_SPECTRUM_BACKEND"
@@ -35,6 +37,9 @@
 #ifndef APP_AUDIO_FEATURE_DUMP_WINDOWS
 #define APP_AUDIO_FEATURE_DUMP_WINDOWS          (3u)
 #endif
+
+#define APP_MODEL_SHARED_BOOT_GATE_DIAG_MS      (5000u)
+#define APP_MODEL_SHARED_BOOT_GATE_POLL_MS      (100u)
 
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE && \
      (0u == APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH))
@@ -170,6 +175,7 @@ static app_audio_preprocess_config_t audio_preprocess_config;
 static app_audio_preprocess_plan_t audio_preprocess_plan;
 static app_audio_preprocess_stats_t audio_preprocess_stats;
 static bool audio_preprocess_config_ready;
+static volatile bool app_model_shared_boot_ready;
 
 static int16_t mono_ring[APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES];
 static uint16_t mono_ring_write_index;
@@ -191,6 +197,24 @@ static uint32_t compare_windows_reported;
 #endif
 #if (APP_AUDIO_FEATURE_DUMP_ENABLE)
 static uint32_t feature_dump_windows_reported;
+#endif
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+static uint32_t ipc_smoke_payload_publish_logs;
+static uint32_t ipc_smoke_backpressure_logs;
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_READY_ENABLE)
+#define APP_MODEL_IPC_SMOKE_WARM_RESET_ARMED     (0x52315241u)
+#define APP_MODEL_IPC_SMOKE_WARM_RESET_DONE      (0x52315244u)
+#define APP_MODEL_IPC_SMOKE_WARM_TRIGGER_DELAY_MS (30000u)
+static uint32_t ipc_smoke_warm_reset_state
+    __attribute__((section(".noinit")));
+#endif
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+#define APP_MODEL_IPC_SMOKE_WARM_INPUT_ARMED     (0x52314941u)
+#define APP_MODEL_IPC_SMOKE_WARM_INPUT_DONE      (0x52314944u)
+#define APP_MODEL_IPC_SMOKE_WARM_INPUT_SEQUENCE  (59u)
+static uint32_t ipc_smoke_warm_input_state
+    __attribute__((section(".noinit")));
+#endif
 #endif
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
 static app_audio_event_feature_frame_t event_feature_ring[
@@ -311,10 +335,13 @@ static void app_audio_preprocess_event_pcm_remember(
     const app_model_audio_feature_desc_t *desc,
     const float *feature);
 #endif
-static void app_audio_preprocess_init_shared_region(void);
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
                                                  float energy);
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+static void app_model_shared_boot_arm_stale_input(
+    volatile app_model_shared_region_t *shared);
+#endif
 static uint32_t app_audio_preprocess_ms_to_samples(uint32_t sample_rate_hz,
                                                    uint16_t ms);
 static float app_audio_preprocess_hz_to_mel(float hz);
@@ -354,10 +381,33 @@ cy_rslt_t app_audio_preprocess_task_init(void)
 
 void app_audio_preprocess_task(void *pvParameters)
 {
+    uint32_t last_boot_gate_diag_ms = 0u;
+    bool boot_gate_diag_printed = false;
+
     (void)pvParameters;
 
-    /* 任务启动后先初始化共享区，再清空本地流状态，确保第一帧从干净状态开始。 */
-    app_audio_preprocess_init_shared_region();
+    while (!app_model_shared_boot_is_ready())
+    {
+        uint32_t now_ms = app_audio_preprocess_now_ms();
+
+        if ((!boot_gate_diag_printed) ||
+            ((now_ms - last_boot_gate_diag_ms) >=
+             APP_MODEL_SHARED_BOOT_GATE_DIAG_MS))
+        {
+            app_model_ipc_smoke_log_lock();
+            printf("[IPC_BOOT_GATE] core=CM33 task=audio_preproc "
+                   "t_ms=%lu ready=0\r\n",
+                   (unsigned long)now_ms);
+            fflush(stdout);
+            app_model_ipc_smoke_log_unlock();
+            last_boot_gate_diag_ms = now_ms;
+            boot_gate_diag_printed = true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(APP_MODEL_SHARED_BOOT_GATE_POLL_MS));
+    }
+
+    /* Boot ownership is complete; start the local PCM stream from clean state. */
     app_audio_preprocess_reset_stream_state();
 
     for (;;)
@@ -1603,6 +1653,9 @@ static bool app_audio_preprocess_global_feature_norm_enabled(
 
 static void app_audio_preprocess_print_resolved_config(void)
 {
+#if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
+    return;
+#else
     uint8_t frontend_profile = audio_preprocess_config.frontend_profile;
 
     printf("[AUDIO_PREPROCESS_INFO] frontend_profile=%lu, frontend_name=%s, "
@@ -1631,6 +1684,7 @@ static void app_audio_preprocess_print_resolved_config(void)
     app_audio_preprocess_print_float_value(
         audio_preprocess_config.energy_gate_threshold);
     printf("\r\n");
+#endif
 }
 
 static void app_audio_preprocess_print_float_value(float value)
@@ -1795,20 +1849,257 @@ static void app_audio_preprocess_print_float(float value)
 }
 #endif
 
-static void app_audio_preprocess_init_shared_region(void)
+cy_rslt_t app_model_shared_boot_init_cm33_owner(void)
 {
-    /* 初始化共享协议头。这里不清空原始 PCM，因为原始 PCM 不在共享区。 */
     volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+    uint32_t magic_before;
+    uint32_t version_before;
+    uint32_t input_state_before;
+    uint32_t result_state_before;
+    uint32_t producer_before;
+    uint32_t consumer_before;
+    uint32_t result_sequence_before;
+    uint32_t audio_sequence_before;
+    uint32_t result_input_sequence_before;
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_READY_ENABLE)
+    bool warm_stale_result_armed;
+#endif
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+    bool warm_stale_input_armed;
+#endif
+
+    app_model_shared_boot_ready = false;
+    APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
+
+    /* Capture retained evidence before invalidating or clearing the region. */
+    magic_before = shared->magic;
+    version_before = shared->version;
+    input_state_before = shared->input_state;
+    result_state_before = shared->result_state;
+    producer_before = shared->producer_sequence;
+    consumer_before = shared->consumer_sequence;
+    result_sequence_before = shared->result_sequence;
+    audio_sequence_before = shared->audio.sequence;
+    result_input_sequence_before = shared->result.input_sequence;
+
+    /* Retained sampling is mandatory even when diagnostic output is disabled. */
+    (void)magic_before;
+    (void)version_before;
+    (void)input_state_before;
+    (void)result_state_before;
+    (void)producer_before;
+    (void)consumer_before;
+    (void)result_sequence_before;
+    (void)audio_sequence_before;
+    (void)result_input_sequence_before;
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_READY_ENABLE)
+    warm_stale_result_armed =
+        (APP_MODEL_IPC_SMOKE_WARM_RESET_ARMED == ipc_smoke_warm_reset_state);
+
+    if (warm_stale_result_armed)
+    {
+        ipc_smoke_warm_reset_state = APP_MODEL_IPC_SMOKE_WARM_RESET_DONE;
+    }
+    else if (APP_MODEL_IPC_SMOKE_WARM_RESET_DONE !=
+             ipc_smoke_warm_reset_state)
+    {
+        ipc_smoke_warm_reset_state = 0u;
+    }
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+    warm_stale_input_armed =
+        (APP_MODEL_IPC_SMOKE_WARM_INPUT_ARMED == ipc_smoke_warm_input_state);
+
+    if (warm_stale_input_armed)
+    {
+        ipc_smoke_warm_input_state = APP_MODEL_IPC_SMOKE_WARM_INPUT_DONE;
+    }
+    else if (APP_MODEL_IPC_SMOKE_WARM_INPUT_DONE !=
+             ipc_smoke_warm_input_state)
+    {
+        ipc_smoke_warm_input_state = 0u;
+    }
+#endif
+
+    /* CM33_NS is the sole boot/reset owner. Invalidate the header first. */
+    shared->magic = 0u;
+    shared->version = 0u;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+    __DMB();
+
+    memset((void *)shared, 0, sizeof(*shared));
+    shared->input_state = APP_MODEL_SHARED_INPUT_EMPTY;
+    shared->result_state = APP_MODEL_SHARED_RESULT_EMPTY;
+    shared->producer_sequence = 0u;
+    shared->consumer_sequence = 0u;
+    shared->result_sequence = 0u;
+    shared->audio.sequence = 0u;
+    shared->result.input_sequence = 0u;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+    /* Publish a clean boot boundary: version first, magic last. */
+    __DMB();
+    shared->version = APP_MODEL_SHARED_VERSION;
+    __DMB();
+    shared->magic = APP_MODEL_SHARED_MAGIC;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+    __DMB();
 
     if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
-        (APP_MODEL_SHARED_VERSION != shared->version))
+        (APP_MODEL_SHARED_VERSION != shared->version) ||
+        (APP_MODEL_SHARED_INPUT_EMPTY != shared->input_state) ||
+        (APP_MODEL_SHARED_RESULT_EMPTY != shared->result_state) ||
+        (0u != shared->producer_sequence) ||
+        (0u != shared->consumer_sequence) ||
+        (0u != shared->result_sequence) ||
+        (0u != shared->audio.sequence) ||
+        (0u != shared->result.input_sequence))
     {
-        memset((void *)shared, 0, sizeof(*shared));
-        shared->magic = APP_MODEL_SHARED_MAGIC;
-        shared->version = APP_MODEL_SHARED_VERSION;
-        shared->input_state = APP_MODEL_SHARED_INPUT_EMPTY;
+        return CY_RSLT_TYPE_ERROR;
+    }
+
+#if (APP_MODEL_IPC_SMOKE_RESET_DIAG_ENABLE)
+    printf("[IPC_RESET_BOOT] core=CM33 epoch=%lu t_ms=%lu "
+           "magic_before=0x%08lx, "
+           "version_before=%lu, input_state_before=%lu, "
+           "result_state_before=%lu, producer_before=%lu, "
+           "consumer_before=%lu, result_seq_before=%lu, "
+           "audio_seq_before=%lu, result_input_seq_before=%lu, "
+           "init_action=cleared, stale_input_ready_before=%lu, "
+           "stale_result_ready_before=%lu\r\n",
+           (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+           0ul,
+           (unsigned long)magic_before,
+           (unsigned long)version_before,
+           (unsigned long)input_state_before,
+           (unsigned long)result_state_before,
+           (unsigned long)producer_before,
+           (unsigned long)consumer_before,
+           (unsigned long)result_sequence_before,
+           (unsigned long)audio_sequence_before,
+           (unsigned long)result_input_sequence_before,
+           (unsigned long)(APP_MODEL_SHARED_INPUT_READY == input_state_before),
+           (unsigned long)(APP_MODEL_SHARED_RESULT_READY == result_state_before));
+    fflush(stdout);
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_READY_ENABLE)
+    if (warm_stale_result_armed)
+    {
+        printf("[IPC_WARM_STALE_TRIGGER] core=CM33 epoch=%lu t_ms=%lu "
+               "phase=verified, result_state_before=%lu, "
+               "result_seq_before=%lu, result_input_seq_before=%lu, "
+               "cleanup=clear\r\n",
+               (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+               0ul,
+               (unsigned long)result_state_before,
+               (unsigned long)result_sequence_before,
+               (unsigned long)result_input_sequence_before);
+        fflush(stdout);
+    }
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+    if (warm_stale_input_armed)
+    {
+        printf("[IPC_WARM_STALE_INPUT_TRIGGER] core=CM33 epoch=%lu t_ms=%lu "
+               "phase=verified, input_state_before=%lu, "
+               "producer_before=%lu, audio_seq_before=%lu, cleanup=clear\r\n",
+               (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+               0ul,
+               (unsigned long)input_state_before,
+               (unsigned long)producer_before,
+               (unsigned long)audio_sequence_before);
+        fflush(stdout);
+    }
+#endif
+
+    app_model_shared_boot_ready = true;
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+    if (0u == ipc_smoke_warm_input_state)
+    {
+        app_model_shared_boot_arm_stale_input(shared);
+    }
+#endif
+
+    return CY_RSLT_SUCCESS;
+}
+
+bool app_model_shared_boot_is_ready(void)
+{
+    return app_model_shared_boot_ready;
+}
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
+static void app_model_shared_boot_arm_stale_input(
+    volatile app_model_shared_region_t *shared)
+{
+    app_model_audio_feature_desc_t desc;
+    uint32_t payload_hash;
+
+    memset(&desc, 0, sizeof(desc));
+    desc.sequence = APP_MODEL_IPC_SMOKE_WARM_INPUT_SEQUENCE;
+    desc.timestamp_ms = 0u;
+    desc.sample_rate_hz = (uint16_t)SAMPLE_RATE_HZ;
+    desc.window_ms = APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS;
+    desc.window_hop_ms = APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS;
+    desc.frame_len_ms = APP_AUDIO_PREPROCESS_DEFAULT_FRAME_LEN_MS;
+    desc.frame_hop_ms = APP_AUDIO_PREPROCESS_DEFAULT_FRAME_HOP_MS;
+    desc.fft_size = APP_AUDIO_PREPROCESS_DEFAULT_FFT_SIZE;
+    desc.mel_bin_count = APP_MODEL_AUDIO_MODEL_MEL_BINS;
+    desc.time_bin_count = APP_MODEL_AUDIO_MODEL_TIME_BINS;
+    desc.payload_bytes = (uint16_t)APP_MODEL_AUDIO_MODEL_INPUT_BYTES;
+    desc.quant_type = (uint8_t)APP_MODEL_AUDIO_QUANT_FLOAT32;
+    desc.quant_zero_point = 0;
+    desc.quant_scale = 1.0f;
+    desc.energy = 1.0f;
+    desc.selected_channel = APP_AUDIO_PREPROCESS_SELECTED_MIXED;
+    desc.valid = 1u;
+
+    app_model_ipc_smoke_fill_payload(
+        model_input_feature,
+        APP_MODEL_AUDIO_MODEL_FLOAT_COUNT,
+        APP_MODEL_IPC_SMOKE_WARM_INPUT_SEQUENCE);
+    payload_hash = app_model_ipc_smoke_hash_payload(
+        model_input_feature,
+        APP_MODEL_AUDIO_MODEL_FLOAT_COUNT);
+
+    shared->input_state = APP_MODEL_SHARED_INPUT_WRITING;
+    shared->audio = desc;
+    memcpy((void *)&shared->audio_payload[0],
+           model_input_feature,
+           APP_MODEL_AUDIO_MODEL_INPUT_BYTES);
+    shared->producer_sequence = desc.sequence;
+
+    /* Match the normal CM33 input release ordering before warm reset. */
+    __DMB();
+    shared->input_state = APP_MODEL_SHARED_INPUT_READY;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+    __DMB();
+
+    ipc_smoke_warm_input_state = APP_MODEL_IPC_SMOKE_WARM_INPUT_ARMED;
+    __DMB();
+    printf("[IPC_WARM_STALE_INPUT_TRIGGER] core=CM33 epoch=%lu t_ms=%lu "
+           "phase=armed, input_state=%lu, producer_sequence=%lu, "
+           "audio_sequence=%lu, payload_hash=0x%08lx\r\n",
+           (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+           0ul,
+           (unsigned long)shared->input_state,
+           (unsigned long)shared->producer_sequence,
+           (unsigned long)shared->audio.sequence,
+           (unsigned long)payload_hash);
+    fflush(stdout);
+    Cy_SysLib_Delay(100u);
+    NVIC_SystemReset();
+
+    for (;;)
+    {
     }
 }
+#endif
 
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
@@ -1817,17 +2108,43 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
     /* 发布策略：共享区只有一个输入槽。
      * 如果 CM55 还没消费上一帧，则本帧丢弃并计数 shared_busy，避免覆盖正在推理的数据。
      */
-    volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+    volatile app_model_shared_region_t *shared;
     uint16_t payload_bytes =
         (uint16_t)((uint32_t)audio_preprocess_config.mel_bin_count *
                    (uint32_t)audio_preprocess_plan.time_bins *
                    (uint32_t)sizeof(model_input_feature[0]));
     app_model_audio_feature_desc_t desc;
 
+    if (!app_model_shared_boot_is_ready())
+    {
+        return false;
+    }
+
+    shared = APP_MODEL_SHARED_REGION;
+
     if ((APP_MODEL_SHARED_INPUT_READY == shared->input_state) ||
         (APP_MODEL_SHARED_INPUT_READING == shared->input_state))
     {
         audio_preprocess_stats.shared_busy++;
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+        if (ipc_smoke_backpressure_logs < APP_MODEL_IPC_SMOKE_LOG_LIMIT)
+        {
+            ipc_smoke_backpressure_logs++;
+            app_model_ipc_smoke_log_lock();
+            printf("[IPC_BACKPRESSURE] core=CM33 epoch=%lu t_ms=%lu "
+                   "input_state=%lu, "
+                   "producer_sequence=%lu, consumer_sequence=%lu, "
+                   "busy_total=%lu, unsafe_overwrite=0\r\n",
+                   (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+                   (unsigned long)app_audio_preprocess_now_ms(),
+                   (unsigned long)shared->input_state,
+                   (unsigned long)shared->producer_sequence,
+                   (unsigned long)shared->consumer_sequence,
+                   (unsigned long)audio_preprocess_stats.shared_busy);
+            fflush(stdout);
+            app_model_ipc_smoke_log_unlock();
+        }
+#endif
         return false;
     }
 
@@ -1850,6 +2167,13 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
     desc.selected_channel = selected_channel;
     desc.valid = 1u;
 
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+    app_model_ipc_smoke_fill_payload(
+        model_input_feature,
+        (uint32_t)desc.mel_bin_count * (uint32_t)desc.time_bin_count,
+        desc.sequence);
+#endif
+
     shared->input_state = APP_MODEL_SHARED_INPUT_WRITING;
     shared->audio = desc;
     memcpy((void *)&shared->audio_payload[0],
@@ -1858,8 +2182,57 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
     shared->producer_sequence = desc.sequence;
     audio_preprocess_stats.last_published_sequence = desc.sequence;
     audio_preprocess_stats.last_published_timestamp_ms = timestamp_ms;
+
+    /* Release descriptor, payload, and sequence before publishing READY. */
+    __DMB();
     shared->input_state = APP_MODEL_SHARED_INPUT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+#if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
+    if (ipc_smoke_payload_publish_logs < APP_MODEL_IPC_SMOKE_LOG_LIMIT)
+    {
+        uint32_t element_count = (uint32_t)desc.mel_bin_count *
+                                 (uint32_t)desc.time_bin_count;
+        uint32_t hash = app_model_ipc_smoke_hash_payload(model_input_feature,
+                                                         element_count);
+
+        ipc_smoke_payload_publish_logs++;
+        app_model_ipc_smoke_log_lock();
+        printf("[IPC_PAYLOAD_PUBLISH] core=CM33 epoch=%lu t_ms=%lu seq=%lu "
+               "producer_sequence=%lu, payload_bytes=%lu, hash32=0x%08lx, "
+               "input_state=%lu\r\n",
+               (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+               (unsigned long)app_audio_preprocess_now_ms(),
+               (unsigned long)desc.sequence,
+               (unsigned long)shared->producer_sequence,
+               (unsigned long)payload_bytes,
+               (unsigned long)hash,
+               (unsigned long)shared->input_state);
+        fflush(stdout);
+        app_model_ipc_smoke_log_unlock();
+    }
+#endif
+
+#if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_READY_ENABLE)
+    if ((0u == ipc_smoke_warm_reset_state) &&
+        (APP_MODEL_IPC_SMOKE_WARM_TRIGGER_DELAY_MS <=
+         app_audio_preprocess_now_ms()))
+    {
+        ipc_smoke_warm_reset_state = APP_MODEL_IPC_SMOKE_WARM_RESET_ARMED;
+        __DMB();
+        app_model_ipc_smoke_log_lock();
+        printf("[IPC_WARM_STALE_TRIGGER] core=CM33 epoch=%lu t_ms=%lu "
+               "phase=armed, input_state=%lu, producer_sequence=%lu\r\n",
+               (unsigned long)APP_MODEL_IPC_SMOKE_BOOT_EPOCH,
+               (unsigned long)app_audio_preprocess_now_ms(),
+               (unsigned long)shared->input_state,
+               (unsigned long)shared->producer_sequence);
+        fflush(stdout);
+        app_model_ipc_smoke_log_unlock();
+        vTaskDelay(pdMS_TO_TICKS(100u));
+        NVIC_SystemReset();
+    }
+#endif
 
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
     app_audio_preprocess_event_feature_remember(&desc, model_input_feature);

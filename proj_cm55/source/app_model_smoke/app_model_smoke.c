@@ -155,7 +155,7 @@ static const app_model_smoke_expected_t app_model_smoke_expected[] =
 static float app_model_smoke_softmax_cough_prob(float output0,
                                                 float output1);
 static float app_model_smoke_absf(float value);
-static void app_model_smoke_publish_result(uint32_t sample_index,
+static bool app_model_smoke_publish_result(uint32_t sample_index,
                                            const float *output,
                                            float cough_prob,
                                            float expected_cough_prob,
@@ -170,6 +170,14 @@ bool app_model_smoke_run_once(void)
 #if (APP_MODEL_SMOKE_TEST_ENABLE)
     bool all_passed = true;
     int init_ret;
+    volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+
+    APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
+    if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
+        (APP_MODEL_SHARED_VERSION != shared->version))
+    {
+        return false;
+    }
 
     if (AUDIO_TEST_VECTOR_COUNT != APP_MODEL_SMOKE_EXPECTED_COUNT)
     {
@@ -181,12 +189,13 @@ bool app_model_smoke_run_once(void)
     {
         float empty_output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
 
-        app_model_smoke_publish_result(0u,
-                                       empty_output,
-                                       0.0f,
-                                       APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(0u),
-                                       0u,
-                                       (uint8_t)APP_MODEL_INFERENCE_STATUS_INVALID_INPUT);
+        (void)app_model_smoke_publish_result(
+            0u,
+            empty_output,
+            0.0f,
+            APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(0u),
+            0u,
+            (uint8_t)APP_MODEL_INFERENCE_STATUS_INVALID_INPUT);
         return false;
     }
 
@@ -213,12 +222,16 @@ bool app_model_smoke_run_once(void)
             all_passed = false;
         }
 
-        app_model_smoke_publish_result(i,
-                                       output,
-                                       cough_prob,
-                                       APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i),
-                                       elapsed_ms,
-                                       (uint8_t)APP_MODEL_INFERENCE_STATUS_OK);
+        if (!app_model_smoke_publish_result(
+                i,
+                output,
+                cough_prob,
+                APP_MODEL_SMOKE_EXPECTED_COUGH_PROB(i),
+                elapsed_ms,
+                (uint8_t)APP_MODEL_INFERENCE_STATUS_OK))
+        {
+            return false;
+        }
 
         /* 给 CM33 结果观察任务留出打印时间；结果槽采用“最新结果覆盖旧结果”语义。 */
         vTaskDelay(pdMS_TO_TICKS(500u));
@@ -248,7 +261,7 @@ static float app_model_smoke_absf(float value)
     return (0.0f <= value) ? value : -value;
 }
 
-static void app_model_smoke_publish_result(uint32_t sample_index,
+static bool app_model_smoke_publish_result(uint32_t sample_index,
                                            const float *output,
                                            float cough_prob,
                                            float expected_cough_prob,
@@ -258,13 +271,11 @@ static void app_model_smoke_publish_result(uint32_t sample_index,
     volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
     app_model_inference_result_t result;
 
+    APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
     if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
         (APP_MODEL_SHARED_VERSION != shared->version))
     {
-        memset((void *)shared, 0, sizeof(*shared));
-        shared->magic = APP_MODEL_SHARED_MAGIC;
-        shared->version = APP_MODEL_SHARED_VERSION;
-        shared->input_state = APP_MODEL_SHARED_INPUT_EMPTY;
+        return false;
     }
 
     memset(&result, 0, sizeof(result));
@@ -288,6 +299,8 @@ static void app_model_smoke_publish_result(uint32_t sample_index,
     __DMB();
     shared->result_state = APP_MODEL_SHARED_RESULT_READY;
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+    return true;
 }
 
 static uint32_t app_model_smoke_now_ms(void)

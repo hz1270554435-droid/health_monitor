@@ -65,13 +65,17 @@
 /* Debug UART 支持的应用层波特率。
  *
  * 注意：这里不是开放的任意 baud 配置，而是列出已经在 retarget_io_init.c 中
- * 计算过 divider 的两个固定速率：
+ * 计算过 divider 的固定速率：
  * - 115200：普通串口助手、模型 smoke test、正式链路调试日志；
+ * - 230400 / 460800 / 921600：UART transport sanity matrix；
  * - 2000000：CSV/PCM 等高吞吐采集导出，减少串口阻塞和丢帧概率。
  *
  * 新增其它速率时，应同步在 retarget_io_init.c 中增加 divider 映射和注释。
  */
 #define RETARGET_IO_BAUD_115200     (115200UL)
+#define RETARGET_IO_BAUD_230400     (230400UL)
+#define RETARGET_IO_BAUD_460800     (460800UL)
+#define RETARGET_IO_BAUD_921600     (921600UL)
 #define RETARGET_IO_BAUD_2000000    (2000000UL)
 
 
@@ -80,11 +84,16 @@
 *******************************************************************************/
 /* 初始化 debug UART 和 retarget-io。
  *
- * 参数 baud_rate 必须为 RETARGET_IO_BAUD_115200 或 RETARGET_IO_BAUD_2000000。
+ * 参数 baud_rate 必须为上面列出的固定速率之一。
  * 业务层应在 main.c 中根据 APP_RUNTIME_MODE 选择波特率；底层只负责按该速率
  * 设置 UART 时钟分频并完成 printf 重定向。
  */
 void init_retarget_io(uint32_t baud_rate);
+
+/* Task/early-boot context only. This bypasses stdio and waits until the UART
+ * FIFO and shifter are empty before returning.
+ */
+void retarget_io_write_blocking(const uint8_t *data, uint32_t size);
 
 /*******************************************************************************
 * Function Name: handle_app_error

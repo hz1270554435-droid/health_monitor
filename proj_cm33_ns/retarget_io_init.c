@@ -56,13 +56,19 @@ static mtb_hal_uart_t               DEBUG_UART_hal_obj;
  * 这里的数值和 BSP 当前生成配置绑定：CYBSP_DEBUG_UART_config.oversample = 10，
  * debug UART 的 peripheral clock root = 100 MHz。PSoC 的 divider 寄存器值比
  * 实际分频小 1，因此：
- * - 2 Mbps：100 MHz / 5 / 10 = 2000000，寄存器值为 4；
  * - 115200：100 MHz / 87 / 10 = 114942.5，寄存器值为 86，误差约 -0.22%。
+ * - 230400：100 MHz / 43 / 10 = 232558.1，寄存器值为 42，误差约 +0.94%；
+ * - 460800：100 MHz / 22 / 10 = 454545.5，寄存器值为 21，误差约 -1.36%；
+ * - 921600：100 MHz / 11 / 10 = 909090.9，寄存器值为 10，误差约 -1.36%；
+ * - 2 Mbps：100 MHz / 5 / 10 = 2000000，寄存器值为 4。
  *
  * 如果以后用 Device Configurator 改了 UART oversample 或 clock root，必须同步
  * 重新计算这里的 divider，否则上位机会继续出现乱码。
  */
 #define DEBUG_UART_115200_DIVIDER_VALUE    (86U)
+#define DEBUG_UART_230400_DIVIDER_VALUE    (42U)
+#define DEBUG_UART_460800_DIVIDER_VALUE    (21U)
+#define DEBUG_UART_921600_DIVIDER_VALUE    (10U)
 #define DEBUG_UART_2000000_DIVIDER_VALUE   (4U)
 
 /* 将应用层选择的固定波特率映射为硬件 divider 寄存器值。 */
@@ -117,7 +123,7 @@ static cy_stc_syspm_callback_t retarget_io_syspm_cb =
 *  初始化 debug UART，并把 printf/scanf 重定向到该串口。
 *
 * Parameters:
-*  baud_rate - 只能传 RETARGET_IO_BAUD_115200 或 RETARGET_IO_BAUD_2000000。
+ *  baud_rate - 只能传 retarget_io_init.h 中列出的固定速率。
 *              该参数由 main.c 根据运行模式统一选择。
 *
 * Return:
@@ -175,15 +181,37 @@ void init_retarget_io(uint32_t baud_rate)
 #endif /* (CY_CFG_PWR_SYS_IDLE_MODE == CY_CFG_PWR_MODE_DEEPSLEEP) */
 }
 
+void retarget_io_write_blocking(const uint8_t *data, uint32_t size)
+{
+    if ((NULL == data) || (0u == size))
+    {
+        return;
+    }
+
+    Cy_SCB_UART_PutArrayBlocking(CYBSP_DEBUG_UART_HW, (void *)data, size);
+    while (!Cy_SCB_UART_IsTxComplete(CYBSP_DEBUG_UART_HW))
+    {
+    }
+}
+
 static uint32_t debug_uart_get_divider_value(uint32_t baud_rate)
 {
-    /* 只接受头文件公开的两个固定速率。若传入其它值，说明 main.c 或编译宏配置
+    /* 只接受头文件公开的固定速率。若传入其它值，说明 main.c 或编译宏配置
      * 已经越过了当前已校准范围，直接停机比使用错误波特率输出乱码更容易定位。
      */
     switch (baud_rate)
     {
         case RETARGET_IO_BAUD_115200:
             return DEBUG_UART_115200_DIVIDER_VALUE;
+
+        case RETARGET_IO_BAUD_230400:
+            return DEBUG_UART_230400_DIVIDER_VALUE;
+
+        case RETARGET_IO_BAUD_460800:
+            return DEBUG_UART_460800_DIVIDER_VALUE;
+
+        case RETARGET_IO_BAUD_921600:
+            return DEBUG_UART_921600_DIVIDER_VALUE;
 
         case RETARGET_IO_BAUD_2000000:
             return DEBUG_UART_2000000_DIVIDER_VALUE;

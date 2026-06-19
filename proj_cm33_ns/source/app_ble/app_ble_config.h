@@ -17,6 +17,10 @@ extern "C" {
 #define APP_BLE_STACK_ENABLE              (0u)
 #endif
 
+#ifndef APP_BLE_SUMMARY_ENABLE
+#define APP_BLE_SUMMARY_ENABLE            (0u)
+#endif
+
 #ifndef APP_BLE_DIAG_ENABLE
 #define APP_BLE_DIAG_ENABLE               (1u)
 #endif
@@ -57,6 +61,10 @@ extern "C" {
 
 #if ((APP_BLE_STACK_ENABLE != 0u) && (APP_BLE_STACK_ENABLE != 1u))
 #error "Unsupported APP_BLE_STACK_ENABLE"
+#endif
+
+#if ((APP_BLE_SUMMARY_ENABLE != 0u) && (APP_BLE_SUMMARY_ENABLE != 1u))
+#error "Unsupported APP_BLE_SUMMARY_ENABLE"
 #endif
 
 #if ((APP_BLE_DIAG_ENABLE != 0u) && (APP_BLE_DIAG_ENABLE != 1u))

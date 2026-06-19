@@ -14,6 +14,7 @@ static e84_display_page_t last_logged_page = E84_DISPLAY_PAGE_COUNT;
 
 static uint32_t app_display_backend_now_ms(void);
 static void app_display_backend_print_float_3(float value);
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
 static void app_display_backend_print_home_page(
     const e84_display_view_model_t *view,
     uint32_t now_ms);
@@ -23,12 +24,23 @@ static void app_display_backend_print_alert_page(
 static void app_display_backend_print_debug_page(
     const e84_display_view_model_t *view,
     uint32_t now_ms);
+#endif
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
+static void app_display_backend_print_final_mock_screen(
+    const e84_display_view_model_t *view,
+    uint32_t now_ms);
+static const char *app_display_backend_mock_scenario(
+    const e84_display_snapshot_t *snapshot);
+#endif
 
 cy_rslt_t app_display_backend_null_init(void)
 {
-    printf("[DISPLAY] backend=null init, min_log_ms=%lu, smoke=%lu\r\n",
+    printf("[DISPLAY] backend=null init, min_log_ms=%lu, smoke=%lu, "
+           "final_mock=%lu product_screen=%lu\r\n",
            (unsigned long)APP_DISPLAY_NULL_LOG_MIN_PERIOD_MS,
-           (unsigned long)APP_DISPLAY_SMOKE_ENABLE);
+           (unsigned long)APP_DISPLAY_SMOKE_ENABLE,
+           (unsigned long)APP_DISPLAY_FINAL_MOCK_ENABLE,
+           (unsigned long)APP_DISPLAY_PRODUCT_SCREEN_ENABLE);
     fflush(stdout);
     return CY_RSLT_SUCCESS;
 }
@@ -64,8 +76,9 @@ void app_display_backend_null_render_snapshot(
     app_display_backend_print_float_3(snapshot->breath_rate_bpm);
     printf(" heart_rate_bpm=");
     app_display_backend_print_float_3(snapshot->heart_rate_bpm);
-    printf(" radar_quality=%u mic_cough_prob=",
-           (unsigned int)snapshot->radar_quality);
+    printf(" radar_quality=%u distance_cm=%u mic_cough_prob=",
+           (unsigned int)snapshot->radar_quality,
+           (unsigned int)snapshot->distance_cm);
     app_display_backend_print_float_3(snapshot->mic_cough_prob);
     printf(" cough_count_1min=%u cough_count_5min=%u audio_quality=%u "
            "fusion_confidence=%u ble_connected=%u flags=0x%08lx\r\n",
@@ -126,6 +139,9 @@ void app_display_backend_null_render_view(
     last_page_log_ms = now_ms;
     last_logged_page = view->current_page;
 
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
+    app_display_backend_print_final_mock_screen(view, now_ms);
+#else
     switch (view->current_page)
     {
         case E84_DISPLAY_PAGE_ALERT:
@@ -142,6 +158,7 @@ void app_display_backend_null_render_view(
             app_display_backend_print_home_page(view, now_ms);
             break;
     }
+#endif
 
     fflush(stdout);
 }
@@ -151,6 +168,7 @@ static uint32_t app_display_backend_now_ms(void)
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
+#if (!APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
 static void app_display_backend_print_home_page(
     const e84_display_view_model_t *view,
     uint32_t now_ms)
@@ -228,6 +246,7 @@ static void app_display_backend_print_debug_page(
            (unsigned long)view->last_refresh_timestamp_ms,
            view->dirty ? 1u : 0u);
 }
+#endif /* !APP_DISPLAY_FINAL_MOCK_ENABLE && !APP_DISPLAY_PRODUCT_SCREEN_ENABLE */
 
 static void app_display_backend_print_float_3(float value)
 {
@@ -251,5 +270,373 @@ static void app_display_backend_print_float_3(float value)
 
     printf("%s%lu.%03lu", sign, (unsigned long)whole, (unsigned long)frac);
 }
+
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
+static const char *app_display_backend_radar_source_label(
+    e84_display_radar_source_state_t state);
+static const char *app_display_backend_radar_presence_text(
+    const e84_display_snapshot_t *snapshot);
+static const char *app_display_backend_radar_quality_label(
+    const e84_display_snapshot_t *snapshot);
+static const char *app_display_backend_main_status_text(
+    const e84_display_snapshot_t *snapshot);
+static const char *app_display_backend_radar_source_id(
+    e84_display_radar_source_state_t state);
+static const char *app_display_backend_radar_presence_id(
+    const e84_display_snapshot_t *snapshot);
+static const char *app_display_backend_radar_quality_id(
+    const e84_display_snapshot_t *snapshot);
+static void app_display_backend_print_final_audit(
+    const e84_display_snapshot_t *snapshot,
+    uint32_t now_ms,
+    const char *path,
+    const char *source,
+    const char *scenario,
+    bool rr_live,
+    bool hr_live,
+    bool distance_live);
+
+static void app_display_backend_print_final_mock_screen(
+    const e84_display_view_model_t *view,
+    uint32_t now_ms)
+{
+    const e84_display_snapshot_t *snapshot = &view->snapshot;
+    bool radar_normal =
+        (E84_DISPLAY_RADAR_SOURCE_NORMAL == snapshot->radar_source_state);
+    bool rr_valid =
+        (0u != (snapshot->flags & E84_DISPLAY_FLAG_RR_VALID));
+    bool hr_valid =
+        (0u != (snapshot->flags & E84_DISPLAY_FLAG_HR_VALID));
+#if (APP_DISPLAY_FINAL_MOCK_ENABLE)
+    const char *path = "APP_DISPLAY_ENABLE+APP_DISPLAY_FINAL_MOCK_ENABLE";
+    const char *source = "mock";
+#else
+    const char *path =
+        "APP_DISPLAY_ENABLE+APP_DISPLAY_PRODUCT_SCREEN_ENABLE";
+    const char *source = "summary_adapter";
+#endif
+
+    const char *scenario = app_display_backend_mock_scenario(snapshot);
+    bool distance_live = radar_normal && (snapshot->distance_cm > 0u);
+
+    printf("[DISPLAY_FINAL_SCREEN] t_ms=%lu path=%s source=%s scenario=%s "
+           "radar_src=%s\r\n",
+           (unsigned long)now_ms,
+           path,
+           source,
+           scenario,
+           e84_display_radar_source_state_name(
+               snapshot->radar_source_state));
+    printf("================================================\r\n");
+    printf("  E84 夜间呼吸与咳嗽健康伴侣\r\n");
+    printf("------------------------------------------------\r\n");
+    printf("  状态: %s | 数据源: %s\r\n",
+           app_display_backend_main_status_text(snapshot),
+           app_display_backend_radar_source_label(
+               snapshot->radar_source_state));
+    printf("------------------------------------------------\r\n");
+    printf("  雷达\r\n");
+    printf("    来源: %s\r\n",
+           app_display_backend_radar_source_label(
+               snapshot->radar_source_state));
+    printf("    人体: %s\r\n",
+           app_display_backend_radar_presence_text(snapshot));
+    printf("    呼吸率: ");
+    if (radar_normal && rr_valid)
+    {
+        app_display_backend_print_float_3(snapshot->breath_rate_bpm);
+        printf(" bpm\r\n");
+    }
+    else
+    {
+        printf("N/A\r\n");
+    }
+    printf("    心率: ");
+    if (radar_normal && hr_valid)
+    {
+        app_display_backend_print_float_3(snapshot->heart_rate_bpm);
+        printf(" bpm\r\n");
+    }
+    else
+    {
+        printf("N/A\r\n");
+    }
+    printf("    距离: ");
+    if (distance_live)
+    {
+        app_display_backend_print_float_3(
+            ((float)snapshot->distance_cm) / 100.0f);
+        printf(" m\r\n");
+    }
+    else
+    {
+        printf("N/A\r\n");
+    }
+    printf("    质量: %s\r\n",
+           app_display_backend_radar_quality_label(snapshot));
+    printf("------------------------------------------------\r\n");
+    printf("  咳嗽模型\r\n");
+    printf("    状态: 模型未验证 / Not Verified\r\n");
+    printf("    说明: 模型未完成板级验证\r\n");
+    printf("------------------------------------------------\r\n");
+    printf("  用于趋势观察与竞赛演示，不作为医学诊断\r\n");
+    printf("================================================\r\n");
+    app_display_backend_print_final_audit(snapshot,
+                                          now_ms,
+                                          path,
+                                          source,
+                                          scenario,
+                                          radar_normal && rr_valid,
+                                          radar_normal && hr_valid,
+                                          distance_live);
+}
+
+static const char *app_display_backend_main_status_text(
+    const e84_display_snapshot_t *snapshot)
+{
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return "监测中";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "数据暂不可用";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "雷达数据超时";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "信号较差";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "数据无效";
+
+        default:
+            return "Not Verified";
+    }
+}
+
+static const char *app_display_backend_mock_scenario(
+    const e84_display_snapshot_t *snapshot)
+{
+    if (NULL == snapshot)
+    {
+        return "unknown";
+    }
+
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "radar_unavailable";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "radar_stale";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "radar_invalid";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "radar_low_quality";
+
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+        default:
+            break;
+    }
+
+    switch (snapshot->health_state)
+    {
+        case E84_DISPLAY_HEALTH_NORMAL:
+            return "real_radar_valid";
+
+        case E84_DISPLAY_HEALTH_ATTENTION:
+            return "attention";
+
+        case E84_DISPLAY_HEALTH_WARNING:
+            return "warning";
+
+        default:
+            return "other";
+    }
+}
+
+static const char *app_display_backend_radar_source_label(
+    e84_display_radar_source_state_t state)
+{
+    switch (state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return "真实雷达联调";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "雷达未连接";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "雷达数据超时";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "数据无效";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "雷达信号较差";
+
+        default:
+            return "Not Verified";
+    }
+}
+
+static const char *app_display_backend_radar_presence_text(
+    const e84_display_snapshot_t *snapshot)
+{
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return snapshot->radar_presence ? "有人" : "未检测到";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "暂无数据";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "数据超时";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "未验证";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "信号较差";
+
+        default:
+            return "Not Verified";
+    }
+}
+
+static const char *app_display_backend_radar_quality_label(
+    const e84_display_snapshot_t *snapshot)
+{
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return (snapshot->radar_quality >= 35u) ? "良好" : "信号较差";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "Not Verified";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "Not Verified";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "Not Verified";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "信号较差";
+
+        default:
+            return "Not Verified";
+    }
+}
+
+static void app_display_backend_print_final_audit(
+    const e84_display_snapshot_t *snapshot,
+    uint32_t now_ms,
+    const char *path,
+    const char *source,
+    const char *scenario,
+    bool rr_live,
+    bool hr_live,
+    bool distance_live)
+{
+    printf("[DISPLAY_FINAL_AUDIT] t_ms=%lu path=%s source=%s scenario=%s "
+           "radar_src=%s source_id=%s presence_id=%s rr=%s hr=%s dist=%s "
+           "rr_milli=%ld hr_milli=%ld distance_cm=%u quality_id=%s "
+           "cough_not_verified=1 disclaimer=1\r\n",
+           (unsigned long)now_ms,
+           path,
+           source,
+           scenario,
+           e84_display_radar_source_state_name(
+               snapshot->radar_source_state),
+           app_display_backend_radar_source_id(
+               snapshot->radar_source_state),
+           app_display_backend_radar_presence_id(snapshot),
+           rr_live ? "live" : "NA",
+           hr_live ? "live" : "NA",
+           distance_live ? "live" : "NA",
+           rr_live ? (long)(snapshot->breath_rate_bpm * 1000.0f) : -1L,
+           hr_live ? (long)(snapshot->heart_rate_bpm * 1000.0f) : -1L,
+           distance_live ? (unsigned int)snapshot->distance_cm : 0u,
+           app_display_backend_radar_quality_id(snapshot));
+}
+
+static const char *app_display_backend_radar_source_id(
+    e84_display_radar_source_state_t state)
+{
+    switch (state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return "real_radar_joint";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "radar_unavailable";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "radar_stale";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "radar_invalid";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "radar_low_quality";
+
+        default:
+            return "not_verified";
+    }
+}
+
+static const char *app_display_backend_radar_presence_id(
+    const e84_display_snapshot_t *snapshot)
+{
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return snapshot->radar_presence ? "person_present" :
+                                              "not_detected";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+            return "no_data";
+
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+            return "timeout";
+
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+            return "not_verified";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "low_quality";
+
+        default:
+            return "not_verified";
+    }
+}
+
+static const char *app_display_backend_radar_quality_id(
+    const e84_display_snapshot_t *snapshot)
+{
+    switch (snapshot->radar_source_state)
+    {
+        case E84_DISPLAY_RADAR_SOURCE_NORMAL:
+            return (snapshot->radar_quality >= 35u) ? "good" :
+                                                      "low_quality";
+
+        case E84_DISPLAY_RADAR_SOURCE_LOW_QUALITY:
+            return "low_quality";
+
+        case E84_DISPLAY_RADAR_SOURCE_UNAVAILABLE:
+        case E84_DISPLAY_RADAR_SOURCE_STALE:
+        case E84_DISPLAY_RADAR_SOURCE_INVALID:
+        default:
+            return "not_verified";
+    }
+}
+
+#endif /* APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE */
 
 #endif /* APP_DISPLAY_ENABLE */

@@ -58,8 +58,33 @@ typedef enum
     APP_MONITOR_EVENT_ALERT_CHANGED,
     APP_MONITOR_EVENT_SOURCE_CHANGED,
     APP_MONITOR_EVENT_AUDIO_CANDIDATE,
+    APP_MONITOR_EVENT_COUGH_BURST,
+    APP_MONITOR_EVENT_VITALS_ATTENTION,
     APP_MONITOR_EVENT_SYSTEM_STATUS
 } app_monitor_event_type_t;
+
+typedef enum
+{
+    APP_MONITOR_PRESENCE_UNKNOWN = 0,
+    APP_MONITOR_PRESENCE_ABSENT,
+    APP_MONITOR_PRESENCE_PRESENT
+} app_monitor_presence_state_t;
+
+typedef enum
+{
+    APP_MONITOR_MOTION_UNKNOWN = 0,
+    APP_MONITOR_MOTION_LOW,
+    APP_MONITOR_MOTION_HIGH
+} app_monitor_motion_state_t;
+
+typedef enum
+{
+    APP_MONITOR_VITAL_UNKNOWN = 0,
+    APP_MONITOR_VITAL_NORMAL,
+    APP_MONITOR_VITAL_LOW,
+    APP_MONITOR_VITAL_HIGH,
+    APP_MONITOR_VITAL_INVALID
+} app_monitor_vital_state_t;
 
 #define APP_MONITOR_SOURCE_AUDIO             (1UL << 0)
 #define APP_MONITOR_SOURCE_RADAR             (1UL << 1)
@@ -67,6 +92,10 @@ typedef enum
 #define APP_MONITOR_SOURCE_MODEL_SHARED      (1UL << 3)
 #define APP_MONITOR_SOURCE_BLE               (1UL << 4)
 #define APP_MONITOR_SOURCE_FUSION_SUMMARY    (1UL << 5)
+
+#define APP_MONITOR_SNAPSHOT_FLAG_MOCK_DATA        (1UL << 0)
+#define APP_MONITOR_SNAPSHOT_FLAG_PARTIAL_REAL_DATA (1UL << 1)
+#define APP_MONITOR_SNAPSHOT_FLAG_CONSUMER_PROJECTED (1UL << 2)
 
 #define APP_MONITOR_REASON_AUDIO_RESULT_READY     (1UL << 0)
 #define APP_MONITOR_REASON_AUDIO_COUGH_CANDIDATE  (1UL << 1)
@@ -77,10 +106,19 @@ typedef enum
 
 #define APP_MONITOR_REASON_RADAR_UNAVAILABLE      (1UL << 8)
 #define APP_MONITOR_REASON_RADAR_API_INACTIVE     (1UL << 9)
+#define APP_MONITOR_REASON_RADAR_PRESENT          (1UL << 10)
+#define APP_MONITOR_REASON_RADAR_NO_TARGET        (1UL << 11)
+#define APP_MONITOR_REASON_RADAR_MOTION_HIGH      (1UL << 12)
+#define APP_MONITOR_REASON_RADAR_VITALS_ATTENTION (1UL << 13)
+#define APP_MONITOR_REASON_RADAR_STALE            (1UL << 14)
+#define APP_MONITOR_REASON_RADAR_QUALITY_POOR     (1UL << 15)
 
 #define APP_MONITOR_REASON_FUSION_AUDIO_ONLY      (1UL << 16)
 #define APP_MONITOR_REASON_FUSION_RADAR_ABSENT    (1UL << 17)
 #define APP_MONITOR_REASON_FUSION_DEGRADED        (1UL << 18)
+#define APP_MONITOR_REASON_FUSION_RADAR_SUPPORT   (1UL << 19)
+#define APP_MONITOR_REASON_FUSION_VITALS_ATTENTION (1UL << 20)
+#define APP_MONITOR_REASON_FUSION_EVENT_ACTIVE    (1UL << 21)
 
 #define APP_MONITOR_REASON_DEVICE_MONITOR_OFF     (1UL << 24)
 #define APP_MONITOR_REASON_DEVICE_MODEL_NOT_READY (1UL << 25)
@@ -114,7 +152,9 @@ typedef struct
     uint8_t presence_state;
     uint8_t motion_state;
     uint8_t breath_state;
+    uint8_t heart_state;
     uint8_t radar_quality;
+    uint8_t motion_x100;
     uint16_t rr_bpm_x10;
     uint16_t hr_bpm_x10;
     uint16_t distance_cm;
@@ -153,6 +193,9 @@ typedef struct
     uint8_t fusion_confidence;
     uint16_t cough_count_1min;
     uint16_t cough_count_5min;
+    app_monitor_event_type_t active_event_type;
+    uint32_t event_count_total;
+    uint32_t cough_event_count_total;
     uint32_t last_event_id;
     uint32_t flags;
 } app_monitor_summary_snapshot_t;
@@ -169,7 +212,11 @@ typedef struct
     uint32_t source_valid_mask;
     uint32_t source_stale_mask;
     uint32_t source_error_mask;
+    uint32_t source_flags;
     uint8_t confidence;
+    uint8_t cough_prob_x100;
+    uint16_t cough_count_1min;
+    uint16_t cough_count_5min;
     uint32_t duration_ms;
 } app_monitor_summary_event_t;
 

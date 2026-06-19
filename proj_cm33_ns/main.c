@@ -42,9 +42,12 @@
 #include "app_get_data.h"
 #include "app_audio_preprocess.h"
 #include "app_model_result_monitor.h"
+#include "app_model_ipc_smoke.h"
 #include "app_uart_radar.h"
+#include "app_radar_bridge.h"
 #include "app_csv_export.h"
 #include "app_ble_config.h"
+#include "app_monitor_summary.h"
 #if (APP_BLE_ENABLE)
 #include "app_ble_stream.h"
 #endif
@@ -56,6 +59,7 @@
 #include "task.h"
 
 #include <stdio.h>
+#include <string.h>
 
 /* The timeout value in microsecond used to wait for core to be booted. */
 #define CM55_BOOT_WAIT_TIME_USEC          (10u)
@@ -114,6 +118,22 @@
 #define APP_MODEL_RESULT_MONITOR_ENABLE   (1u)
 #endif
 
+#ifndef APP_UART_SANITY_TEST_ENABLE
+#define APP_UART_SANITY_TEST_ENABLE       (0u)
+#endif
+
+#ifndef APP_UART_SANITY_OUTPUT_METHOD
+#define APP_UART_SANITY_OUTPUT_METHOD     (1u)
+#endif
+
+#ifndef APP_UART_SANITY_LINE_DELAY_MS
+#define APP_UART_SANITY_LINE_DELAY_MS     (10u)
+#endif
+
+#define APP_UART_SANITY_METHOD_PRINTF     (0u)
+#define APP_UART_SANITY_METHOD_BLOCKING   (1u)
+#define APP_UART_SANITY_LINE_COUNT        (100u)
+
 /* BLE bring-up 调试开关。
  * 0：正常运行现有音频前处理 + CM55 推理链路；
  * 1：临时暂停 AUDIO_PREPROCESS 模式下的 PDM、音频前处理、结果监控和 CM55 boot，
@@ -131,6 +151,14 @@
  */
 #ifndef APP_DISPLAY_ENABLE
 #define APP_DISPLAY_ENABLE                (0u)
+#endif
+
+#ifndef APP_DISPLAY_LCD_ENABLE
+#define APP_DISPLAY_LCD_ENABLE            (0u)
+#endif
+
+#ifndef APP_DISPLAY_LCD_SMOKE_ONLY
+#define APP_DISPLAY_LCD_SMOKE_ONLY        (0u)
 #endif
 
 #if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
@@ -154,11 +182,57 @@
 #error "Unsupported APP_DISPLAY_ENABLE"
 #endif
 
+#if ((APP_MONITOR_SUMMARY_ENABLE != 0u) && \
+     (APP_MONITOR_SUMMARY_ENABLE != 1u))
+#error "Unsupported APP_MONITOR_SUMMARY_ENABLE"
+#endif
+
 /* 编译期限制 Debug UART 只使用已经计算并验证过 divider 的速率。 */
 #if ((APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_115200) && \
+     (APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_230400) && \
+     (APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_460800) && \
+     (APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_921600) && \
      (APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_2000000))
 #error "Unsupported APP_DEBUG_UART_BAUD_RATE"
 #endif
+
+#if ((APP_UART_SANITY_TEST_ENABLE != 0u) && \
+     (APP_UART_SANITY_TEST_ENABLE != 1u))
+#error "Unsupported APP_UART_SANITY_TEST_ENABLE"
+#endif
+
+#if ((APP_UART_SANITY_OUTPUT_METHOD != APP_UART_SANITY_METHOD_PRINTF) && \
+     (APP_UART_SANITY_OUTPUT_METHOD != APP_UART_SANITY_METHOD_BLOCKING))
+#error "Unsupported APP_UART_SANITY_OUTPUT_METHOD"
+#endif
+
+static void app_uart_sanity_run(void)
+{
+    char line[32];
+    uint32_t sequence;
+
+    for (sequence = 0u; sequence < APP_UART_SANITY_LINE_COUNT; ++sequence)
+    {
+        int length = snprintf(line,
+                              sizeof(line),
+                              "[UART_SANITY] seq=%03lu\r\n",
+                              (unsigned long)sequence);
+
+        if ((length <= 0) || ((size_t)length >= sizeof(line)))
+        {
+            handle_app_error(CY_RSLT_TYPE_ERROR);
+        }
+
+#if (APP_UART_SANITY_OUTPUT_METHOD == APP_UART_SANITY_METHOD_BLOCKING)
+        retarget_io_write_blocking((const uint8_t *)line, (uint32_t)length);
+#else
+        printf("%s", line);
+        fflush(stdout);
+#endif
+
+        Cy_SysLib_Delay(APP_UART_SANITY_LINE_DELAY_MS);
+    }
+}
 
 int main(void)
 {
@@ -174,11 +248,48 @@ int main(void)
      * 模式可以共用同一套 printf/retarget-io 初始化代码。
      */
     init_retarget_io(APP_DEBUG_UART_BAUD_RATE);
+
+#if (APP_UART_SANITY_TEST_ENABLE)
+    app_uart_sanity_run();
+    for (;;)
+    {
+        Cy_SysLib_Delay(1000u);
+    }
+#endif
+
+    app_model_ipc_smoke_log_init();
     printf("[BOOT] CM33 alive, mode=%lu, uart_baud=%lu, shared_ver=%lu\r\n",
            (unsigned long)APP_RUNTIME_MODE,
            (unsigned long)APP_DEBUG_UART_BAUD_RATE,
            (unsigned long)APP_MODEL_SHARED_VERSION);
     fflush(stdout);
+
+    /* CM33_NS is the sole app-model shared boot/reset owner. This must finish
+     * before any task is created and before CM55 is released.
+     */
+    result = app_model_shared_boot_init_cm33_owner();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] app-model shared boot owner failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+
+#if (APP_MONITOR_SUMMARY_ENABLE)
+    result = app_monitor_summary_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] monitor summary init failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+    printf("[BOOT] monitor summary owner ready, mock=%lu, ring=%lu\r\n",
+           (unsigned long)APP_MONITOR_SUMMARY_MOCK_ENABLE,
+           (unsigned long)APP_MONITOR_SUMMARY_EVENT_RING_SIZE);
+    fflush(stdout);
+#endif
 
 #if (APP_DISPLAY_ENABLE)
     result = app_display_init();
@@ -198,8 +309,13 @@ int main(void)
         fflush(stdout);
     }
     handle_app_error(result);
-    printf("[BOOT] display task created, backend=null, smoke=%lu\r\n",
-           (unsigned long)APP_DISPLAY_SMOKE_ENABLE);
+    printf("[BOOT] display backend=%s lcd=%lu\r\n",
+#if (APP_DISPLAY_LCD_ENABLE)
+           "lcd",
+#else
+           "null",
+#endif
+           (unsigned long)APP_DISPLAY_LCD_ENABLE);
     fflush(stdout);
 #endif
 
@@ -267,6 +383,23 @@ int main(void)
     printf("[BOOT] model result monitor task created\r\n");
     fflush(stdout);
 #endif
+
+#if (APP_RADAR_BRIDGE_ENABLE)
+    /* Real radar bridge profile: start radar parser and bridge task.
+     * Bridge is the sole consumer of the radar queue.
+     * Test decoder MUST be disabled (APP_UART_RADAR_TEST_ENABLE=0).
+     */
+    result = app_uart_radar_task_init();
+    handle_app_error(result);
+    printf("[BOOT] radar parser task created (bridge profile)\r\n");
+    fflush(stdout);
+
+    result = app_radar_bridge_init();
+    handle_app_error(result);
+    printf("[BOOT] radar bridge task created\r\n");
+    fflush(stdout);
+#endif
+
 #elif (APP_RUNTIME_MODE == APP_RUNTIME_MODE_CSV_EXPORT)
     /* 训练/采集数据模式：CSV 导出任务按 APP_CSV_EXPORT_CAPTURE_MODE 消费 MIC
      * 和/或雷达队列，并通过 debug UART 输出带 device 标签的数据流。该模式用于

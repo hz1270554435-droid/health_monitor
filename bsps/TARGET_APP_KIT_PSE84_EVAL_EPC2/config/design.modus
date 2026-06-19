@@ -2036,7 +2036,7 @@
                         <Param id="privileged2" value="false"/>
                         <Param id="privileged3" value="false"/>
                         <Param id="shareable1" value="false"/>
-                        <Param id="shareable2" value="false"/>
+                        <Param id="shareable2" value="true"/>
                         <Param id="shareable3" value="false"/>
                         <Param id="size1" value="0x00003000"/>
                         <Param id="size2" value="0x00040000"/>

@@ -69,25 +69,50 @@ D:\cough_model_train\DATA\board_live_v3_2_recall_fix_YYYYMMDD
 
 v3.2 recall-fix 当前只需要 MIC 数据，优先使用 CSV_EXPORT audio-only 固件。
 
-在顶层工作区构建：
+先在顶层工作区加载 ModusToolbox 环境：
 
 ```powershell
 Set-Location D:\e84_health_monitor
 . .\tools\enter_mtb_env.ps1
-make firmware-csv-audio
 ```
 
-如果板子还没有烧录这个构建，再手动烧录：
+本批默认使用 MIC-only 数据导出，推荐构建并烧录：
 
 ```powershell
-make -C firmware program
+make firmware-csv-audio
+make -C firmware program APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=0
+```
+
+如果你直接在 `firmware/` 根目录操作，等价命令是：
+
+```powershell
+Set-Location D:\e84_health_monitor\firmware
+make build APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=0
+make program APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=0
+```
+
+只有在明确需要同步 MIC + radar 数据时，才改用：
+
+```powershell
+Set-Location D:\e84_health_monitor
+. .\tools\enter_mtb_env.ps1
+make firmware-csv-audio-radar
+make -C firmware program APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=1
 ```
 
 说明：
 
+- `APP_RUNTIME_MODE=1` 表示进入 `CSV_EXPORT` 运行模式。
+- `APP_CSV_EXPORT_CAPTURE_MODE=0/1/2` 分别对应 `audio-only` /
+  `audio+radar` / `radar-only`。
 - `make firmware-csv-audio` 对应 `APP_RUNTIME_MODE=1` 和
   `APP_CSV_EXPORT_CAPTURE_MODE=0`。
-- Debug UART 波特率使用 `2000000`。
+- `make firmware-csv-audio-radar` 对应 `APP_RUNTIME_MODE=1` 和
+  `APP_CSV_EXPORT_CAPTURE_MODE=1`。
+- 当前调试宏下，`CSV_EXPORT` 模式会自动把 `APP_DEBUG_UART_BAUD_RATE`
+  设为 `2000000`；普通前处理/自检模式默认仍是 `115200`。
+- 当前导出宏默认启用 `APP_CSV_EXPORT_MIC_BINARY_ENABLE=1`，所以 MIC
+  数据应以 `PCMB` 二进制 PCM block 形式输出，不需要额外开关。
 - 本批数据默认不要用 audio+radar，因为 radar 文本流会增加高频 MIC
   采集干扰风险。只有明确要采同步 fusion/radar 数据时才用
   `make firmware-csv-audio-radar`。
@@ -167,15 +192,15 @@ $DataRoot\train_candidate\sessions\audio\session_0001_..._audio.json
 
 ```powershell
 python firmware\tools\capture_csv.py `
-  --port $Port `
+  --port COM4 `
   --baud 2000000 `
-  --duration <采集秒数> `
-  --output-dir "<输出子集目录>" `
+  --duration 0 `
+  --output-dir "$DataRoot\train_candidate_5.29" `
   --session-output-dir sessions `
-  --audio-session-sec <每个session秒数> `
+  --audio-session-sec 60 `
   --person-id p01 `
-  --scene "<场景名>" `
-  --distance-cm <距离cm> `
+  --scene "cough" `
+  --distance-cm 40 `
   --audio-fs 16000 `
   --audio-channels 1 `
   --audio-mix-mode select-best
@@ -206,7 +231,7 @@ python firmware\tools\capture_csv.py `
 
 ```powershell
 Set-Location D:\e84_health_monitor
-$Port = "COM7"
+$Port = "COM4"
 $Date = Get-Date -Format yyyyMMdd
 $DataRoot = "D:\cough_model_train\DATA\board_live_v3_2_recall_fix_$Date"
 ```
@@ -215,14 +240,14 @@ $DataRoot = "D:\cough_model_train\DATA\board_live_v3_2_recall_fix_$Date"
 
 ```powershell
 python firmware\tools\capture_csv.py `
-  --port $Port `
+  --port COM4 `
   --baud 2000000 `
-  --duration 90 `
-  --output-dir "$DataRoot\train_candidate" `
+  --duration 0 `
+  --output-dir "D:\cough_model_train\DATA\board_live_v3_2_recall_fix\train_candidate2026.5.29" `
   --session-output-dir sessions `
   --audio-session-sec 60 `
   --person-id p01 `
-  --scene "cough_40cm_front_normal" `
+  --scene "background" `
   --distance-cm 40 `
   --audio-fs 16000 `
   --audio-channels 1 `
@@ -564,9 +589,22 @@ ml\data\labels\audio_labels_v3_1_fpfix_train.csv
 
 没有 `PCMB` 数据：
 
-1. 多半是串口选错或固件不是 CSV_EXPORT audio-only。
-2. 重新运行 `make firmware-csv-audio`，必要时 `make -C firmware program`。
-3. 重新采一段 10 秒短样本验证。
+1. 多半是串口选错，或烧录镜像不是 `APP_RUNTIME_MODE=1`
+   `APP_CSV_EXPORT_CAPTURE_MODE=0` 的 CSV_EXPORT audio-only 固件。
+2. 重新运行 `make firmware-csv-audio`，并显式烧录：
+
+```powershell
+make -C firmware program APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=0
+```
+
+1. 如果你是从 `firmware/` 根目录直接操作，则用：
+
+```powershell
+make program APP_RUNTIME_MODE=1 APP_CSV_EXPORT_CAPTURE_MODE=0
+```
+
+1. 确认本地没有额外覆盖 `APP_CSV_EXPORT_MIC_BINARY_ENABLE=0`。
+2. 重新采一段 10 秒短样本验证。
 
 WAV 太短或静音：
 

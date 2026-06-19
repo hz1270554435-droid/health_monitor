@@ -45,8 +45,17 @@
 #include "cybsp.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include <stdio.h>
 
+#ifndef APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE
+#define APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE (0u)
+#endif
+
+#if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
+#include "app_cm55_display_bringup.h"
+#else
 #include "app_model_inference.h"
+#endif
 
 /*******************************************************************************
 * Function Name: main
@@ -80,7 +89,17 @@ int main(void)
     /* Enable global interrupts */
     __enable_irq();
 
+    /* Note: UART is initialized by CM33. CM55 printf shares the same UART. */
+
+#if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
+    /* CM55 display bring-up mode: run display instead of inference */
+    printf("[CM55_BOOT] display_bringup_enable=1 inference_disabled=1\r\n");
+    fflush(stdout);
+    result = app_cm55_display_bringup_init();
+#else
+    /* Normal mode: CM55 runs ML inference */
     result = app_model_inference_task_init();
+#endif
     if (CY_RSLT_SUCCESS != result)
     {
         CY_ASSERT(0);
