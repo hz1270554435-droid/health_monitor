@@ -112,6 +112,14 @@ static void app_display_lcd_backlight_smoke_tick(uint32_t now_ms);
 #endif
 #endif
 
+#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE
+#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
+#endif
+
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+#include "app_display_cm55_bridge.h"
+#endif
+
 cy_rslt_t app_display_init(void)
 {
     cy_rslt_t result;
@@ -133,6 +141,23 @@ cy_rslt_t app_display_init(void)
     {
         return CY_RSLT_TYPE_ERROR;
     }
+
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+    {
+        cy_rslt_t bridge_result = app_display_cm55_bridge_init();
+        if (CY_RSLT_SUCCESS != bridge_result)
+        {
+            printf("[DISPLAY_BRIDGE] init failed, result=0x%08lx\r\n",
+                   (unsigned long)bridge_result);
+            fflush(stdout);
+        }
+        else
+        {
+            printf("[DISPLAY_BRIDGE] init=ok\r\n");
+            fflush(stdout);
+        }
+    }
+#endif
 
 #if (APP_DISPLAY_LCD_ENABLE)
     printf("[DISPLAY_BACKEND_SELECT] backend=lcd\r\n");

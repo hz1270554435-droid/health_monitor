@@ -5,6 +5,14 @@
 #if (APP_DISPLAY_ENABLE && APP_DISPLAY_SUMMARY_ENABLE && \
      !APP_DISPLAY_SMOKE_ENABLE && !APP_DISPLAY_FINAL_MOCK_ENABLE)
 
+#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE
+#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
+#endif
+
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+#include "app_display_cm55_bridge.h"
+#endif
+
 #include <stdbool.h>
 #include <string.h>
 
@@ -85,6 +93,9 @@ cy_rslt_t app_display_summary_adapter_tick(uint32_t now_ms)
         app_display_summary_build_from_monitor(&snapshot, &summary, now_ms);
         summary_last_publish_ms = now_ms;
         (void)app_display_publish_snapshot(&snapshot);
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+        (void)app_display_cm55_bridge_publish(&snapshot);
+#endif
         app_display_summary_publish_monitor_event(&summary);
         return CY_RSLT_SUCCESS;
     }
@@ -96,6 +107,9 @@ cy_rslt_t app_display_summary_adapter_tick(uint32_t now_ms)
         app_model_result_monitor_get_stats(&model_stats);
         app_display_summary_build_snapshot(&snapshot, &model_stats, now_ms);
         summary_last_publish_ms = now_ms;
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+        (void)app_display_cm55_bridge_publish(&snapshot);
+#endif
         return app_display_publish_snapshot(&snapshot);
     }
 #endif

@@ -338,6 +338,53 @@
                         <Alias value="CYBSP_IMU_INT1"/>
                     </Aliases>
                 </Block>
+                <Personality template="gfxss" version="1.0" instance="Gtvjjhqsj-g">
+                    <Block location="gfxss[0]" locked="true"/>
+                    <Parameters>
+                        <Param id="display_height" value="480"/>
+                        <Param id="display_type" value="GFX_DISP_TYPE_DSI_DPI"/>
+                        <Param id="display_width" value="832"/>
+                        <Param id="format" value="vivD24"/>
+                        <Param id="fps" value="60"/>
+                        <Param id="gpu_enabled" value="true"/>
+                        <Param id="hbp" value="20"/>
+                        <Param id="hfp" value="210"/>
+                        <Param id="hsync_width" value="10"/>
+                        <Param id="layer0_enabled" value="true"/>
+                        <Param id="layer0_format" value="vivRGB565"/>
+                        <Param id="layer0_height" value="480"/>
+                        <Param id="layer0_pos_x" value="0"/>
+                        <Param id="layer0_pos_y" value="0"/>
+                        <Param id="layer0_visibility" value="true"/>
+                        <Param id="layer0_width" value="832"/>
+                        <Param id="layer0_zorder" value="0"/>
+                        <Param id="layer1_enabled" value="false"/>
+                        <Param id="layer1_format" value="vivRGB565"/>
+                        <Param id="layer1_height" value="1"/>
+                        <Param id="layer1_pos_x" value="0"/>
+                        <Param id="layer1_pos_y" value="0"/>
+                        <Param id="layer1_visibility" value="true"/>
+                        <Param id="layer1_width" value="1"/>
+                        <Param id="layer1_zorder" value="0"/>
+                        <Param id="layer2_enabled" value="false"/>
+                        <Param id="layer2_format" value="vivRGB565"/>
+                        <Param id="layer2_height" value="1"/>
+                        <Param id="layer2_pos_x" value="0"/>
+                        <Param id="layer2_pos_y" value="0"/>
+                        <Param id="layer2_visibility" value="true"/>
+                        <Param id="layer2_width" value="1"/>
+                        <Param id="layer2_zorder" value="0"/>
+                        <Param id="lp_mode_cmd_transfer" value="true"/>
+                        <Param id="lp_mode_video_transfer" value="true"/>
+                        <Param id="max_per_lane_Mbps" value="850"/>
+                        <Param id="mode_flags" value="VID_MODE_TYPE_BURST"/>
+                        <Param id="no_of_dsi_lines" value="1"/>
+                        <Param id="use_max_per_lane_Mbps" value="true"/>
+                        <Param id="vbp" value="20"/>
+                        <Param id="vfp" value="20"/>
+                        <Param id="vsync_width" value="5"/>
+                    </Parameters>
+                </Personality>
                 <Personality template="mxi3c" version="1.0" instance="ckbUNHh80qA">
                     <Block location="i3c[0]" locked="true">
                         <Aliases>
@@ -2471,7 +2518,7 @@
                         </Aliases>
                     </Block>
                     <Parameters>
-                        <Param id="intDivider" value="10"/>
+                        <Param id="intDivider" value="32"/>
                         <Param id="startOnReset" value="true"/>
                     </Parameters>
                 </Personality>
@@ -2648,7 +2695,7 @@
                     <Parameters>
                         <Param id="AcceptAddress" value="false"/>
                         <Param id="AcceptGeneralCall" value="false"/>
-                        <Param id="DataRate" value="400"/>
+                        <Param id="DataRate" value="100"/>
                         <Param id="EnableRxFifo" value="true"/>
                         <Param id="EnableTxFifo" value="true"/>
                         <Param id="EnableWakeup" value="false"/>
@@ -3914,6 +3961,10 @@
             </BlockConfig>
             <Netlist>
                 <Net>
+                    <Port name="gfxss[0].clk_ref_mipidsi[0]"/>
+                    <Port name="srss[0].clock[0].hfclk[12].root_clk[0]"/>
+                </Net>
+                <Net>
                     <Port name="i3c[0].clock_i3c_en[0]"/>
                     <Port name="peri[0].group[9].div_8[0].clk[0]"/>
                 </Net>
@@ -4261,6 +4312,7 @@
                     <Port name="srss[0].clock[0].hfclk[0].root_clk[0]"/>
                 </Net>
                 <Net>
+                    <Port name="gfxss[0].clk_hf[0]"/>
                     <Port name="peri[1].mmio[0].clk_pclk_root[0]"/>
                     <Port name="peri[1].mmio[0].clk_pclk_root[1]"/>
                     <Port name="peri[1].mmio[0].clk_pclk_root[2]"/>

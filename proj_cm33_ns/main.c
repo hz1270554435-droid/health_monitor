@@ -55,6 +55,7 @@
 #include "app_display.h"
 #endif
 #include "retarget_io_init.h"
+#include "app_display_diag.h"
 #include "FreeRTOS.h"
 #include "task.h"
 
@@ -143,6 +144,34 @@
 #define APP_BLE_DEBUG_DISABLE_INFERENCE   (0u)
 #endif
 
+#ifndef APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE
+#define APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE (0u)
+#endif
+
+#ifndef APP_CM55_INFERENCE_ENABLE
+#define APP_CM55_INFERENCE_ENABLE         (1u)
+#endif
+
+#ifndef APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE
+#define APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE
+#define APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_DIAG_ENABLE
+#define APP_DISPLAY_DIAG_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_CM33_DIAG_POLL_ENABLE
+#define APP_DISPLAY_CM33_DIAG_POLL_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
+#define APP_DISPLAY_CM55_UART_LOG_ENABLE (1u)
+#endif
+
 /* Optional Display/UI layer.
  * Default off. When enabled, Stage 1 starts a low-priority null backend task
  * that logs display snapshots/alerts only; it does not initialize real display
@@ -177,6 +206,41 @@
 #error "Unsupported APP_BLE_DEBUG_DISABLE_INFERENCE"
 #endif
 
+#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE != 0u) && \
+     (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE"
+#endif
+
+#if ((APP_CM55_INFERENCE_ENABLE != 0u) && \
+     (APP_CM55_INFERENCE_ENABLE != 1u))
+#error "Unsupported APP_CM55_INFERENCE_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE != 0u) && \
+     (APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE != 0u) && \
+     (APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_DIAG_ENABLE != 0u) && \
+     (APP_DISPLAY_DIAG_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_DIAG_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_CM33_DIAG_POLL_ENABLE != 0u) && \
+     (APP_DISPLAY_CM33_DIAG_POLL_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_CM33_DIAG_POLL_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_CM55_UART_LOG_ENABLE != 0u) && \
+     (APP_DISPLAY_CM55_UART_LOG_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_CM55_UART_LOG_ENABLE"
+#endif
+
 #if ((APP_DISPLAY_ENABLE != 0u) && \
      (APP_DISPLAY_ENABLE != 1u))
 #error "Unsupported APP_DISPLAY_ENABLE"
@@ -206,6 +270,7 @@
 #error "Unsupported APP_UART_SANITY_OUTPUT_METHOD"
 #endif
 
+#if (APP_UART_SANITY_TEST_ENABLE)
 static void app_uart_sanity_run(void)
 {
     char line[32];
@@ -233,6 +298,7 @@ static void app_uart_sanity_run(void)
         Cy_SysLib_Delay(APP_UART_SANITY_LINE_DELAY_MS);
     }
 }
+#endif
 
 int main(void)
 {
@@ -242,6 +308,89 @@ int main(void)
     handle_app_error(result);
 
     __enable_irq();
+
+#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE) && \
+     (!APP_CM55_INFERENCE_ENABLE))
+    /* Display-only proof mode mirrors the official LVGL demo launcher:
+     * CM33_NS releases CM55 and stays out of UART, shared memory, audio, radar,
+     * BLE, and local display paths. Optional launcher UART is diagnostic-only.
+     */
+#if (APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE)
+    init_retarget_io(APP_DEBUG_UART_BAUD_RATE);
+    printf("[CM33_DISPLAY_ONLY] launcher_start baud=%lu cm55_addr=0x%08lx\r\n",
+           (unsigned long)APP_DEBUG_UART_BAUD_RATE,
+           (unsigned long)CM55_APP_BOOT_ADDR);
+    fflush(stdout);
+#endif
+
+#if (APP_DISPLAY_DIAG_ENABLE)
+    app_display_diag_reset();
+    app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM33_LAUNCHER_START,
+                          0u,
+                          (uint32_t)__LINE__,
+                          0u);
+#if (APP_DISPLAY_CM33_DIAG_POLL_ENABLE)
+    init_retarget_io(APP_DEBUG_UART_BAUD_RATE);
+    printf("[DISPLAY_DIAG] cm33_launcher_start addr=0x%08lx\r\n",
+           (unsigned long)CM55_APP_BOOT_ADDR);
+    fflush(stdout);
+#endif
+#endif
+
+    Cy_SysEnableCM55(MXCM55, CM55_APP_BOOT_ADDR, CM55_BOOT_WAIT_TIME_USEC);
+
+#if (APP_DISPLAY_DIAG_ENABLE)
+    app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM33_CM55_RELEASED,
+                          0u,
+                          (uint32_t)__LINE__,
+                          0u);
+#endif
+
+#if (APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE)
+    printf("[CM33_DISPLAY_ONLY] cm55_released\r\n");
+    fflush(stdout);
+#endif
+
+#if ((APP_DISPLAY_DIAG_ENABLE) && (APP_DISPLAY_CM33_DIAG_POLL_ENABLE))
+    for (;;)
+    {
+        const volatile app_display_diag_region_t *diag = APP_DISPLAY_DIAG_REGION;
+
+        Cy_SysLib_Delay(500u);
+        printf("[DISPLAY_DIAG] magic=0x%08lx ver=%lu stage=%lu(%s) "
+               "result=0x%08lx line=%lu heartbeat=%lu flags=0x%08lx "
+               "detail0=0x%08lx detail1=0x%08lx "
+               "detail2=0x%08lx detail3=0x%08lx\r\n",
+               (unsigned long)diag->magic,
+               (unsigned long)diag->version,
+               (unsigned long)diag->stage,
+               app_display_diag_stage_name((uint32_t)diag->stage),
+               (unsigned long)diag->result,
+               (unsigned long)diag->line,
+               (unsigned long)diag->heartbeat,
+               (unsigned long)diag->flags,
+               (unsigned long)diag->detail0,
+               (unsigned long)diag->detail1,
+               (unsigned long)diag->detail2,
+               (unsigned long)diag->detail3);
+        fflush(stdout);
+    }
+#endif
+
+#if (APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE)
+    for (;;)
+    {
+        Cy_SysLib_Delay(5000u);
+        printf("[CM33_DISPLAY_ONLY] heartbeat cm55_released=1\r\n");
+        fflush(stdout);
+    }
+#else
+    for (;;)
+    {
+        Cy_SysLib_Delay(1000u);
+    }
+#endif
+#endif
 
     /* 初始化 debug UART 重定向。
      * 这里传入 main.c 选出的 APP_DEBUG_UART_BAUD_RATE，使采集模式和普通调试

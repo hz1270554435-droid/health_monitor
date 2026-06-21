@@ -45,15 +45,31 @@
 #include "cybsp.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "app_display_diag.h"
 #include <stdio.h>
 
 #ifndef APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE
 #define APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE (0u)
 #endif
 
+#ifndef APP_CM55_INFERENCE_ENABLE
+#define APP_CM55_INFERENCE_ENABLE (1u)
+#endif
+
+#ifndef APP_DISPLAY_DIAG_ENABLE
+#define APP_DISPLAY_DIAG_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
+#define APP_DISPLAY_CM55_UART_LOG_ENABLE (1u)
+#endif
+
 #if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
 #include "app_cm55_display_bringup.h"
-#else
+#include "app_cm55_display_retarget.h"
+#endif
+
+#if (APP_CM55_INFERENCE_ENABLE)
 #include "app_model_inference.h"
 #endif
 
@@ -77,28 +93,91 @@ int main(void)
 {
     cy_rslt_t result;
 
+#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE) && (APP_DISPLAY_DIAG_ENABLE))
+    app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_MAIN_ENTER,
+                          0u,
+                          (uint32_t)__LINE__,
+                          0u);
+#endif
+
     /* Initialize the device and board peripherals */
     result = cybsp_init();
 
     /* Board init failed. Stop program execution */
     if (CY_RSLT_SUCCESS != result)
     {
+#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE) && (APP_DISPLAY_DIAG_ENABLE))
+        app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_CYBSP_INIT_FAIL,
+                              (uint32_t)result,
+                              (uint32_t)__LINE__,
+                              0u);
+#endif
         CY_ASSERT(0);
     }
+
+#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE) && (APP_DISPLAY_DIAG_ENABLE))
+    app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_CYBSP_INIT_OK,
+                          (uint32_t)result,
+                          (uint32_t)__LINE__,
+                          0u);
+#endif
+
+#if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
+#if (APP_DISPLAY_CM55_UART_LOG_ENABLE)
+    result = app_cm55_display_retarget_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+#if (APP_DISPLAY_DIAG_ENABLE)
+        app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_RETARGET_FAIL,
+                              (uint32_t)result,
+                              (uint32_t)__LINE__,
+                              0u);
+#endif
+#if (APP_CM55_INFERENCE_ENABLE)
+        CY_ASSERT(0);
+#else
+        result = CY_RSLT_SUCCESS;
+#endif
+    }
+#if (APP_DISPLAY_DIAG_ENABLE)
+    else
+    {
+        app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_RETARGET_OK,
+                              (uint32_t)result,
+                              (uint32_t)__LINE__,
+                              0u);
+    }
+#endif
+#else
+#if (APP_DISPLAY_DIAG_ENABLE)
+    app_display_diag_mark(APP_DISPLAY_DIAG_STAGE_CM55_RETARGET_SKIP,
+                          0u,
+                          (uint32_t)__LINE__,
+                          0u);
+#endif
+#endif
+#endif
 
     /* Enable global interrupts */
     __enable_irq();
 
-    /* Note: UART is initialized by CM33. CM55 printf shares the same UART. */
-
 #if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
-    /* CM55 display bring-up mode: run display instead of inference */
-    printf("[CM55_BOOT] display_bringup_enable=1 inference_disabled=1\r\n");
+#if (APP_DISPLAY_CM55_UART_LOG_ENABLE)
+    printf("[CM55_BOOT] display_bringup_enable=1 inference_enable=%lu\r\n",
+           (unsigned long)APP_CM55_INFERENCE_ENABLE);
     fflush(stdout);
+#endif
     result = app_cm55_display_bringup_init();
-#else
-    /* Normal mode: CM55 runs ML inference */
+#if (APP_CM55_INFERENCE_ENABLE)
+    if (CY_RSLT_SUCCESS == result)
+    {
+        result = app_model_inference_task_init();
+    }
+#endif
+#elif (APP_CM55_INFERENCE_ENABLE)
     result = app_model_inference_task_init();
+#else
+    result = CY_RSLT_SUCCESS;
 #endif
     if (CY_RSLT_SUCCESS != result)
     {

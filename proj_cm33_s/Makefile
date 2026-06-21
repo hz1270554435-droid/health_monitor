@@ -53,7 +53,7 @@ VERBOSE=
 # ... then code in directories named COMPONENT_foo and COMPONENT_bar will be
 # added to the build
 #
-COMPONENTS+=SECURE_DEVICE
+COMPONENTS+=SECURE_DEVICE GFXSS
 
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
