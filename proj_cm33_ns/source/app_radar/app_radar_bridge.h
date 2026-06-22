@@ -52,10 +52,11 @@ extern "C" {
 #define APP_RADAR_BRIDGE_RX_WAIT_MS             (100u)
 #define APP_RADAR_BRIDGE_LOG_MS                 (5000u)
 
-/* LD6002 presence raw values (vendor mapping TBD). */
-#define APP_RADAR_BRIDGE_PRESENCE_UNKNOWN_RAW   (0u)
-#define APP_RADAR_BRIDGE_PRESENCE_ABSENT_RAW    (1u)
-#define APP_RADAR_BRIDGE_PRESENCE_PRESENT_RAW   (2u)
+/* LD6002 presence raw values (verified 2026-06-22 from real UART log).
+ * LD6002 sends: 0 = no human, 1 = human present. */
+#define APP_RADAR_BRIDGE_PRESENCE_UNKNOWN_RAW   (2u)
+#define APP_RADAR_BRIDGE_PRESENCE_ABSENT_RAW    (0u)
+#define APP_RADAR_BRIDGE_PRESENCE_PRESENT_RAW   (1u)
 
 /* LD6002 TYPE definitions (mirrors app_uart_radar.c). */
 #define APP_RADAR_BRIDGE_TYPE_FIRMWARE_STATUS    (0xFFFFu)

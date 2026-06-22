@@ -29,7 +29,7 @@ typedef struct
     int32_t  rr_centi;              /* 0x0A14 breath rate * 100 */
     int32_t  hr_centi;              /* 0x0A15 heart rate * 100 */
     uint32_t range_flag;            /* 0x0A16 flag */
-    int32_t  distance_centi;        /* 0x0A16 distance * 100 */
+    int32_t  distance_cm;           /* 0x0A16 distance in cm (LD6002 native unit) */
     int32_t  x_centi;               /* 0x0A17 X * 100 */
     int32_t  y_centi;               /* 0x0A17 Y * 100 */
     int32_t  z_centi;               /* 0x0A17 Z * 100 */
@@ -128,15 +128,16 @@ static void bridge_decode_frame(app_radar_bridge_accumulator_t *acc,
             if ((data_len >= 4u) && bridge_float_is_finite(data))
             {
                 int32_t centi = bridge_float_to_centi(data);
-                /* Contract range: 4..60 bpm → 400..6000 centi */
-                if ((centi >= 400) && (centi <= 6000))
+                /* Contract range: >0..60 bpm → 1..6000 centi
+                 * LD6002 reports 0-21 bpm; 0 means no breath detected. */
+                if ((centi > 0) && (centi <= 6000))
                 {
                     acc->rr_centi = centi;
                     acc->has_rr = true;
                 }
                 else
                 {
-                    acc->has_rr = false;  /* out of range */
+                    acc->has_rr = false;  /* out of range or no breath */
                 }
             }
             break;
@@ -164,19 +165,33 @@ static void bridge_decode_frame(app_radar_bridge_accumulator_t *acc,
             if (data_len >= 8u)
             {
                 acc->range_flag = bridge_read_le_u32(data);
-                if (bridge_float_is_finite(&data[4]))
+                /* range_flag != 0 means target locked. Without lock,
+                 * distance is meaningless — mark as no distance. */
+                if ((acc->range_flag != 0u) &&
+                    bridge_float_is_finite(&data[4]))
                 {
-                    int32_t centi = bridge_float_to_centi(&data[4]);
-                    /* Contract range: 0.0..10.0 m → 0..1000 centi */
-                    if ((centi >= 0) && (centi <= 1000))
+                    /* LD6002 reports distance in centimeters (not meters).
+                     * Convert float cm to integer cm directly. */
+                    uint32_t raw = bridge_read_le_u32(&data[4]);
+                    float dist_cm;
+                    memcpy(&dist_cm, &raw, sizeof(dist_cm));
+                    int32_t cm = (dist_cm >= 0.0f)
+                                 ? (int32_t)(dist_cm + 0.5f)
+                                 : (int32_t)(dist_cm - 0.5f);
+                    /* Valid range: 0..500 cm */
+                    if ((cm > 0) && (cm <= 500))
                     {
-                        acc->distance_centi = centi;
+                        acc->distance_cm = cm;
                         acc->has_distance = true;
                     }
                     else
                     {
                         acc->has_distance = false;
                     }
+                }
+                else
+                {
+                    acc->has_distance = false;
                 }
             }
             break;
@@ -288,7 +303,7 @@ static void bridge_map_to_radar_input(
     /* Distance mapping. */
     if (acc->has_distance)
     {
-        out->distance_cm = (uint16_t)(acc->distance_centi);
+        out->distance_cm = (uint16_t)(acc->distance_cm);
     }
     else
     {
@@ -314,7 +329,7 @@ static void bridge_log_source_markers(const app_radar_bridge_accumulator_t *acc,
            "frames=%lu 0x0F09=%lu 0x0A13=%lu 0x0A14=%lu 0x0A15=%lu "
            "0x0A16=%lu 0x0A17=%lu 0x0A04=%lu unsup=%lu "
            "presence_raw=%u has_rr=%u rr_centi=%ld has_hr=%u "
-           "hr_centi=%ld has_dist=%u dist_centi=%ld\r\n",
+           "hr_centi=%ld has_dist=%u dist_cm=%ld\r\n",
            quality->valid ? 1u : 0u,
            (unsigned int)quality->quality,
            quality->valid ? 1u : 0u,
@@ -335,7 +350,7 @@ static void bridge_log_source_markers(const app_radar_bridge_accumulator_t *acc,
            acc->has_hr ? 1u : 0u,
            (long)acc->hr_centi,
            acc->has_distance ? 1u : 0u,
-           (long)acc->distance_centi);
+           (long)acc->distance_cm);
 }
 
 /* ---------------------------------------------------------------------------
