@@ -20,8 +20,14 @@
 #define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
 #endif
 
-#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE) || (APP_DISPLAY_LVGL_ENABLE)
 #include "app_display_cm55_shared.h"
+#endif
+
+#if (APP_DISPLAY_LVGL_ENABLE)
+#include "lvgl.h"
+#include "lv_port_disp.h"
+#include "ui_health_dashboard.h"
 #endif
 
 #include <stdio.h>
@@ -47,6 +53,10 @@
 
 #ifndef APP_DISPLAY_PANEL_I2C_LOWLEVEL_PROBE_ENABLE
 #define APP_DISPLAY_PANEL_I2C_LOWLEVEL_PROBE_ENABLE (0u)
+#endif
+
+#ifndef APP_DISPLAY_LVGL_ENABLE
+#define APP_DISPLAY_LVGL_ENABLE (0u)
 #endif
 
 #define CM55_DISP_HOR_RES               (832U)
@@ -555,6 +565,10 @@ static const cn_glyph_t cn_font[] =
     {0x6709, {0x01,0x00,0x01,0x00,0x3F,0xFE,0x02,0x00,0x06,0x00,0x07,0xFC,0x0C,0x0C,0x14,0x0C,0x67,0xFC,0x44,0x0C,0x07,0xFC,0x04,0x0C,0x04,0x0C,0x04,0x18,0x00,0x00,0x00,0x00}}, /* 有 */
     {0x5C0F, {0x00,0x00,0x01,0x80,0x01,0x80,0x01,0x80,0x01,0x80,0x09,0x90,0x19,0x98,0x11,0x88,0x11,0x8C,0x31,0x84,0x21,0x84,0x61,0x84,0x01,0x80,0x01,0x80,0x03,0x80,0x00,0x00}}, /* 小 */
     {0x6B21, {0x00,0x00,0x00,0x80,0x21,0x80,0x21,0x00,0x31,0xFC,0x1A,0x04,0x02,0x4C,0x04,0x48,0x00,0x40,0x18,0x40,0x10,0xE0,0x30,0xA0,0x61,0x10,0x43,0x0C,0x0C,0x06,0x00,0x00}}, /* 次 */
+    {0x63D0, {0x00,0x00,0x11,0xFC,0x11,0xFC,0x11,0x04,0x7D,0xFC,0x11,0x04,0x11,0xFC,0x10,0x00,0x1B,0xFE,0xF0,0x20,0x11,0x20,0x11,0x3C,0x13,0x20,0x12,0xE0,0x76,0x7E,0x04,0x00}}, /* 提 */
+    {0x9192, {0x00,0x00,0x00,0x7E,0x7F,0x42,0x14,0x42,0x14,0x7E,0x7E,0x42,0x5E,0x7E,0x5E,0x10,0x5E,0x50,0x66,0xFE,0x42,0x90,0x7E,0xFE,0x42,0x10,0x7E,0x10,0x42,0xFE,0x42,0x00}}, /* 醒 */
+    {0x8B66, {0x12,0x30,0x7F,0xBE,0x12,0x44,0x3F,0xA8,0x7C,0xB8,0x27,0x1C,0x3C,0x66,0x7F,0xFE,0x00,0x00,0x1F,0xF8,0x1F,0xF8,0x00,0x00,0x1F,0xF8,0x1F,0xF8,0x10,0x08,0x00,0x00}}, /* 警 */
+    {0x544A, {0x00,0x00,0x00,0x80,0x08,0x80,0x10,0x80,0x3F,0xFC,0x20,0x80,0x00,0x80,0x7F,0xFE,0x00,0x00,0x1F,0xF8,0x10,0x08,0x10,0x08,0x10,0x08,0x1F,0xF8,0x10,0x08,0x00,0x00}}, /* 告 */
 };
 
 #define CN_FONT_COUNT (sizeof(cn_font) / sizeof(cn_font[0]))
@@ -589,49 +603,177 @@ static void draw_cn_char(uint16_t *fb,
     draw_char(fb, x, y, '?', color, 2U);
 }
 
+/* Draw a Chinese character scaled by factor (1x=16px, 2x=32px) */
+static void draw_cn_char_scaled(uint16_t *fb,
+                                uint32_t x,
+                                uint32_t y,
+                                uint16_t code,
+                                uint16_t color,
+                                uint32_t scale)
+{
+    for (uint32_t i = 0U; i < CN_FONT_COUNT; ++i)
+    {
+        if (cn_font[i].code == code)
+        {
+            const uint8_t *bmp = cn_font[i].bitmap;
+            for (uint32_t row = 0U; row < 16U; ++row)
+            {
+                uint16_t row_bits =
+                    ((uint16_t)bmp[row * 2U] << 8) | bmp[(row * 2U) + 1U];
+                for (uint32_t col = 0U; col < 16U; ++col)
+                {
+                    if (0U != (row_bits & (0x8000U >> col)))
+                    {
+                        fill_rect(fb,
+                                  x + (col * scale),
+                                  y + (row * scale),
+                                  scale, scale, color);
+                    }
+                }
+            }
+            return;
+        }
+    }
+    draw_char(fb, x, y, '?', color, scale);
+}
+
+static void draw_float_1dp_scaled(uint16_t *fb,
+                                  uint32_t x,
+                                  uint32_t y,
+                                  uint16_t value_x10,
+                                  uint16_t color,
+                                  uint32_t scale)
+{
+    uint32_t whole = value_x10 / 10U;
+    uint32_t frac = value_x10 % 10U;
+    x += draw_number(fb, x, y, whole, color, scale);
+    draw_char(fb, x, y, '.', color, scale);
+    x += 6U * scale;
+    draw_char(fb, x, y, (char)('0' + frac), color, scale);
+}
+
+/* Draw a card with soft gradient alert glow on the top edge */
+static void draw_card_with_alert(uint16_t *fb,
+                                 uint32_t cx, uint32_t cy,
+                                 uint32_t cw, uint32_t ch,
+                                 uint16_t accent_color,
+                                 uint32_t alert_start_ms,
+                                 uint32_t now_ms,
+                                 uint32_t alert_duration_ms)
+{
+    fill_rect(fb, cx, cy, cw, ch, RGB565(255U, 255U, 255U));
+    fill_rect(fb, cx, cy, 5U, ch, accent_color);
+
+    if (0U != alert_start_ms)
+    {
+        uint32_t elapsed = now_ms - alert_start_ms;
+        if (elapsed < alert_duration_ms)
+        {
+            /* Soft gradient: 6 layers of decreasing intensity */
+            uint32_t progress_x256 = (elapsed * 256U) / alert_duration_ms;
+            uint32_t layers = 6U;
+            for (uint32_t layer = 0U; layer < layers; ++layer)
+            {
+                uint32_t intensity = 256U - progress_x256;
+                uint32_t layer_fade = intensity * (layers - layer) / layers;
+                uint16_t r = (uint16_t)((layer_fade * 240U) / 256U);
+                uint16_t g = (uint16_t)((layer_fade * 82U) / 256U);
+                uint16_t b = (uint16_t)((layer_fade * 82U) / 256U);
+                uint16_t glow = RGB565(r, g, b);
+                fill_rect(fb, cx + layer, cy + layer, cw - (2U * layer), 2U, glow);
+            }
+            /* Bottom edge glow (thinner) */
+            for (uint32_t layer = 0U; layer < 3U; ++layer)
+            {
+                uint32_t intensity = 256U - progress_x256;
+                uint32_t layer_fade = intensity * (3U - layer) / 3U;
+                uint16_t r = (uint16_t)((layer_fade * 200U) / 256U);
+                uint16_t g = (uint16_t)((layer_fade * 60U) / 256U);
+                uint16_t b = (uint16_t)((layer_fade * 60U) / 256U);
+                uint16_t glow = RGB565(r, g, b);
+                fill_rect(fb, cx + layer, cy + ch - 2U - layer, cw - (2U * layer), 2U, glow);
+            }
+        }
+    }
+}
+
+/* Render fading alert text inside a card */
+static void draw_alert_in_card(uint16_t *fb,
+                               uint32_t cx, uint32_t cy, uint32_t cw, uint32_t ch,
+                               uint32_t alert_start_ms, uint32_t now_ms,
+                               uint32_t alert_duration_ms,
+                               uint16_t code1, uint16_t code2, uint16_t code3,
+                               uint16_t code4, uint16_t code5)
+{
+    if (0U == alert_start_ms) return;
+    uint32_t elapsed = now_ms - alert_start_ms;
+    if (elapsed >= alert_duration_ms) return;
+
+    uint32_t progress = (elapsed * 256U) / alert_duration_ms;
+    uint32_t intensity = 256U - progress;
+    uint16_t r = (uint16_t)((intensity * 240U) / 256U);
+    uint16_t g = (uint16_t)((intensity * 60U) / 256U);
+    uint16_t b = (uint16_t)((intensity * 60U) / 256U);
+    if (r < 40U) r = 40U;
+    if (g < 10U) g = 10U;
+    if (b < 10U) b = 10U;
+    uint16_t alert_color = RGB565(r, g, b);
+
+    uint32_t text_y = cy + ch - 36U;
+    uint32_t tx = cx + 20U;
+    if (0xFFFFU != code1) { draw_cn_char_scaled(fb, tx, text_y, code1, alert_color, 2U); tx += 36U; }
+    if (0xFFFFU != code2) { draw_cn_char_scaled(fb, tx, text_y, code2, alert_color, 2U); tx += 36U; }
+    if (0xFFFFU != code3) { draw_cn_char_scaled(fb, tx, text_y, code3, alert_color, 2U); tx += 36U; }
+    if (0xFFFFU != code4) { draw_cn_char_scaled(fb, tx, text_y, code4, alert_color, 2U); tx += 36U; }
+    if (0xFFFFU != code5) { draw_cn_char_scaled(fb, tx, text_y, code5, alert_color, 2U); }
+}
+
 static void draw_live_frame(uint16_t *fb)
 {
     volatile app_display_cm55_snapshot_t *snap = APP_DISPLAY_CM55_SNAPSHOT;
     uint32_t seq_end, seq_begin;
     uint8_t health;
     uint16_t status_color;
-    const char *status_text;
-    const char *summary_text;
 
-    /* === Color palette: health-app style === */
-    uint16_t c_bg       = RGB565(242U, 243U, 245U); /* light gray background */
-    uint16_t c_card     = RGB565(255U, 255U, 255U); /* white card */
-    uint16_t c_border   = RGB565(220U, 222U, 226U); /* subtle border */
-    uint16_t c_title    = RGB565(34U,  34U,  34U);  /* near-black title */
-    uint16_t c_subtitle = RGB565(100U, 106U, 115U); /* gray subtitle */
-    uint16_t c_label    = RGB565(120U, 126U, 135U); /* card label */
-    uint16_t c_value    = RGB565(34U,  34U,  34U);  /* card value */
-    uint16_t c_unit     = RGB565(150U, 156U, 165U); /* unit text */
-    uint16_t c_teal     = RGB565(0U,   179U, 164U); /* primary teal */
-    uint16_t c_green    = RGB565(76U,  175U, 80U);  /* normal green */
-    uint16_t c_yellow   = RGB565(253U, 181U, 21U);  /* attention yellow */
-    uint16_t c_red      = RGB565(240U, 82U,  82U);  /* warning red */
-    uint16_t c_gray     = RGB565(170U, 176U, 185U); /* unavailable gray */
-    uint16_t c_orange   = RGB565(245U, 166U, 35U);  /* not-verified orange */
-    uint16_t c_header_bg = RGB565(255U, 255U, 255U); /* white header */
-    uint16_t c_bar_bg   = RGB565(248U, 249U, 250U); /* status bar bg */
+    /* Alert state: per-card */
+    static uint32_t cough_alert_ms;
+    static uint32_t rr_alert_ms;
+    static uint32_t hr_alert_ms;
+    static uint32_t radar_alert_ms;
+    uint32_t now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    uint32_t alert_dur = 15000U;
 
-    /* Card geometry: 2x2 grid (centered in 800px visible area) */
+    /* Colors */
+    uint16_t c_bg       = RGB565(242U, 243U, 245U);
+    uint16_t c_label    = RGB565(100U, 106U, 115U);
+    uint16_t c_value    = RGB565(34U,  34U,  34U);
+    uint16_t c_unit     = RGB565(150U, 156U, 165U);
+    uint16_t c_teal     = RGB565(0U,   179U, 164U);
+    uint16_t c_green    = RGB565(76U,  175U, 80U);
+    uint16_t c_yellow   = RGB565(253U, 181U, 21U);
+    uint16_t c_red      = RGB565(240U, 82U,  82U);
+    uint16_t c_gray     = RGB565(170U, 176U, 185U);
+    uint16_t c_header_bg = RGB565(255U, 255U, 255U);
+    uint16_t c_border   = RGB565(220U, 222U, 226U);
+    uint16_t c_bar_bg   = RGB565(248U, 249U, 250U);
+
+    /* Layout: x_off=20, cards 376x160, header 60px, bar 44px */
     uint32_t x_off = 20U;
     uint32_t card_w = 376U;
-    uint32_t card_h = 130U;
+    uint32_t card_h = 160U;
     uint32_t card_x1 = 20U + x_off;
     uint32_t card_x2 = 404U + x_off;
-    uint32_t card_y1 = 108U;
-    uint32_t card_y2 = 252U;
+    uint32_t card_y1 = 68U;
+    uint32_t card_y2 = 238U;
+    uint32_t bar_y = CM55_DISP_VER_RES - 44U;
+    uint32_t cs = 2U; /* Chinese scale */
+    uint32_t ns = 4U; /* Number scale */
 
-    /* Clear framebuffer with light gray. */
+    /* Clear */
     for (uint32_t i = 0U; i < (CM55_DISP_HOR_RES * CM55_DISP_VER_RES); ++i)
-    {
         fb[i] = c_bg;
-    }
 
-    /* Torn-read check. */
+    /* Torn-read check */
     APP_DISPLAY_CM55_INVALIDATE_CACHE(
         (uint32_t)snap, sizeof(app_display_cm55_snapshot_t));
     seq_end = snap->seq_end;
@@ -639,242 +781,191 @@ static void draw_live_frame(uint16_t *fb)
 
     health = snap->health_state;
 
-    /* === Header area (white band, 100px) === */
-    fill_rect(fb, 0U, 0U, CM55_DISP_ACTUAL_HOR_RES, 100U, c_header_bg);
-    /* Bottom border of header */
-    fill_rect(fb, 0U, 99U, CM55_DISP_ACTUAL_HOR_RES, 2U, c_border);
-
-    /* Title: E84 夜间健康监测 */
-    draw_text(fb, 24U + x_off, 16U, "E84", c_teal, 3U);
+    /* === Alert state machine === */
+    /* Cough: reset if new cough detected while alert active */
+    if (snap->cough_count_1min > 0U)
     {
-        uint32_t tx = 100U + x_off;
-        draw_cn_char(fb, tx, 20U, 0x591C, c_title); tx += 18U; /* 夜 */
-        draw_cn_char(fb, tx, 20U, 0x95F4, c_title); tx += 18U; /* 间 */
-        draw_cn_char(fb, tx, 20U, 0x5065, c_title); tx += 18U; /* 健 */
-        draw_cn_char(fb, tx, 20U, 0x5EB7, c_title); tx += 18U; /* 康 */
-        draw_cn_char(fb, tx, 20U, 0x76D1, c_title); tx += 18U; /* 监 */
-        draw_cn_char(fb, tx, 20U, 0x6D4B, c_title);             /* 测 */
-    }
-
-    /* Health status: right side of header */
-    if (health == DISPLAY_CM55_HEALTH_NORMAL)
-    {
-        status_color = c_green;
-    }
-    else if (health == DISPLAY_CM55_HEALTH_ATTENTION)
-    {
-        status_color = c_yellow;
-    }
-    else if (health == DISPLAY_CM55_HEALTH_WARNING)
-    {
-        status_color = c_red;
-    }
-    else if (health == DISPLAY_CM55_HEALTH_SENSOR_LOST)
-    {
-        status_color = c_yellow;
-    }
-    else if (health == DISPLAY_CM55_HEALTH_ERROR)
-    {
-        status_color = c_red;
+        if (0U == cough_alert_ms || (now_ms - cough_alert_ms) > alert_dur)
+            cough_alert_ms = now_ms;
     }
     else
     {
-        status_color = c_gray;
-    }
-    fill_rect(fb, 580U + x_off, 24U, 10U, 10U, status_color);
-    /* 实时监测中 */
-    {
-        uint32_t sx = 596U + x_off;
-        draw_cn_char(fb, sx, 20U, 0x5B9E, status_color); sx += 18U; /* 实 */
-        draw_cn_char(fb, sx, 20U, 0x65F6, status_color); sx += 18U; /* 时 */
-        draw_cn_char(fb, sx, 20U, 0x76D1, status_color); sx += 18U; /* 监 */
-        draw_cn_char(fb, sx, 20U, 0x6D4B, status_color); sx += 18U; /* 测 */
-        draw_cn_char(fb, sx, 20U, 0x4E2D, status_color);           /* 中 */
+        cough_alert_ms = 0U;
     }
 
-    /* Subtitle: summary line */
-    if (health == DISPLAY_CM55_HEALTH_NORMAL)
+    /* RR: abnormal if >25 or <8 bpm (and data present) */
+    if (0U != snap->rr_bpm_x10 && (snap->rr_bpm_x10 > 250U || snap->rr_bpm_x10 < 80U))
     {
-        /* 今晚状态整体平稳 */
-        uint32_t ux = 24U + x_off;
-        draw_cn_char(fb, ux, 56U, 0x4ECA, c_subtitle); ux += 18U; /* 今 */
-        draw_cn_char(fb, ux, 56U, 0x665A, c_subtitle); ux += 18U; /* 晚 */
-        draw_cn_char(fb, ux, 56U, 0x72B6, c_subtitle); ux += 18U; /* 状 */
-        draw_cn_char(fb, ux, 56U, 0x6001, c_subtitle); ux += 18U; /* 态 */
-        draw_cn_char(fb, ux, 56U, 0x6574, c_subtitle); ux += 18U; /* 整 */
-        draw_cn_char(fb, ux, 56U, 0x4F53, c_subtitle); ux += 18U; /* 体 */
-        draw_cn_char(fb, ux, 56U, 0x5E73, c_subtitle); ux += 18U; /* 平 */
-        draw_cn_char(fb, ux, 56U, 0x7A33, c_subtitle);           /* 稳 */
-    }
-    else if (health == DISPLAY_CM55_HEALTH_ATTENTION)
-    {
-        /* 检测到轻微波动 */
-        uint32_t ux = 24U + x_off;
-        draw_cn_char(fb, ux, 56U, 0x68C0, c_yellow); ux += 18U; /* 检 */
-        draw_cn_char(fb, ux, 56U, 0x6D4B, c_yellow); ux += 18U; /* 测 */
-        draw_cn_char(fb, ux, 56U, 0x5230, c_yellow); ux += 18U; /* 到 */
-        draw_cn_char(fb, ux, 56U, 0x8F7B, c_yellow); ux += 18U; /* 轻 */
-        draw_cn_char(fb, ux, 56U, 0x5FAE, c_yellow); ux += 18U; /* 微 */
-        draw_cn_char(fb, ux, 56U, 0x6CE2, c_yellow); ux += 18U; /* 波 */
-        draw_cn_char(fb, ux, 56U, 0x52A8, c_yellow);           /* 动 */
-    }
-    else if (health == DISPLAY_CM55_HEALTH_WARNING)
-    {
-        /* 检测到异常呼吸 */
-        uint32_t ux = 24U + x_off;
-        draw_cn_char(fb, ux, 56U, 0x68C0, c_red); ux += 18U; /* 检 */
-        draw_cn_char(fb, ux, 56U, 0x6D4B, c_red); ux += 18U; /* 测 */
-        draw_cn_char(fb, ux, 56U, 0x5230, c_red); ux += 18U; /* 到 */
-        draw_cn_char(fb, ux, 56U, 0x5F02, c_red); ux += 18U; /* 异 */
-        draw_cn_char(fb, ux, 56U, 0x5E38, c_red); ux += 18U; /* 常 */
-        draw_cn_char(fb, ux, 56U, 0x547C, c_red); ux += 18U; /* 呼 */
-        draw_cn_char(fb, ux, 56U, 0x5438, c_red);           /* 吸 */
+        if (0U == rr_alert_ms || (now_ms - rr_alert_ms) > alert_dur)
+            rr_alert_ms = now_ms;
     }
     else
     {
-        /* 初始化传感器中 */
-        uint32_t ux = 24U + x_off;
-        draw_cn_char(fb, ux, 56U, 0x521D, c_gray); ux += 18U; /* 初 */
-        draw_cn_char(fb, ux, 56U, 0x59CB, c_gray); ux += 18U; /* 始 */
-        draw_cn_char(fb, ux, 56U, 0x5316, c_gray); ux += 18U; /* 化 */
-        draw_text(fb, ux, 56U, "...", c_gray, 2U);
+        rr_alert_ms = 0U;
     }
 
-    /* Model not-verified: small orange tag if active */
-    if (0U != snap->cough_model_not_verified)
+    /* HR: abnormal if >100 or <50 bpm (and data present) */
+    if (0U != snap->hr_bpm_x10 && (snap->hr_bpm_x10 > 1000U || snap->hr_bpm_x10 < 500U))
     {
-        uint32_t mx = 24U + x_off;
-        draw_cn_char(fb, mx, 80U, 0x6A21, c_orange); mx += 18U; /* 模 */
-        draw_cn_char(fb, mx, 80U, 0x578B, c_orange); mx += 18U; /* 型 */
-        draw_text(fb, mx, 80U, ": Not Verified", c_orange, 1U);
+        if (0U == hr_alert_ms || (now_ms - hr_alert_ms) > alert_dur)
+            hr_alert_ms = now_ms;
+    }
+    else
+    {
+        hr_alert_ms = 0U;
     }
 
-    /* === Card 1: 呼吸率 (top-left) === */
-    fill_rect(fb, card_x1, card_y1, card_w, card_h, c_card);
-    fill_rect(fb, card_x1, card_y1, 4U, card_h, c_teal);
-    /* 呼吸率 */
+    /* === Header (60px) === */
+    fill_rect(fb, 0U, 0U, CM55_DISP_ACTUAL_HOR_RES, 60U, c_header_bg);
+    fill_rect(fb, 0U, 59U, CM55_DISP_ACTUAL_HOR_RES, 2U, c_border);
+
+    {
+        uint32_t tx = 24U + x_off;
+        draw_cn_char_scaled(fb, tx, 8U, 0x591C, c_teal, cs); tx += 18U * cs;
+        draw_cn_char_scaled(fb, tx, 8U, 0x95F4, c_teal, cs); tx += 18U * cs;
+        draw_cn_char_scaled(fb, tx, 8U, 0x5065, c_teal, cs); tx += 18U * cs;
+        draw_cn_char_scaled(fb, tx, 8U, 0x5EB7, c_teal, cs); tx += 18U * cs;
+        draw_cn_char_scaled(fb, tx, 8U, 0x76D1, c_teal, cs); tx += 18U * cs;
+        draw_cn_char_scaled(fb, tx, 8U, 0x6D4B, c_teal, cs);
+    }
+
+    /* Status dot + text */
+    if (health == DISPLAY_CM55_HEALTH_NORMAL) status_color = c_green;
+    else if (health == DISPLAY_CM55_HEALTH_ATTENTION) status_color = c_yellow;
+    else if (health == DISPLAY_CM55_HEALTH_WARNING) status_color = c_red;
+    else if (health == DISPLAY_CM55_HEALTH_SENSOR_LOST) status_color = c_yellow;
+    else if (health == DISPLAY_CM55_HEALTH_ERROR) status_color = c_red;
+    else status_color = c_gray;
+
+    fill_rect(fb, 560U + x_off, 14U, 14U, 14U, status_color);
+    {
+        uint32_t sx = 580U + x_off;
+        draw_cn_char_scaled(fb, sx, 8U, 0x5B9E, status_color, cs); sx += 18U * cs;
+        draw_cn_char_scaled(fb, sx, 8U, 0x65F6, status_color, cs); sx += 18U * cs;
+        draw_cn_char_scaled(fb, sx, 8U, 0x76D1, status_color, cs); sx += 18U * cs;
+        draw_cn_char_scaled(fb, sx, 8U, 0x6D4B, status_color, cs); sx += 18U * cs;
+        draw_cn_char_scaled(fb, sx, 8U, 0x4E2D, status_color, cs);
+    }
+
+    /* === Card 1: 呼吸率 === */
+    draw_card_with_alert(fb, card_x1, card_y1, card_w, card_h,
+                         c_teal, rr_alert_ms, now_ms, alert_dur);
     {
         uint32_t cx = card_x1 + 20U;
-        draw_cn_char(fb, cx, card_y1 + 12U, 0x547C, c_label); cx += 18U; /* 呼 */
-        draw_cn_char(fb, cx, card_y1 + 12U, 0x5438, c_label); cx += 18U; /* 吸 */
-        draw_cn_char(fb, cx, card_y1 + 12U, 0x7387, c_label);             /* 率 */
+        draw_cn_char_scaled(fb, cx, card_y1 + 10U, 0x547C, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y1 + 10U, 0x5438, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y1 + 10U, 0x7387, c_label, cs);
     }
     if (0U != snap->rr_bpm_x10)
     {
-        draw_float_1dp(fb, card_x1 + 20U, card_y1 + 42U,
-                       snap->rr_bpm_x10, c_value, 3U);
-        draw_text(fb, card_x1 + 180U, card_y1 + 56U, "bpm", c_unit, 2U);
-        /* 平稳 */
-        {
-            uint32_t cx = card_x1 + 20U;
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x5E73, c_green); cx += 18U; /* 平 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x7A33, c_green);           /* 稳 */
-        }
+        draw_float_1dp_scaled(fb, card_x1 + 20U, card_y1 + 48U,
+                              snap->rr_bpm_x10, c_value, ns);
+        draw_text(fb, card_x1 + 220U, card_y1 + 64U, "bpm", c_unit, 2U);
+        draw_cn_char_scaled(fb, card_x1 + 20U, card_y1 + 120U, 0x5E73, c_green, cs);
+        draw_cn_char_scaled(fb, card_x1 + 20U + 18U * cs, card_y1 + 120U, 0x7A33, c_green, cs);
     }
     else
     {
-        draw_text(fb, card_x1 + 20U, card_y1 + 48U, "--", c_gray, 3U);
-        /* 暂无数据 */
-        {
-            uint32_t cx = card_x1 + 20U;
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x6682, c_gray); cx += 18U; /* 暂 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x65E0, c_gray); cx += 18U; /* 无 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x6570, c_gray); cx += 18U; /* 数 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x636E, c_gray);           /* 据 */
-        }
+        draw_text(fb, card_x1 + 20U, card_y1 + 56U, "--", c_gray, ns);
+        draw_cn_char_scaled(fb, card_x1 + 20U, card_y1 + 120U, 0x6682, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x1 + 20U + 18U * cs, card_y1 + 120U, 0x65E0, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x1 + 20U + 36U * cs, card_y1 + 120U, 0xCAFD, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x1 + 20U + 54U * cs, card_y1 + 120U, 0x636E, c_gray, cs);
     }
+    /* RR alert text inside card */
+    draw_alert_in_card(fb, card_x1, card_y1, card_w, card_h,
+                       rr_alert_ms, now_ms, alert_dur,
+                       0x547C, 0x5438, 0x7387, 0x5F02, 0x5E38);
 
-    /* === Card 2: 心率 (top-right) === */
-    fill_rect(fb, card_x2, card_y1, card_w, card_h, c_card);
-    fill_rect(fb, card_x2, card_y1, 4U, card_h, c_red);
-    /* 心率 */
+    /* === Card 2: 心率 === */
+    draw_card_with_alert(fb, card_x2, card_y1, card_w, card_h,
+                         c_red, hr_alert_ms, now_ms, alert_dur);
     {
         uint32_t cx = card_x2 + 20U;
-        draw_cn_char(fb, cx, card_y1 + 12U, 0x5FC3, c_label); cx += 18U; /* 心 */
-        draw_cn_char(fb, cx, card_y1 + 12U, 0x7387, c_label);             /* 率 */
+        draw_cn_char_scaled(fb, cx, card_y1 + 10U, 0x5FC3, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y1 + 10U, 0x7387, c_label, cs);
     }
     if (0U != snap->hr_bpm_x10)
     {
-        draw_float_1dp(fb, card_x2 + 20U, card_y1 + 42U,
-                       snap->hr_bpm_x10, c_value, 3U);
-        draw_text(fb, card_x2 + 180U, card_y1 + 56U, "bpm", c_unit, 2U);
-        /* 正常 */
-        {
-            uint32_t cx = card_x2 + 20U;
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x6B63, c_green); cx += 18U; /* 正 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x5E38, c_green);           /* 常 */
-        }
+        draw_float_1dp_scaled(fb, card_x2 + 20U, card_y1 + 48U,
+                              snap->hr_bpm_x10, c_value, ns);
+        draw_text(fb, card_x2 + 220U, card_y1 + 64U, "bpm", c_unit, 2U);
+        draw_cn_char_scaled(fb, card_x2 + 20U, card_y1 + 120U, 0x6B63, c_green, cs);
+        draw_cn_char_scaled(fb, card_x2 + 20U + 18U * cs, card_y1 + 120U, 0x5E38, c_green, cs);
     }
     else
     {
-        draw_text(fb, card_x2 + 20U, card_y1 + 48U, "--", c_gray, 3U);
-        {
-            uint32_t cx = card_x2 + 20U;
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x6682, c_gray); cx += 18U; /* 暂 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x65E0, c_gray); cx += 18U; /* 无 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x6570, c_gray); cx += 18U; /* 数 */
-            draw_cn_char(fb, cx, card_y1 + 100U, 0x636E, c_gray);           /* 据 */
-        }
+        draw_text(fb, card_x2 + 20U, card_y1 + 56U, "--", c_gray, ns);
+        draw_cn_char_scaled(fb, card_x2 + 20U, card_y1 + 120U, 0x6682, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x2 + 20U + 18U * cs, card_y1 + 120U, 0x65E0, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x2 + 20U + 36U * cs, card_y1 + 120U, 0xCAFD, c_gray, cs);
+        draw_cn_char_scaled(fb, card_x2 + 20U + 54U * cs, card_y1 + 120U, 0x636E, c_gray, cs);
     }
+    /* HR alert text inside card */
+    draw_alert_in_card(fb, card_x2, card_y1, card_w, card_h,
+                       hr_alert_ms, now_ms, alert_dur,
+                       0x5FC3, 0x7387, 0x5F02, 0x5E38, 0xFFFF);
 
-    /* === Card 3: 咳嗽事件 (bottom-left) === */
-    fill_rect(fb, card_x1, card_y2, card_w, card_h, c_card);
-    fill_rect(fb, card_x1, card_y2, 4U, card_h, c_yellow);
-    /* 咳嗽事件 */
+    /* === Card 3: 咳嗽事件 === */
+    draw_card_with_alert(fb, card_x1, card_y2, card_w, card_h,
+                         c_yellow, cough_alert_ms, now_ms, alert_dur);
     {
         uint32_t cx = card_x1 + 20U;
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x54B3, c_label); cx += 18U; /* 咳 */
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x55FD, c_label); cx += 18U; /* 嗽 */
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x4E8B, c_label); cx += 18U; /* 事 */
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x4EF6, c_label);             /* 件 */
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x54B3, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x55FD, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x4E8B, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x4EF6, c_label, cs);
     }
     {
         uint16_t c1 = snap->cough_count_1min;
         uint16_t c5 = snap->cough_count_5min;
         uint32_t lx;
 
-        /* Line 1: 整晚 X 次 */
+        /* 整晚 X 次 */
         lx = card_x1 + 20U;
-        draw_cn_char(fb, lx, card_y2 + 38U, 0x6574, c_label); lx += 18U;
-        draw_cn_char(fb, lx, card_y2 + 38U, 0x665A, c_label); lx += 18U;
-        draw_number(fb, lx, card_y2 + 38U, c5, c_value, 2U); lx += 36U;
-        draw_cn_char(fb, lx, card_y2 + 38U, 0x6B21, c_unit);
+        draw_cn_char_scaled(fb, lx, card_y2 + 48U, 0x6574, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 48U, 0x665A, c_label, cs); lx += 18U * cs;
+        draw_number(fb, lx, card_y2 + 48U, c5, c_value, ns); lx += 60U;
+        draw_cn_char_scaled(fb, lx, card_y2 + 60U, 0x6B21, c_unit, cs);
 
-        /* Line 2: 近半小时 X 次 */
+        /* 近半小时 X 次 */
         lx = card_x1 + 20U;
-        draw_cn_char(fb, lx, card_y2 + 62U, 0x8FD1, c_label); lx += 18U;
-        draw_cn_char(fb, lx, card_y2 + 62U, 0x534A, c_label); lx += 18U;
-        draw_cn_char(fb, lx, card_y2 + 62U, 0x5C0F, c_label); lx += 18U;
-        draw_cn_char(fb, lx, card_y2 + 62U, 0x65F6, c_label); lx += 18U;
-        draw_number(fb, lx, card_y2 + 62U, c1, c_value, 2U); lx += 36U;
-        draw_cn_char(fb, lx, card_y2 + 62U, 0x6B21, c_unit);
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x8FD1, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x534A, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x5C0F, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x65F6, c_label, cs); lx += 18U * cs;
+        draw_number(fb, lx, card_y2 + 92U, c1, c_value, 3U); lx += 54U;
+        draw_cn_char_scaled(fb, lx, card_y2 + 100U, 0x6B21, c_unit, cs);
 
-        /* Line 3: 当前 无咳嗽 / 有咳嗽 */
+        /* 当前状态 */
         lx = card_x1 + 20U;
-        draw_cn_char(fb, lx, card_y2 + 86U, 0x5F53, c_label); lx += 18U;
-        draw_cn_char(fb, lx, card_y2 + 86U, 0x524D, c_label); lx += 18U;
+        draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x5F53, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x524D, c_label, cs); lx += 18U * cs;
         if (c1 > 0U)
         {
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x6709, c_yellow); lx += 18U;
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x54B3, c_yellow); lx += 18U;
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x55FD, c_yellow);
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x6709, c_yellow, cs); lx += 18U * cs;
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x54B3, c_yellow, cs); lx += 18U * cs;
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x55FD, c_yellow, cs);
         }
         else
         {
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x65E0, c_green); lx += 18U;
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x54B3, c_green); lx += 18U;
-            draw_cn_char(fb, lx, card_y2 + 86U, 0x55FD, c_green);
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x65E0, c_green, cs); lx += 18U * cs;
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x54B3, c_green, cs); lx += 18U * cs;
+            draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x55FD, c_green, cs);
         }
     }
+    /* Cough alert text inside card */
+    draw_alert_in_card(fb, card_x1, card_y2, card_w, card_h,
+                       cough_alert_ms, now_ms, alert_dur,
+                       0x68C0, 0x6D4B, 0x5230, 0x54B3, 0x55FD);
 
-    /* === Card 4: 雷达状态 (bottom-right) === */
-    fill_rect(fb, card_x2, card_y2, card_w, card_h, c_card);
-    fill_rect(fb, card_x2, card_y2, 4U, card_h, c_green);
-    /* 雷达 */
+    /* === Card 4: 雷达 === */
+    draw_card_with_alert(fb, card_x2, card_y2, card_w, card_h,
+                         c_green, radar_alert_ms, now_ms, alert_dur);
     {
         uint32_t cx = card_x2 + 20U;
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x96F7, c_label); cx += 18U; /* 雷 */
-        draw_cn_char(fb, cx, card_y2 + 12U, 0x8FBE, c_label);             /* 达 */
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x96F7, c_label, cs); cx += 18U * cs;
+        draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x8FBE, c_label, cs);
     }
     {
         uint8_t radar_src = snap->radar_source;
@@ -882,147 +973,120 @@ static void draw_live_frame(uint16_t *fb)
         {
             if (0U != snap->radar_presence)
             {
-                /* 已检测到人体 */
                 uint32_t cx = card_x2 + 20U;
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x5DF2, c_green); cx += 18U; /* 已 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x68C0, c_green); cx += 18U; /* 检 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x6D4B, c_green); cx += 18U; /* 测 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x5230, c_green); cx += 18U; /* 到 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x4EBA, c_green); cx += 18U; /* 人 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x4F53, c_green);           /* 体 */
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5DF2, c_green, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x68C0, c_green, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x6D4B, c_green, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5230, c_green, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4EBA, c_green, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4F53, c_green, cs);
                 if (0U != snap->distance_cm)
                 {
-                    draw_number(fb, card_x2 + 20U, card_y2 + 100U,
-                                snap->distance_cm, c_label, 2U);
-                    draw_text(fb, card_x2 + 76U, card_y2 + 100U, "cm", c_unit, 2U);
+                    draw_number(fb, card_x2 + 20U, card_y2 + 92U, snap->distance_cm, c_value, ns);
+                    draw_text(fb, card_x2 + 220U, card_y2 + 108U, "cm", c_unit, 2U);
                 }
             }
             else
             {
-                /* 未检测到人体 */
                 uint32_t cx = card_x2 + 20U;
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x672A, c_gray); cx += 18U; /* 未 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x68C0, c_gray); cx += 18U; /* 检 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x6D4B, c_gray); cx += 18U; /* 测 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x5230, c_gray); cx += 18U; /* 到 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x4EBA, c_gray); cx += 18U; /* 人 */
-                draw_cn_char(fb, cx, card_y2 + 42U, 0x4F53, c_gray);           /* 体 */
-                {
-                    uint32_t cx2 = card_x2 + 20U;
-                    draw_cn_char(fb, cx2, card_y2 + 100U, 0x7B49, c_gray); cx2 += 18U; /* 等 */
-                    draw_cn_char(fb, cx2, card_y2 + 100U, 0x5F85, c_gray); cx2 += 18U; /* 待 */
-                    draw_cn_char(fb, cx2, card_y2 + 100U, 0x4E2D, c_gray);           /* 中 */
-                }
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x672A, c_gray, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x68C0, c_gray, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x6D4B, c_gray, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5230, c_gray, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4EBA, c_gray, cs); cx += 18U * cs;
+                draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4F53, c_gray, cs);
             }
         }
         else if (DISPLAY_CM55_RADAR_UNAVAILABLE == radar_src)
         {
-            /* 数据暂不可用 */
             uint32_t cx = card_x2 + 20U;
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x6570, c_gray); cx += 18U; /* 数 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x636E, c_gray); cx += 18U; /* 据 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x6682, c_gray); cx += 18U; /* 暂 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x4E0D, c_gray); cx += 18U; /* 不 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x53EF, c_gray); cx += 18U; /* 可 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x7528, c_gray);           /* 用 */
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x6570, c_gray, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x636E, c_gray, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x6682, c_gray, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4E0D, c_gray, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x53EF, c_gray, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x7528, c_gray, cs);
         }
         else if (DISPLAY_CM55_RADAR_STALE == radar_src)
         {
-            /* 信号已断开 */
             uint32_t cx = card_x2 + 20U;
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x4FE1, c_yellow); cx += 18U; /* 信 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x53F7, c_yellow); cx += 18U; /* 号 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x5DF2, c_yellow); cx += 18U; /* 已 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x65AD, c_yellow);           /* 断 */
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x4FE1, c_yellow, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x53F7, c_yellow, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5DF2, c_yellow, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x65AD, c_yellow, cs);
         }
         else
         {
-            /* 雷达异常 */
             uint32_t cx = card_x2 + 20U;
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x96F7, c_red); cx += 18U; /* 雷 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x8FBE, c_red); cx += 18U; /* 达 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x5F02, c_red); cx += 18U; /* 异 */
-            draw_cn_char(fb, cx, card_y2 + 42U, 0x5E38, c_red);           /* 常 */
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x96F7, c_red, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x8FBE, c_red, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5F02, c_red, cs); cx += 18U * cs;
+            draw_cn_char_scaled(fb, cx, card_y2 + 48U, 0x5E38, c_red, cs);
         }
     }
 
-    /* === Bottom Status Bar (50px) === */
-    {
-        uint32_t bar_y = CM55_DISP_VER_RES - 50U;
-        fill_rect(fb, 0U, bar_y, CM55_DISP_ACTUAL_HOR_RES, 50U, c_bar_bg);
-        fill_rect(fb, 0U, bar_y, CM55_DISP_ACTUAL_HOR_RES, 1U, c_border);
+    /* === Status Bar === */
+    fill_rect(fb, 0U, bar_y, CM55_DISP_ACTUAL_HOR_RES, 44U, c_bar_bg);
+    fill_rect(fb, 0U, bar_y, CM55_DISP_ACTUAL_HOR_RES, 1U, c_border);
 
-        /* Left: current state text */
+    {
+        uint32_t bx = 24U + x_off;
         if (health == DISPLAY_CM55_HEALTH_NORMAL)
         {
-            /* 睡眠呼吸趋势平稳 */
-            uint32_t bx = 24U + x_off;
-            draw_cn_char(fb, bx, bar_y + 16U, 0x7761, c_subtitle); bx += 18U; /* 睡 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x7720, c_subtitle); bx += 18U; /* 眠 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x547C, c_subtitle); bx += 18U; /* 呼 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5438, c_subtitle); bx += 18U; /* 吸 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x8D8B, c_subtitle); bx += 18U; /* 趋 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x52BF, c_subtitle); bx += 18U; /* 势 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5E73, c_subtitle); bx += 18U; /* 平 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x7A33, c_subtitle);           /* 稳 */
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x7761, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x7720, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x547C, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5438, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x8D8B, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x52BF, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5E73, c_label, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x7A33, c_label, cs);
         }
         else if (health == DISPLAY_CM55_HEALTH_ATTENTION)
         {
-            /* 呼吸轻微波动 */
-            uint32_t bx = 24U + x_off;
-            draw_cn_char(fb, bx, bar_y + 16U, 0x547C, c_yellow); bx += 18U; /* 呼 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5438, c_yellow); bx += 18U; /* 吸 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x8F7B, c_yellow); bx += 18U; /* 轻 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5FAE, c_yellow); bx += 18U; /* 微 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x6CE2, c_yellow); bx += 18U; /* 波 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x52A8, c_yellow);           /* 动 */
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x547C, c_yellow, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5438, c_yellow, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x8F7B, c_yellow, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5FAE, c_yellow, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x6CE2, c_yellow, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x52A8, c_yellow, cs);
         }
         else if (health == DISPLAY_CM55_HEALTH_WARNING)
         {
-            /* 异常呼吸检测 */
-            uint32_t bx = 24U + x_off;
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5F02, c_red); bx += 18U; /* 异 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5E38, c_red); bx += 18U; /* 常 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x547C, c_red); bx += 18U; /* 呼 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x5438, c_red); bx += 18U; /* 吸 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x68C0, c_red); bx += 18U; /* 检 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x6D4B, c_red);           /* 测 */
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5F02, c_red, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5E38, c_red, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x547C, c_red, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x5438, c_red, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x68C0, c_red, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x6D4B, c_red, cs);
         }
         else
         {
-            /* 监测进行中 */
-            uint32_t bx = 24U + x_off;
-            draw_cn_char(fb, bx, bar_y + 16U, 0x76D1, c_gray); bx += 18U; /* 监 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x6D4B, c_gray); bx += 18U; /* 测 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x8FDB, c_gray); bx += 18U; /* 进 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x884C, c_gray); bx += 18U; /* 行 */
-            draw_cn_char(fb, bx, bar_y + 16U, 0x4E2D, c_gray);           /* 中 */
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x76D1, c_gray, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x6D4B, c_gray, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x8FDB, c_gray, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x884C, c_gray, cs); bx += 18U * cs;
+            draw_cn_char_scaled(fb, bx, bar_y + 12U, 0x4E2D, c_gray, cs);
         }
 
-        /* Right: sensor status dots */
-        /* MIC */
-        fill_rect(fb, 520U + x_off, bar_y + 20U, 8U, 8U,
+        fill_rect(fb, 520U + x_off, bar_y + 16U, 10U, 10U,
                   (snap->audio_quality > 50U) ? c_green : c_red);
-        draw_text(fb, 532U + x_off, bar_y + 16U, "MIC", c_subtitle, 2U);
-        /* Radar */
-        fill_rect(fb, 600U + x_off, bar_y + 20U, 8U, 8U,
-                  (DISPLAY_CM55_RADAR_NORMAL == snap->radar_source) ?
-                  c_green : c_gray);
-        draw_text(fb, 612U + x_off, bar_y + 16U, "Radar", c_subtitle, 2U);
-        /* BLE */
-        fill_rect(fb, 700U + x_off, bar_y + 20U, 8U, 8U,
+        draw_text(fb, 534U + x_off, bar_y + 12U, "MIC", c_label, 2U);
+
+        fill_rect(fb, 610U + x_off, bar_y + 16U, 10U, 10U,
+                  (DISPLAY_CM55_RADAR_NORMAL == snap->radar_source) ? c_green : c_gray);
+        draw_text(fb, 624U + x_off, bar_y + 12U, "Radar", c_label, 2U);
+
+        fill_rect(fb, 710U + x_off, bar_y + 16U, 10U, 10U,
                   (0U != snap->ble_connected) ? c_green : c_gray);
-        draw_text(fb, 712U + x_off, bar_y + 16U, "BLE", c_subtitle, 2U);
+        draw_text(fb, 724U + x_off, bar_y + 12U, "BLE", c_label, 2U);
     }
 
-    /* Seq begin check. */
     __DMB();
     seq_begin = snap->seq_begin;
-    if (seq_begin != seq_end)
-    {
-        return;
-    }
+    if (seq_begin != seq_end) return;
 }
+
 #endif /* APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE */
 
 static void flip_framebuffer_180(uint16_t *fb)
@@ -1408,7 +1472,9 @@ static cy_en_scb_i2c_status_t cm55_panel_i2c_init_subdiag(void)
 static void cm55_gfx_task(void *arg)
 {
     uint32_t tick_count = 0U;
+#if !APP_DISPLAY_LVGL_ENABLE
     uint16_t *active_fb = frame_buffer1;
+#endif
     cy_en_sysint_status_t sysint_status;
     cy_en_gfx_status_t gfx_status;
     cy_en_scb_i2c_status_t i2c_status;
@@ -1423,7 +1489,10 @@ static void cm55_gfx_task(void *arg)
 
     memset(frame_buffer1, 0, sizeof(frame_buffer1));
     memset(frame_buffer2, 0, sizeof(frame_buffer2));
-#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+#if (APP_DISPLAY_LVGL_ENABLE)
+    /* LVGL will render into the framebuffers — skip CPU drawing */
+    CM55_DISP_LOG("[CM55_DISP] LVGL mode: skipping CPU frame draw\r\n");
+#elif (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
     draw_live_frame(frame_buffer1);
     draw_live_frame(frame_buffer2);
 #else
@@ -1560,6 +1629,16 @@ static void cm55_gfx_task(void *arg)
                    (uint32_t)vglite_status,
                    0u);
 
+#if (APP_DISPLAY_LVGL_ENABLE)
+    /* Initialize LVGL and the dashboard UI */
+    CM55_DISP_LOG("[CM55_DISP] step07 lvgl_init\r\n");
+    lv_init();
+    lv_port_disp_init(cm55_gfx_task_handle, GFXSS, &gfx_context);
+    ui_health_dashboard_init();
+    CM55_DISP_LOG("[CM55_DISP] step07 lvgl_init OK\r\n");
+    CM55_DISP_DIAG(APP_DISPLAY_DIAG_STAGE_DISPLAY_READY, 0u, 0u);
+    CM55_DISP_LOG("[CM55_DISP] READY lvgl_mode=1\r\n");
+#else
     if (0U != set_framebuffer(active_fb))
     {
         CM55_DISP_DIAG(APP_DISPLAY_DIAG_STAGE_DISPLAY_READY, 0u, 0u);
@@ -1569,9 +1648,20 @@ static void cm55_gfx_task(void *arg)
 #else
     CM55_DISP_LOG("[CM55_DISP] READY proof_framebuffer=1\r\n");
 #endif
+#endif /* APP_DISPLAY_LVGL_ENABLE */
 
     for (;;)
     {
+#if (APP_DISPLAY_LVGL_ENABLE)
+        /* LVGL mode: ~30 FPS timer handler + ~1 Hz data update */
+        lv_timer_handler();
+        if ((tick_count % 30U) == 0U)
+        {
+            ui_health_dashboard_update();
+        }
+        ++tick_count;
+        vTaskDelay(pdMS_TO_TICKS(33U));
+#else
         vTaskDelay(pdMS_TO_TICKS(1000U));
         ++tick_count;
         active_fb = (active_fb == frame_buffer1) ? frame_buffer2 : frame_buffer1;
@@ -1594,6 +1684,7 @@ static void cm55_gfx_task(void *arg)
             CM55_DISP_LOG("[CM55_DISP] tick=%lu\r\n",
                           (unsigned long)tick_count);
         }
+#endif /* APP_DISPLAY_LVGL_ENABLE */
     }
 }
 
