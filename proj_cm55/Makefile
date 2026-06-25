@@ -203,8 +203,13 @@ else ifeq ($(APP_AUDIO_MODEL_SELECT),4)
 CY_IGNORE+=model/audio_model_v2_float.c
 CY_IGNORE+=model/audio_model_v3_board_htk_hardneg_float.c
 DEFINES+=APP_AUDIO_MODEL_SELECT=4
+else ifeq ($(APP_AUDIO_MODEL_SELECT),5)
+CY_IGNORE+=model/audio_model_v2_float.c
+CY_IGNORE+=model/audio_model_v3_board_htk_hardneg_float.c
+CY_IGNORE+=model/audio_model_v3.1_board_fpfix_float.c
+DEFINES+=APP_AUDIO_MODEL_SELECT=5
 else
-$(error Unsupported APP_AUDIO_MODEL_SELECT=$(APP_AUDIO_MODEL_SELECT); expected 2, 3, or 4)
+$(error Unsupported APP_AUDIO_MODEL_SELECT=$(APP_AUDIO_MODEL_SELECT); expected 2, 3, 4, or 5)
 endif
 endif
 DEFINES+=APP_MODEL_SMOKE_TEST_ENABLE=$(APP_MODEL_SMOKE_TEST_ENABLE)
