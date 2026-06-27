@@ -57,7 +57,7 @@ typedef enum
     APP_MONITOR_EVENT_STATE_CHANGED,
     APP_MONITOR_EVENT_ALERT_CHANGED,
     APP_MONITOR_EVENT_SOURCE_CHANGED,
-    APP_MONITOR_EVENT_AUDIO_CANDIDATE,
+    APP_MONITOR_EVENT_CONFIRMED_COUGH,
     APP_MONITOR_EVENT_COUGH_BURST,
     APP_MONITOR_EVENT_VITALS_ATTENTION,
     APP_MONITOR_EVENT_SYSTEM_STATUS
@@ -134,6 +134,7 @@ typedef struct
     bool mic_quality_poor;
     bool cough_confirmed;
     bool cough_density_high;
+    bool confirmed_cough_edge;
     uint8_t cough_prob_x100;
     uint8_t event_threshold_x100;
     uint8_t audio_quality;
@@ -142,6 +143,7 @@ typedef struct
     uint32_t result_sequence;
     uint32_t age_ms;
     uint32_t reason_flags;
+    uint32_t confirmed_cough_event_id;
 } app_monitor_audio_input_t;
 
 typedef struct

@@ -1,5 +1,6 @@
 #include "app_ble_stream.h"
 
+#include "app_build_config.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -17,10 +18,6 @@
 #include "app_ble_protocol.h"
 
 #if (APP_BLE_ENABLE)
-
-#ifndef APP_MONITOR_SUMMARY_ENABLE
-#define APP_MONITOR_SUMMARY_ENABLE              (0u)
-#endif
 
 #if (APP_BLE_SUMMARY_ENABLE && !APP_MONITOR_SUMMARY_ENABLE)
 #error "APP_BLE_SUMMARY_ENABLE requires APP_MONITOR_SUMMARY_ENABLE"
@@ -792,9 +789,11 @@ static uint8_t app_ble_stream_summary_event_type(
 {
     switch (event->event_type)
     {
-        case APP_MONITOR_EVENT_AUDIO_CANDIDATE:
-        case APP_MONITOR_EVENT_COUGH_BURST:
+        case APP_MONITOR_EVENT_CONFIRMED_COUGH:
             return APP_BLE_EVENT_COUGH;
+
+        case APP_MONITOR_EVENT_COUGH_BURST:
+            return APP_BLE_EVENT_WARNING;
 
         case APP_MONITOR_EVENT_VITALS_ATTENTION:
             return APP_BLE_EVENT_WARNING;

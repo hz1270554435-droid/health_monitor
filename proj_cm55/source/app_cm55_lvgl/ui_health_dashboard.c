@@ -23,6 +23,7 @@
 
 #include "ui_health_dashboard.h"
 #include "lvgl.h"
+#include "app_build_config.h"
 #include "app_display_cm55_shared.h"
 #include "fonts/lv_font_simsun_16_e84.h"
 #include "fonts/lv_font_simsun_20_e84.h"
@@ -31,24 +32,8 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
-#define APP_DISPLAY_CM55_UART_LOG_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_LVGL_SKIP_SNAPSHOT_READ_ENABLE
-#define APP_DISPLAY_LVGL_SKIP_SNAPSHOT_READ_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_LVGL_SNAPSHOT_PROBE_ENABLE
-#define APP_DISPLAY_LVGL_SNAPSHOT_PROBE_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_LVGL_MINIMAL_REALTIME_ENABLE
-#define APP_DISPLAY_LVGL_MINIMAL_REALTIME_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_LVGL_FOOTER_DIAG_ENABLE
-#define APP_DISPLAY_LVGL_FOOTER_DIAG_ENABLE (0u)
+#ifndef APP_DISPLAY_LVGL_TIMEZONE_OFFSET_S
+#define APP_DISPLAY_LVGL_TIMEZONE_OFFSET_S (8 * 60 * 60)
 #endif
 
 #if (APP_DISPLAY_CM55_UART_LOG_ENABLE)
@@ -135,6 +120,7 @@
 /* Widget handles                                                     */
 /* ------------------------------------------------------------------ */
 static lv_obj_t *lbl_subtitle;
+static lv_obj_t *lbl_clock;
 static lv_obj_t *capsule_status;
 static lv_obj_t *lbl_status;
 
@@ -162,6 +148,10 @@ static lv_obj_t *lbl_radar_presence;
 static lv_obj_t *lbl_trend;
 static lv_obj_t *lbl_diag;
 static lv_obj_t *dot_mic, *dot_radar, *dot_ble;
+
+/* Display-local state only for log dedup. Counts remain producer-owned. */
+static bool s_logged_total_valid;
+static uint32_t s_last_logged_total;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -266,6 +256,66 @@ static void set_metric_value(lv_obj_t *value, lv_obj_t *unit,
     lv_obj_align_to(unit, value, LV_ALIGN_OUT_RIGHT_MID, 8, unit_y_ofs);
 }
 
+static void update_clock_label(uint32_t epoch_s, uint32_t time_flags)
+{
+    char buf[16];
+
+    if ((0U == epoch_s) ||
+        (0U == (time_flags & DISPLAY_CM55_TIME_FLAG_VALID)))
+    {
+        lv_label_set_text(lbl_clock, "--:--");
+        lv_obj_set_style_text_color(lbl_clock, C_TEXT_DIM, 0);
+        return;
+    }
+
+    uint32_t local_s = epoch_s + (uint32_t)APP_DISPLAY_LVGL_TIMEZONE_OFFSET_S;
+    uint32_t day_s = local_s % (24U * 60U * 60U);
+    uint32_t hour = day_s / (60U * 60U);
+    uint32_t minute = (day_s / 60U) % 60U;
+
+    snprintf(buf, sizeof(buf), "%02lu:%02lu",
+             (unsigned long)hour,
+             (unsigned long)minute);
+    lv_label_set_text(lbl_clock, buf);
+
+    if (0U != (time_flags & DISPLAY_CM55_TIME_FLAG_BLE_SYNCED))
+    {
+        lv_obj_set_style_text_color(lbl_clock, C_GREEN, 0);
+    }
+    else if (0U != (time_flags & DISPLAY_CM55_TIME_FLAG_NVM_LOADED))
+    {
+        lv_obj_set_style_text_color(lbl_clock, C_AMBER, 0);
+    }
+    else
+    {
+        lv_obj_set_style_text_color(lbl_clock, C_TEXT, 0);
+    }
+}
+
+static void update_cough_labels(uint16_t cough_5min,
+                                uint32_t cough_event_count_total)
+{
+    char buf[48];
+    s_last_logged_total = cough_event_count_total;
+    s_logged_total_valid = true;
+
+    snprintf(buf, sizeof(buf), "整夜: %lu 次",
+             (unsigned long)cough_event_count_total);
+    lv_label_set_text(lbl_cough_all, buf);
+    snprintf(buf, sizeof(buf), "最近5min: %u 次",
+             (unsigned int)cough_5min);
+    lv_label_set_text(lbl_cough_half, buf);
+
+    if (cough_5min > 0U)
+    {
+        set_badge_pill(lbl_cough_badge, "检测到咳嗽", C_AMBER_DIM, C_AMBER);
+    }
+    else
+    {
+        set_badge_pill(lbl_cough_badge, "无明显咳嗽", C_GREEN_DIM, C_GREEN);
+    }
+}
+
 static lv_obj_t *make_dot(lv_obj_t *parent, lv_color_t color)
 {
     lv_obj_t *dot = lv_led_create(parent);
@@ -287,6 +337,7 @@ static void copy_snapshot_ui_fields(app_display_cm55_snapshot_t *out,
     out->magic = snap->magic;
     out->version = snap->version;
     out->heartbeat = snap->heartbeat;
+    out->timestamp_ms = snap->timestamp_ms;
     out->health_state = snap->health_state;
     out->alert_code = snap->alert_code;
     out->radar_source = snap->radar_source;
@@ -301,8 +352,11 @@ static void copy_snapshot_ui_fields(app_display_cm55_snapshot_t *out,
     out->distance_cm = snap->distance_cm;
     out->cough_count_1min = snap->cough_count_1min;
     out->cough_count_5min = snap->cough_count_5min;
+    out->cough_event_count_total = snap->cough_event_count_total;
     out->fusion_confidence = snap->fusion_confidence;
     out->ble_connected = snap->ble_connected;
+    out->wall_epoch_s = snap->wall_epoch_s;
+    out->wall_time_flags = snap->wall_time_flags;
 }
 
 static bool read_snapshot(app_display_cm55_snapshot_t *out)
@@ -481,6 +535,7 @@ static void run_minimal_realtime(uint32_t tick)
     uint32_t version = snap->version;
     uint32_t begin = snap->seq_begin;
     uint32_t end = snap->seq_end;
+    uint32_t timestamp_ms = snap->timestamp_ms;
     uint32_t rr = snap->rr_bpm_x10;
     uint32_t hr = snap->hr_bpm_x10;
     uint32_t dist = snap->distance_cm;
@@ -488,9 +543,12 @@ static void run_minimal_realtime(uint32_t tick)
     uint32_t cough_prob = snap->mic_cough_prob_x1000;
     uint32_t cough_1min = snap->cough_count_1min;
     uint32_t cough_5min = snap->cough_count_5min;
+    uint32_t cough_event_total = snap->cough_event_count_total;
     uint32_t health_state = snap->health_state;
     uint32_t flags = snap->flags;
     uint32_t ble_connected = snap->ble_connected;
+    uint32_t wall_epoch_s = snap->wall_epoch_s;
+    uint32_t wall_time_flags = snap->wall_time_flags;
 
     if ((APP_DISPLAY_CM55_SNAPSHOT_MAGIC == magic) &&
         (APP_DISPLAY_CM55_SNAPSHOT_VERSION == version) &&
@@ -511,6 +569,8 @@ static void run_minimal_realtime(uint32_t tick)
         set_status_hint("警告：请检查", C_ROSE_DIM, C_ROSE);
     else
         set_status_hint("实时数据同步中", C_CYAN_DIM, C_CYAN);
+
+    update_clock_label(wall_epoch_s, wall_time_flags);
 
     if (rr > 0U)
     {
@@ -540,19 +600,11 @@ static void run_minimal_realtime(uint32_t tick)
         set_badge_pill(lbl_hr_badge, "暂无数据", C_ROSE_DIM, C_ROSE);
     }
 
-    snprintf(buf, sizeof(buf), "整夜: %lu 次", (unsigned long)cough_5min);
-    lv_label_set_text(lbl_cough_all, buf);
-    snprintf(buf, sizeof(buf), "最近30min: %lu 次", (unsigned long)cough_1min);
-    lv_label_set_text(lbl_cough_half, buf);
-
-    if ((cough_prob > 500U) || (cough_1min > 0U))
-    {
-        set_badge_pill(lbl_cough_badge, "检测到咳嗽", C_AMBER_DIM, C_AMBER);
-    }
-    else
-    {
-        set_badge_pill(lbl_cough_badge, "无明显咳嗽", C_GREEN_DIM, C_GREEN);
-    }
+    (void)cough_1min;
+    (void)cough_prob;
+    (void)timestamp_ms;
+    (void)tick;
+    update_cough_labels((uint16_t)cough_5min, cough_event_total);
 
     if (dist > 0U)
     {
@@ -638,6 +690,12 @@ void ui_health_dashboard_init(void)
     lv_obj_set_style_text_font(lbl_subtitle, FONT_20, 0);
     lv_obj_set_pos(lbl_subtitle, TITLE_X - OUTER_X, SUBTITLE_Y - OUTER_Y + 4);
     set_status_hint("今晚状态整体平稳", C_GREEN_DIM, C_GREEN);
+
+    lbl_clock = lv_label_create(outer);
+    lv_label_set_text(lbl_clock, "--:--");
+    lv_obj_set_style_text_color(lbl_clock, C_TEXT_DIM, 0);
+    lv_obj_set_style_text_font(lbl_clock, FONT_UNIT, 0);
+    lv_obj_align(lbl_clock, LV_ALIGN_TOP_MID, 0, 22);
 
     /* ---- Status capsule ---- */
     capsule_status = lv_obj_create(outer);
@@ -866,6 +924,7 @@ void ui_health_dashboard_update(void)
     app_display_cm55_snapshot_t snap;
     if (!read_snapshot(&snap)) {
         lv_label_set_text(lbl_subtitle, "等待数据...");
+        update_clock_label(0u, 0u);
         set_snapshot_diag(&snap);
         return;
     }
@@ -899,6 +958,8 @@ void ui_health_dashboard_update(void)
         }
     }
 
+    update_clock_label(snap.wall_epoch_s, snap.wall_time_flags);
+
     /* ---- 呼吸率 (integer display) ---- */
     if (snap.rr_bpm_x10 > 0U) {
         uint16_t rr_int = (snap.rr_bpm_x10 + 5U) / 10U;  /* round */
@@ -926,16 +987,8 @@ void ui_health_dashboard_update(void)
     }
 
     /* ---- 咳嗽 ---- */
-    snprintf(buf, sizeof(buf), "整夜: %u 次", snap.cough_count_5min);
-    lv_label_set_text(lbl_cough_all, buf);
-    snprintf(buf, sizeof(buf), "最近30min: %u 次", snap.cough_count_1min);
-    lv_label_set_text(lbl_cough_half, buf);
-
-    if ((snap.mic_cough_prob_x1000 > 500U) || (snap.cough_count_1min > 0U)) {
-        set_badge_pill(lbl_cough_badge, "检测到咳嗽", C_AMBER_DIM, C_AMBER);
-    } else {
-        set_badge_pill(lbl_cough_badge, "无明显咳嗽", C_GREEN_DIM, C_GREEN);
-    }
+    update_cough_labels(snap.cough_count_5min,
+                        snap.cough_event_count_total);
 
     /* ---- 雷达 (integer display) ---- */
     if (snap.distance_cm > 0U) {

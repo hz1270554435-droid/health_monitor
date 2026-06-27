@@ -3,8 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_audio_replay.h"
 #include "app_audio_preprocess.h"
 #include "app_audio_deployment_config.h"
+#include "app_build_config.h"
 #include "app_model_ipc_smoke.h"
 #include "app_monitor_summary.h"
 
@@ -63,6 +65,18 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_MODEL_INPUT_DUMP_WINDOWS             (3u)
 #endif
 
+#ifndef APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE
+#define APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE     (0u)
+#endif
+
+#ifndef APP_MODEL_LOG_RESULT_ENABLE
+#define APP_MODEL_LOG_RESULT_ENABLE              (0u)
+#endif
+
+#ifndef APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE
+#define APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE     (0u)
+#endif
+
 #ifndef APP_MODEL_EVENT_THRESHOLD
 #define APP_MODEL_EVENT_THRESHOLD                (0.95f)
 #endif
@@ -85,18 +99,6 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 
 #ifndef APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS
 #define APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS     APP_MODEL_LOG_RATE_LIMIT_MS
-#endif
-
-#ifndef APP_BLE_ENABLE
-#define APP_BLE_ENABLE                           (0u)
-#endif
-
-#ifndef APP_BLE_FAKE_DATA_ENABLE
-#define APP_BLE_FAKE_DATA_ENABLE                 (0u)
-#endif
-
-#ifndef APP_BLE_STACK_ENABLE
-#define APP_BLE_STACK_ENABLE                     (0u)
 #endif
 
 #if (APP_BLE_ENABLE)
@@ -142,13 +144,20 @@ typedef struct
     uint32_t prev_melbank_windows_profiled;
     uint32_t prev_suppress_count_total;
     uint32_t event_candidate_start_ms;
+    uint32_t event_candidate_start_input_sequence;
+    uint32_t event_candidate_start_result_sequence;
     uint32_t event_candidate_hits;
     uint32_t last_suppress_log_ms;
     uint32_t last_event_ms;
+    uint32_t last_event_start_input_sequence;
+    uint32_t last_event_end_input_sequence;
     float event_candidate_max_energy;
+    float event_candidate_peak_cough_prob;
     float last_event_max_energy;
     float last_suppressed_energy;
     float max_suppressed_energy_1s;
+    bool last_demo_decision_valid;
+    bool last_demo_decision_cough;
 } app_model_result_monitor_runtime_t;
 
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
@@ -178,8 +187,19 @@ static uint32_t model_event_context_write_index;
 #endif
 
 static const char *app_model_result_monitor_status_name(uint8_t status);
+static uint32_t app_model_result_monitor_prob_to_x100(float value);
+static void app_model_result_monitor_build_replay_window_suffix(
+    uint32_t input_sequence,
+    char *suffix,
+    size_t suffix_size);
+static void app_model_result_monitor_build_replay_range_suffix(
+    uint32_t start_input_sequence,
+    uint32_t end_input_sequence,
+    char *suffix,
+    size_t suffix_size);
 static void app_model_result_monitor_print_float(float value);
 static void app_model_result_monitor_print_float_force(float value);
+static void app_model_result_monitor_print_boot_marker(void);
 static void app_model_result_monitor_print_deployment_info(void);
 static void app_model_result_monitor_update_status_counts(
     const app_model_inference_result_t *result);
@@ -187,6 +207,11 @@ static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
     uint32_t now_ms);
+static void app_model_result_monitor_maybe_print_demo_change(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms,
+    bool demo_cough);
 static void app_model_result_monitor_bridge_summary(uint32_t now_ms);
 static bool app_model_result_monitor_has_live_scores(
     const app_model_inference_result_t *result);
@@ -262,6 +287,11 @@ cy_rslt_t app_model_result_monitor_task_init(void)
 void app_model_result_monitor_task(void *pvParameters)
 {
     (void)pvParameters;
+
+#if (APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE || \
+     APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+    app_model_result_monitor_print_boot_marker();
+#endif
 
 #if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
     app_model_result_monitor_print_deployment_info();
@@ -406,9 +436,12 @@ void app_model_result_monitor_task(void *pvParameters)
             }
             else if (app_model_result_monitor_has_live_scores(&result))
             {
+#if ((APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT) && \
+     (!APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE))
                 const char *decision =
                     (APP_MODEL_DEMO_COUGH_THRESHOLD <= result.scores[2]) ?
                     "COUGH" : "NON_COUGH";
+#endif
 
                 /* 对正式业务结果，先更新运行时统计，再按日志级别决定是否打印。 */
                 app_model_result_monitor_note_live_result(&result,
@@ -425,15 +458,44 @@ void app_model_result_monitor_task(void *pvParameters)
                 app_model_result_monitor_print_demo_result(&result,
                                                            result_sequence);
 #endif
-#if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
                 if (app_model_result_monitor_should_print_event(
                         &result,
                         result_sequence,
                         app_model_result_monitor_now_ms()))
                 {
+                    model_result_monitor_stats.events_printed++;
+                    model_result_monitor_stats.last_event_id =
+                        model_result_runtime.event_id;
+                    model_result_monitor_stats.last_confirmed_cough_edge =
+                        true;
+                    model_result_monitor_stats.last_confirmed_cough_event_id =
+                        model_result_runtime.event_id;
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+                    {
+                        char replay_suffix[160];
+                        uint32_t log_start_ms =
+                            app_model_result_monitor_log_start();
+                        app_model_result_monitor_build_replay_range_suffix(
+                            model_result_runtime.last_event_start_input_sequence,
+                            model_result_runtime.last_event_end_input_sequence,
+                            replay_suffix,
+                            sizeof(replay_suffix));
+                        printf("[COUGH_EDGE] id=%lu t_ms=%lu "
+                               "source=C2_ACCEPTED%s\r\n",
+                               (unsigned long)model_result_runtime.event_id,
+                               (unsigned long)
+                                   app_model_result_monitor_now_ms(),
+                               replay_suffix);
+                        fflush(stdout);
+                        app_model_result_monitor_log_end(log_start_ms);
+                    }
+#endif
+#if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
+#if (!APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE)
                     app_model_result_monitor_print_event(&result,
                                                          result_sequence,
                                                          decision);
+#endif
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
                     if (
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
@@ -466,8 +528,8 @@ void app_model_result_monitor_task(void *pvParameters)
 #endif
                     }
 #endif
-                }
 #endif
+                }
             }
             else
             {
@@ -508,6 +570,7 @@ void app_model_result_monitor_task(void *pvParameters)
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
         app_model_result_monitor_bridge_summary(app_model_result_monitor_now_ms());
+        model_result_monitor_stats.last_confirmed_cough_edge = false;
 #if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
         app_model_result_monitor_maybe_print_ipc_smoke_stat(
             shared,
@@ -553,6 +616,108 @@ static const char *app_model_result_monitor_status_name(uint8_t status)
     }
 }
 
+static uint32_t app_model_result_monitor_prob_to_x100(float value)
+{
+    if (value <= 0.0f)
+    {
+        return 0u;
+    }
+    if (value >= 1.0f)
+    {
+        return 100u;
+    }
+
+    return (uint32_t)((value * 100.0f) + 0.5f);
+}
+
+static void app_model_result_monitor_build_replay_window_suffix(
+    uint32_t input_sequence,
+    char *suffix,
+    size_t suffix_size)
+{
+    if ((NULL == suffix) || (0u == suffix_size))
+    {
+        return;
+    }
+
+    suffix[0] = '\0';
+
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    app_audio_replay_runtime_info_t runtime_info;
+    app_audio_replay_window_info_t window_info;
+    char replay_time_sec[24];
+
+    if (!app_audio_replay_get_runtime_info(&runtime_info) ||
+        !app_audio_replay_get_window_info(input_sequence, &window_info))
+    {
+        return;
+    }
+
+    app_audio_replay_format_seconds(replay_time_sec,
+                                    sizeof(replay_time_sec),
+                                    window_info.start_ms);
+    (void)snprintf(
+        suffix,
+        suffix_size,
+        " replay_mode=1 chunk_id=%s replay_window_index=%lu replay_time_sec=%s",
+        (NULL != runtime_info.chunk_id) ? runtime_info.chunk_id : "null",
+        (unsigned long)window_info.replay_window_index,
+        replay_time_sec);
+#else
+    (void)input_sequence;
+#endif
+}
+
+static void app_model_result_monitor_build_replay_range_suffix(
+    uint32_t start_input_sequence,
+    uint32_t end_input_sequence,
+    char *suffix,
+    size_t suffix_size)
+{
+    if ((NULL == suffix) || (0u == suffix_size))
+    {
+        return;
+    }
+
+    suffix[0] = '\0';
+
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    app_audio_replay_runtime_info_t runtime_info;
+    app_audio_replay_window_info_t start_window;
+    app_audio_replay_window_info_t end_window;
+    char start_time_sec[24];
+    char end_time_sec[24];
+
+    if (!app_audio_replay_get_runtime_info(&runtime_info) ||
+        !app_audio_replay_get_window_info(start_input_sequence, &start_window) ||
+        !app_audio_replay_get_window_info(end_input_sequence, &end_window))
+    {
+        return;
+    }
+
+    app_audio_replay_format_seconds(start_time_sec,
+                                    sizeof(start_time_sec),
+                                    start_window.start_ms);
+    app_audio_replay_format_seconds(end_time_sec,
+                                    sizeof(end_time_sec),
+                                    end_window.end_ms);
+    (void)snprintf(
+        suffix,
+        suffix_size,
+        " replay_mode=1 chunk_id=%s replay_window_index_start=%lu "
+        "replay_window_index_end=%lu replay_time_sec_start=%s "
+        "replay_time_sec_end=%s",
+        (NULL != runtime_info.chunk_id) ? runtime_info.chunk_id : "null",
+        (unsigned long)start_window.replay_window_index,
+        (unsigned long)end_window.replay_window_index,
+        start_time_sec,
+        end_time_sec);
+#else
+    (void)start_input_sequence;
+    (void)end_input_sequence;
+#endif
+}
+
 static void app_model_result_monitor_print_float(float value)
 {
 #if (APP_MODEL_PRINT_FLOAT_ENABLE)
@@ -584,6 +749,24 @@ static void app_model_result_monitor_print_float_force(float value)
     }
 
     printf("%s%lu.%06lu", sign, (unsigned long)whole, (unsigned long)frac);
+}
+
+static void app_model_result_monitor_print_boot_marker(void)
+{
+    uint32_t log_start_ms = app_model_result_monitor_log_start();
+
+    printf("[BOOT] t_ms=0 model=%s frontend=%s window=%lu.%01lu hop=%lu.%01lu "
+           "trace=1\r\n",
+           APP_AUDIO_ACTIVE_MODEL_NAME,
+           APP_AUDIO_ACTIVE_FRONTEND_NAME,
+           (unsigned long)(APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS / 1000u),
+           (unsigned long)
+               ((APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_MS % 1000u) / 100u),
+           (unsigned long)(APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS / 1000u),
+           (unsigned long)
+               ((APP_AUDIO_PREPROCESS_DEFAULT_WINDOW_HOP_MS % 1000u) / 100u));
+    fflush(stdout);
+    app_model_result_monitor_log_end(log_start_ms);
 }
 
 static void app_model_result_monitor_print_deployment_info(void)
@@ -692,16 +875,39 @@ static void app_model_result_monitor_note_live_result(
     model_result_monitor_stats.max_cough_prob_1s =
         model_result_runtime.max_cough_prob_1s;
 
+#if (APP_MODEL_LOG_RESULT_ENABLE)
+    {
+        const char *pred =
+            (APP_MODEL_DEMO_COUGH_THRESHOLD <= result->scores[2]) ?
+            "cough" : "non_cough";
+        uint32_t log_start_ms = app_model_result_monitor_log_start();
+        printf("[MODEL] t_ms=%lu prob_x100=%lu pred=%s\r\n",
+               (unsigned long)now_ms,
+               (unsigned long)(result->scores[2] * 100.0f + 0.5f),
+               pred);
+        fflush(stdout);
+        app_model_result_monitor_log_end(log_start_ms);
+    }
+#endif
+
     /* 用 demo 阈值把每帧结果粗分为 cough / non_cough，
      * 后续周期统计直接基于这里累加的计数输出。
      */
     if (APP_MODEL_DEMO_COUGH_THRESHOLD <= result->scores[2])
     {
         model_result_runtime.decision_count_cough_1s++;
+        app_model_result_monitor_maybe_print_demo_change(result,
+                                                         result_sequence,
+                                                         now_ms,
+                                                         true);
     }
     else
     {
         model_result_runtime.decision_count_non_cough_1s++;
+        app_model_result_monitor_maybe_print_demo_change(result,
+                                                         result_sequence,
+                                                         now_ms,
+                                                         false);
     }
     model_result_monitor_stats.decision_count_cough_1s =
         model_result_runtime.decision_count_cough_1s;
@@ -769,6 +975,8 @@ static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
     audio.audio_quality = audio.valid ? 100u : 0u;
     audio.mic_quality_poor = false;
     audio.reason_flags = 0u;
+    audio.confirmed_cough_edge = stats.last_confirmed_cough_edge;
+    audio.confirmed_cough_event_id = stats.last_confirmed_cough_event_id;
 
 #if (APP_BLE_ENABLE)
     device.monitor_requested = app_ble_cmd_monitor_is_requested();
@@ -1074,7 +1282,8 @@ static void app_model_result_monitor_print_suppress(
     uint32_t now_ms,
     float max_energy)
 {
-#if (APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT)
+#if ((APP_MODEL_LOG_LEVEL >= APP_MODEL_LOG_LEVEL_STAT) && \
+     APP_MODEL_LOG_RESULT_ENABLE)
     uint32_t log_start_ms;
 
     if (NULL == result)
@@ -1122,13 +1331,50 @@ static bool app_model_result_monitor_should_print_event(
     uint32_t now_ms)
 {
     float candidate_energy;
+    uint32_t candidate_id;
+    uint32_t duration_ms;
+    uint32_t peak_x100;
 
     if ((NULL == result) ||
         (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
     {
+        if (0u != model_result_runtime.event_candidate_hits)
+        {
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+            candidate_id =
+                model_result_runtime.event_candidate_start_result_sequence;
+            duration_ms =
+                (0u != model_result_runtime.event_candidate_start_ms) ?
+                (now_ms - model_result_runtime.event_candidate_start_ms) : 0u;
+            peak_x100 = app_model_result_monitor_prob_to_x100(
+                model_result_runtime.event_candidate_peak_cough_prob);
+            {
+                char replay_suffix[160];
+                uint32_t log_start_ms =
+                    app_model_result_monitor_log_start();
+                app_model_result_monitor_build_replay_range_suffix(
+                    model_result_runtime.event_candidate_start_input_sequence,
+                    result->input_sequence,
+                    replay_suffix,
+                    sizeof(replay_suffix));
+                printf("[C1_EVENT] id=%lu confirmed=0 reason=threshold_drop "
+                       "peak_x100=%lu hits=%lu duration_ms=%lu%s\r\n",
+                       (unsigned long)candidate_id,
+                       (unsigned long)peak_x100,
+                       (unsigned long)model_result_runtime.event_candidate_hits,
+                       (unsigned long)duration_ms,
+                       replay_suffix);
+                fflush(stdout);
+                app_model_result_monitor_log_end(log_start_ms);
+            }
+#endif
+        }
         model_result_runtime.event_candidate_hits = 0u;
         model_result_runtime.event_candidate_start_ms = 0u;
+        model_result_runtime.event_candidate_start_input_sequence = 0u;
+        model_result_runtime.event_candidate_start_result_sequence = 0u;
         model_result_runtime.event_candidate_max_energy = 0.0f;
+        model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
         return false;
     }
 
@@ -1146,8 +1392,13 @@ static bool app_model_result_monitor_should_print_event(
           APP_MODEL_EVENT_WINDOW_MS)))
     {
         model_result_runtime.event_candidate_start_ms = now_ms;
+        model_result_runtime.event_candidate_start_input_sequence =
+            result->input_sequence;
+        model_result_runtime.event_candidate_start_result_sequence =
+            result_sequence;
         model_result_runtime.event_candidate_hits = 0u;
         model_result_runtime.event_candidate_max_energy = 0.0f;
+        model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
     }
 
     candidate_energy = result->scores[3];
@@ -1156,12 +1407,68 @@ static bool app_model_result_monitor_should_print_event(
     {
         model_result_runtime.event_candidate_max_energy = candidate_energy;
     }
+    if ((0u == model_result_runtime.event_candidate_hits) ||
+        (model_result_runtime.event_candidate_peak_cough_prob < result->scores[2]))
+    {
+        model_result_runtime.event_candidate_peak_cough_prob = result->scores[2];
+    }
 
     model_result_runtime.event_candidate_hits++;
+    candidate_id = model_result_runtime.event_candidate_start_result_sequence;
+    duration_ms = (0u != model_result_runtime.event_candidate_start_ms) ?
+                  (now_ms - model_result_runtime.event_candidate_start_ms) : 0u;
+    peak_x100 = app_model_result_monitor_prob_to_x100(
+        model_result_runtime.event_candidate_peak_cough_prob);
+    if (1u == model_result_runtime.event_candidate_hits)
+    {
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+        char replay_suffix[160];
+        uint32_t log_start_ms = app_model_result_monitor_log_start();
+
+        app_model_result_monitor_build_replay_range_suffix(
+            model_result_runtime.event_candidate_start_input_sequence,
+            result->input_sequence,
+            replay_suffix,
+            sizeof(replay_suffix));
+        printf("[C1_CAND] id=%lu start_ms=%lu end_ms=%lu peak_x100=%lu "
+               "hits=%lu duration_ms=%lu%s\r\n",
+               (unsigned long)candidate_id,
+               (unsigned long)model_result_runtime.event_candidate_start_ms,
+               (unsigned long)now_ms,
+               (unsigned long)peak_x100,
+               (unsigned long)model_result_runtime.event_candidate_hits,
+               (unsigned long)duration_ms,
+               replay_suffix);
+        fflush(stdout);
+        app_model_result_monitor_log_end(log_start_ms);
+#endif
+    }
     if (model_result_runtime.event_candidate_hits < APP_MODEL_EVENT_MIN_HITS)
     {
         return false;
     }
+
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+    {
+        char replay_suffix[160];
+        uint32_t log_start_ms = app_model_result_monitor_log_start();
+
+        app_model_result_monitor_build_replay_range_suffix(
+            model_result_runtime.event_candidate_start_input_sequence,
+            result->input_sequence,
+            replay_suffix,
+            sizeof(replay_suffix));
+        printf("[C1_EVENT] id=%lu confirmed=1 reason=hits_reached "
+               "peak_x100=%lu hits=%lu duration_ms=%lu%s\r\n",
+               (unsigned long)candidate_id,
+               (unsigned long)peak_x100,
+               (unsigned long)model_result_runtime.event_candidate_hits,
+               (unsigned long)duration_ms,
+               replay_suffix);
+        fflush(stdout);
+        app_model_result_monitor_log_end(log_start_ms);
+    }
+#endif
 
     candidate_energy = model_result_runtime.event_candidate_max_energy;
     if (candidate_energy < APP_MODEL_EVENT_MIN_ENERGY)
@@ -1177,16 +1484,69 @@ static bool app_model_result_monitor_should_print_event(
             result_sequence,
             now_ms,
             candidate_energy);
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+        {
+            char replay_suffix[160];
+            uint32_t log_start_ms = app_model_result_monitor_log_start();
+
+            app_model_result_monitor_build_replay_range_suffix(
+                model_result_runtime.event_candidate_start_input_sequence,
+                result->input_sequence,
+                replay_suffix,
+                sizeof(replay_suffix));
+            printf("[C2_EVENT] id=%lu accepted=0 reject_reason=low_energy "
+                   "peak_x100=%lu hits=%lu duration_ms=%lu%s\r\n",
+                   (unsigned long)candidate_id,
+                   (unsigned long)peak_x100,
+                   (unsigned long)model_result_runtime.event_candidate_hits,
+                   (unsigned long)duration_ms,
+                   replay_suffix);
+            fflush(stdout);
+            app_model_result_monitor_log_end(log_start_ms);
+        }
+#endif
         model_result_runtime.event_candidate_hits = 0u;
         model_result_runtime.event_candidate_start_ms = 0u;
+        model_result_runtime.event_candidate_start_input_sequence = 0u;
+        model_result_runtime.event_candidate_start_result_sequence = 0u;
         model_result_runtime.event_candidate_max_energy = 0.0f;
+        model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
         return false;
     }
 
+#if (APP_MODEL_LOG_CONFIRMED_EVENT_ENABLE)
+    {
+        char replay_suffix[160];
+        uint32_t log_start_ms = app_model_result_monitor_log_start();
+
+        app_model_result_monitor_build_replay_range_suffix(
+            model_result_runtime.event_candidate_start_input_sequence,
+            result->input_sequence,
+            replay_suffix,
+            sizeof(replay_suffix));
+        printf("[C2_EVENT] id=%lu accepted=1 reject_reason=none "
+               "peak_x100=%lu hits=%lu duration_ms=%lu%s\r\n",
+               (unsigned long)candidate_id,
+               (unsigned long)peak_x100,
+               (unsigned long)model_result_runtime.event_candidate_hits,
+               (unsigned long)duration_ms,
+               replay_suffix);
+        fflush(stdout);
+        app_model_result_monitor_log_end(log_start_ms);
+    }
+#endif
+
     model_result_runtime.last_event_max_energy = candidate_energy;
+    model_result_runtime.last_event_start_input_sequence =
+        model_result_runtime.event_candidate_start_input_sequence;
+    model_result_runtime.last_event_end_input_sequence =
+        result->input_sequence;
     model_result_runtime.event_candidate_hits = 0u;
     model_result_runtime.event_candidate_start_ms = 0u;
+    model_result_runtime.event_candidate_start_input_sequence = 0u;
+    model_result_runtime.event_candidate_start_result_sequence = 0u;
     model_result_runtime.event_candidate_max_energy = 0.0f;
+    model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
     model_result_runtime.last_event_ms = now_ms;
     return true;
 }
@@ -1417,6 +1777,58 @@ static void app_model_result_monitor_maybe_print_stat(
 }
 #endif
 #endif
+
+static void app_model_result_monitor_maybe_print_demo_change(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms,
+    bool demo_cough)
+{
+#if (APP_MODEL_LOG_DEMO_COUGH_ONLY_ENABLE)
+    uint32_t log_start_ms;
+    const char *curr_pred;
+    uint32_t cough_x100;
+    uint32_t non_cough_x100;
+    char replay_suffix[160];
+
+    if (NULL == result)
+    {
+        return;
+    }
+
+    curr_pred = demo_cough ? "cough" : "non_cough";
+    cough_x100 = app_model_result_monitor_prob_to_x100(result->scores[2]);
+    /* Current live firmware publishes cough_prob in scores[2].
+     * For the binary non_cough/cough contract, non_cough probability is the
+     * complementary probability and is printed explicitly for UART review.
+     */
+    non_cough_x100 = (100u >= cough_x100) ? (100u - cough_x100) : 0u;
+    model_result_runtime.last_demo_decision_valid = true;
+    model_result_runtime.last_demo_decision_cough = demo_cough;
+
+    log_start_ms = app_model_result_monitor_log_start();
+    app_model_result_monitor_build_replay_window_suffix(result->input_sequence,
+                                                        replay_suffix,
+                                                        sizeof(replay_suffix));
+    printf("[MIC_WIN] t_ms=%lu idx=%lu pred=%s cough_x100=%lu "
+           "non_cough_x100=%lu input_seq=%lu result_seq=%lu%s\r\n",
+           (unsigned long)now_ms,
+           (unsigned long)result->input_sequence,
+           curr_pred,
+           (unsigned long)cough_x100,
+           (unsigned long)non_cough_x100,
+           (unsigned long)result->input_sequence,
+           (unsigned long)result_sequence,
+           replay_suffix);
+    fflush(stdout);
+    app_model_result_monitor_log_end(log_start_ms);
+#else
+    (void)result;
+    (void)result_sequence;
+    (void)now_ms;
+    (void)demo_cough;
+#endif
+}
 
 static void app_model_result_monitor_print_idle_diag(
     const volatile app_model_shared_region_t *shared)

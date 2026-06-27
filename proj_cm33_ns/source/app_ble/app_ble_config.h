@@ -1,24 +1,10 @@
 #ifndef __APP_BLE_CONFIG_H__
 #define __APP_BLE_CONFIG_H__
 
+#include "app_build_config.h"
+
 #if defined(__cplusplus)
 extern "C" {
-#endif
-
-#ifndef APP_BLE_ENABLE
-#define APP_BLE_ENABLE                    (0u)
-#endif
-
-#ifndef APP_BLE_FAKE_DATA_ENABLE
-#define APP_BLE_FAKE_DATA_ENABLE          (0u)
-#endif
-
-#ifndef APP_BLE_STACK_ENABLE
-#define APP_BLE_STACK_ENABLE              (0u)
-#endif
-
-#ifndef APP_BLE_SUMMARY_ENABLE
-#define APP_BLE_SUMMARY_ENABLE            (0u)
 #endif
 
 #ifndef APP_BLE_DIAG_ENABLE
@@ -26,7 +12,7 @@ extern "C" {
 #endif
 
 #ifndef APP_BLE_LOG_LEVEL
-#define APP_BLE_LOG_LEVEL                 (1u)
+#define APP_BLE_LOG_LEVEL                 (0u)
 #endif
 
 #define APP_BLE_LOG_LEVEL_QUIET           (0u)
@@ -51,28 +37,8 @@ extern "C" {
 #define APP_BLE_TIME_SYNC_MIN_EPOCH_S     (1577836800UL)
 #define APP_BLE_TIME_SYNC_MAX_EPOCH_S     (4102444800UL)
 
-#if ((APP_BLE_ENABLE != 0u) && (APP_BLE_ENABLE != 1u))
-#error "Unsupported APP_BLE_ENABLE"
-#endif
-
-#if ((APP_BLE_FAKE_DATA_ENABLE != 0u) && (APP_BLE_FAKE_DATA_ENABLE != 1u))
-#error "Unsupported APP_BLE_FAKE_DATA_ENABLE"
-#endif
-
-#if ((APP_BLE_STACK_ENABLE != 0u) && (APP_BLE_STACK_ENABLE != 1u))
-#error "Unsupported APP_BLE_STACK_ENABLE"
-#endif
-
-#if ((APP_BLE_SUMMARY_ENABLE != 0u) && (APP_BLE_SUMMARY_ENABLE != 1u))
-#error "Unsupported APP_BLE_SUMMARY_ENABLE"
-#endif
-
 #if ((APP_BLE_DIAG_ENABLE != 0u) && (APP_BLE_DIAG_ENABLE != 1u))
 #error "Unsupported APP_BLE_DIAG_ENABLE"
-#endif
-
-#if ((APP_BLE_STACK_ENABLE != 0u) && (APP_BLE_ENABLE == 0u))
-#error "APP_BLE_STACK_ENABLE requires APP_BLE_ENABLE"
 #endif
 
 #if defined(__cplusplus)

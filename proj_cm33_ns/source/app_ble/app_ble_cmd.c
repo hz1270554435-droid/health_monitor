@@ -8,6 +8,7 @@
 
 #include "app_ble_config.h"
 #include "app_ble_diag.h"
+#include "app_board_time.h"
 
 #define APP_BLE_ALERT_THRESHOLD_MAX             (100u)
 #define APP_BLE_ALERT_THRESHOLD_DEFAULT_COUGH   (75u)
@@ -30,8 +31,6 @@
 #error "GET_DEVICE_INFO response exceeds default BLE notify payload"
 #endif
 
-static bool ble_time_synced;
-static uint32_t ble_time_offset_s;
 static bool monitor_requested;
 static uint32_t last_start_ts_s;
 static uint32_t last_stop_ts_s;
@@ -54,7 +53,6 @@ cy_rslt_t app_ble_cmd_handle(const app_ble_command_t *cmd,
                              app_ble_cmd_response_t *resp)
 {
     uint32_t epoch_s;
-    uint32_t now_s;
 
     if ((NULL == cmd) || (NULL == resp))
     {
@@ -89,9 +87,19 @@ cy_rslt_t app_ble_cmd_handle(const app_ble_command_t *cmd,
                 break;
             }
 
-            now_s = app_ble_cmd_now_s();
-            ble_time_offset_s = epoch_s - now_s;
-            ble_time_synced = true;
+            if (CY_RSLT_SUCCESS !=
+                app_board_time_calibrate_epoch_s(
+                    epoch_s,
+#if (APP_BLE_FAKE_DATA_ENABLE)
+                    APP_BOARD_TIME_SOURCE_BLE_FAKE
+#else
+                    APP_BOARD_TIME_SOURCE_BLE
+#endif
+                    ))
+            {
+                resp->status = APP_BLE_ERR_STACK_FAILED;
+                break;
+            }
             resp->status = APP_BLE_OK;
             break;
 
@@ -160,12 +168,12 @@ cy_rslt_t app_ble_cmd_handle(const app_ble_command_t *cmd,
 
 bool app_ble_cmd_time_is_synced(void)
 {
-    return ble_time_synced;
+    return app_board_time_is_synced();
 }
 
 uint32_t app_ble_cmd_get_time_offset_s(void)
 {
-    return ble_time_offset_s;
+    return app_board_time_get_offset_s();
 }
 
 bool app_ble_cmd_monitor_is_requested(void)
@@ -196,6 +204,13 @@ void app_ble_cmd_get_alert_threshold_config(
 
 static uint32_t app_ble_cmd_now_s(void)
 {
+    uint32_t epoch_s;
+
+    if (app_board_time_now_epoch_s(&epoch_s))
+    {
+        return epoch_s;
+    }
+
     return (uint32_t)((xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000u);
 }
 
@@ -258,7 +273,7 @@ static uint8_t app_ble_cmd_get_runtime_flags(void)
         runtime |= APP_BLE_RUNTIME_FLAG_MONITOR_REQUESTED;
     }
 
-    if (ble_time_synced)
+    if (app_board_time_is_synced())
     {
         runtime |= APP_BLE_RUNTIME_FLAG_TIME_SYNCED;
     }

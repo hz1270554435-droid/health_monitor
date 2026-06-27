@@ -1,13 +1,18 @@
-/* Auto-generated B0-current test vectors for firmware smoke test. */
-/* Source: ml/exports/v3_3_2_b0_current/fixed_vector_package/ */
 #ifndef AUDIO_TEST_VECTORS_V3_3_2_B0_H
 #define AUDIO_TEST_VECTORS_V3_3_2_B0_H
 
+#include <stdint.h>
+
+#define AUDIO_TEST_VECTOR_BATCH 1
+#define AUDIO_TEST_VECTOR_CHANNELS 1
+#define AUDIO_TEST_VECTOR_N_MELS 40
+#define AUDIO_TEST_VECTOR_TIME_FRAMES 101
+#define AUDIO_TEST_VECTOR_SIZE (AUDIO_TEST_VECTOR_N_MELS * AUDIO_TEST_VECTOR_TIME_FRAMES)
 #define AUDIO_TEST_VECTOR_COUNT 7
-#define AUDIO_TEST_VECTOR_ELEMENT_COUNT 4040  /* 40 mels * 101 time bins */
+#define AUDIO_TEST_VECTOR_EXPECTED_COUNT AUDIO_TEST_VECTOR_COUNT
 
 /* Vector 0: cough */
-static const float audio_test_vector_0[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_0[AUDIO_TEST_VECTOR_SIZE] = {
     -38.744057f, -38.972095f, -42.232517f, -47.048023f, -53.219456f, -56.551777f, -57.609219f, -58.268559f, -55.805481f, -55.152874f,
     -55.832096f, -47.375843f, -37.787842f, -32.585888f, -31.192924f, -32.539124f, -35.323864f, -38.939651f, -42.346527f, -40.887352f,
     -41.754482f, -46.844170f, -54.426079f, -57.009632f, -61.743652f, -67.545715f, -70.693802f, -73.044098f, -76.002487f, -80.000000f,
@@ -415,7 +420,7 @@ static const float audio_test_vector_0[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 1: non_cough */
-static const float audio_test_vector_1[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_1[AUDIO_TEST_VECTOR_SIZE] = {
     -8.683633f, -7.751107f, -7.709148f, -7.018622f, -6.663362f, -6.973580f, -7.178261f, -6.999710f, -6.807178f, -6.475572f,
     -6.280194f, -6.642457f, -7.465981f, -7.390471f, -6.847408f, -7.231152f, -8.126486f, -8.072893f, -6.899215f, -6.043685f,
     -5.922670f, -5.578556f, -4.804056f, -4.944049f, -5.777552f, -5.997849f, -6.244141f, -6.593554f, -7.218094f, -8.224815f,
@@ -823,7 +828,7 @@ static const float audio_test_vector_1[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 2: LQ */
-static const float audio_test_vector_2[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_2[AUDIO_TEST_VECTOR_SIZE] = {
     -8.683633f, -7.751107f, -7.709148f, -7.018622f, -6.663362f, -6.973580f, -7.178261f, -6.999710f, -6.807178f, -6.475572f,
     -6.280194f, -6.642457f, -7.465981f, -7.390471f, -6.847408f, -7.231152f, -8.126486f, -8.072893f, -6.899215f, -6.043685f,
     -5.922670f, -5.578556f, -4.804056f, -4.944049f, -5.777552f, -5.997849f, -6.244141f, -6.593554f, -7.218094f, -8.224815f,
@@ -1231,7 +1236,7 @@ static const float audio_test_vector_2[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 3: KE */
-static const float audio_test_vector_3[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_3[AUDIO_TEST_VECTOR_SIZE] = {
     -55.096550f, -56.779671f, -60.801552f, -61.644165f, -63.208485f, -66.529388f, -66.337730f, -64.900970f, -65.436394f, -67.340782f,
     -68.259254f, -65.333603f, -62.876183f, -61.581238f, -60.915443f, -61.262821f, -62.011116f, -60.148407f, -55.722771f, -53.480591f,
     -54.600418f, -59.106148f, -62.295685f, -60.666908f, -58.769279f, -55.946484f, -52.953625f, -50.300526f, -48.930412f, -49.275963f,
@@ -1639,7 +1644,7 @@ static const float audio_test_vector_3[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 4: smoke */
-static const float audio_test_vector_4[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_4[AUDIO_TEST_VECTOR_SIZE] = {
     -38.083069f, -35.812561f, -35.158333f, -33.780941f, -30.827097f, -26.251564f, -20.363853f, -17.199774f, -17.242064f, -20.115473f,
     -23.919733f, -23.316818f, -21.457117f, -21.903013f, -25.142044f, -31.401688f, -40.910793f, -43.680908f, -42.239403f, -40.747520f,
     -41.381256f, -44.888916f, -50.691872f, -44.472626f, -33.114738f, -27.058044f, -25.211927f, -27.044338f, -32.117889f, -33.607773f,
@@ -2047,7 +2052,7 @@ static const float audio_test_vector_4[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 5: throat_clear */
-static const float audio_test_vector_5[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_5[AUDIO_TEST_VECTOR_SIZE] = {
     -22.086830f, -18.488035f, -15.087276f, -12.329895f, -11.400867f, -13.118420f, -17.608767f, -20.016676f, -20.552404f, -20.783352f,
     -18.834223f, -18.939568f, -20.824986f, -21.538607f, -19.718269f, -17.606344f, -18.045561f, -20.971733f, -23.585058f, -23.954323f,
     -25.027897f, -27.116634f, -28.293808f, -28.512537f, -29.809664f, -31.891344f, -32.214855f, -29.645224f, -28.597439f, -30.520504f,
@@ -2455,7 +2460,7 @@ static const float audio_test_vector_5[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
 };
 
 /* Vector 6: fabric_or_knock */
-static const float audio_test_vector_6[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
+static const float audio_test_vector_6[AUDIO_TEST_VECTOR_SIZE] = {
     -8.683633f, -7.751107f, -7.709148f, -7.018622f, -6.663362f, -6.973580f, -7.178261f, -6.999710f, -6.807178f, -6.475572f,
     -6.280194f, -6.642457f, -7.465981f, -7.390471f, -6.847408f, -7.231152f, -8.126486f, -8.072893f, -6.899215f, -6.043685f,
     -5.922670f, -5.578556f, -4.804056f, -4.944049f, -5.777552f, -5.997849f, -6.244141f, -6.593554f, -7.218094f, -8.224815f,
@@ -2862,15 +2867,18 @@ static const float audio_test_vector_6[AUDIO_TEST_VECTOR_ELEMENT_COUNT] = {
     -28.973034f, -28.228630f, -27.722424f, -27.495831f, -27.898438f, -28.792538f, -28.762730f, -28.234543f, -28.942101f, -31.707714f
 };
 
-/* Expected outputs: [logit0, logit1, cough_prob] */
-static const float audio_test_vector_expected[7][3] = {
-    /* cough */ {-0.8816f, 1.1233f, 0.8813f},
-    /* non_cough */ {4.2924f, -4.0164f, 0.0002f},
-    /* LQ */ {4.2924f, -4.0164f, 0.0002f},
-    /* KE */ {0.6812f, -0.5579f, 0.2246f},
-    /* smoke */ {0.5670f, -0.3604f, 0.2835f},
-    /* throat_clear */ {3.8975f, -3.7483f, 0.0005f},
-    /* fabric_or_knock */ {4.2924f, -4.0164f, 0.0002f}
+static const float* const audio_test_vectors[AUDIO_TEST_VECTOR_COUNT] = {
+    audio_test_vector_0,
+    audio_test_vector_1,
+    audio_test_vector_2,
+    audio_test_vector_3,
+    audio_test_vector_4,
+    audio_test_vector_5,
+    audio_test_vector_6
 };
+
+static const float audio_test_vector_expected_output0[AUDIO_TEST_VECTOR_COUNT] = { -0.8816000f, 4.2924000f, 4.2924000f, 0.6812000f, 0.5670000f, 3.8975000f, 4.2924000f };
+static const float audio_test_vector_expected_output1[AUDIO_TEST_VECTOR_COUNT] = { 1.1233000f, -4.0164000f, -4.0164000f, -0.5579000f, -0.3604000f, -3.7483000f, -4.0164000f };
+static const float audio_test_vector_expected_cough_prob[AUDIO_TEST_VECTOR_COUNT] = { 0.88130000f, 0.00020000f, 0.00020000f, 0.22460000f, 0.28350000f, 0.00050000f, 0.00020000f };
 
 #endif /* AUDIO_TEST_VECTORS_V3_3_2_B0_H */

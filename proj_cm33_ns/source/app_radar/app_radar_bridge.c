@@ -323,6 +323,7 @@ static void bridge_map_to_radar_input(
 static void bridge_log_source_markers(const app_radar_bridge_accumulator_t *acc,
                                       const app_radar_quality_result_t *quality)
 {
+#if (APP_RADAR_BRIDGE_LOG_ENABLE)
     printf("[RADAR_BRIDGE] mock=0 host_mock=0 fake=0 projection=0 "
            "real_radar=%u bridge=1 test_decoder=0 "
            "quality=%u valid=%u stale=%u age_ms=%lu "
@@ -351,6 +352,10 @@ static void bridge_log_source_markers(const app_radar_bridge_accumulator_t *acc,
            (long)acc->hr_centi,
            acc->has_distance ? 1u : 0u,
            (long)acc->distance_cm);
+#else
+    (void)acc;
+    (void)quality;
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -369,8 +374,10 @@ static void app_radar_bridge_task(void *pvParameters)
     app_radar_quality_input_default(&quality_input);
     quality_input.profile = APP_RADAR_QUALITY_PROFILE_BRIDGE;
 
+#if (APP_RADAR_BRIDGE_LOG_ENABLE)
     printf("[RADAR_BRIDGE] task started, profile=bridge, "
            "test_decoder=disabled\r\n");
+#endif
 
     for (;;)
     {
@@ -428,8 +435,9 @@ static void app_radar_bridge_task(void *pvParameters)
         }
 
         /* Periodic source marker log. */
-        if (pdMS_TO_TICKS(APP_RADAR_BRIDGE_LOG_MS) <=
-            (xTaskGetTickCount() - last_log_tick))
+        if (APP_RADAR_BRIDGE_LOG_ENABLE &&
+            (pdMS_TO_TICKS(APP_RADAR_BRIDGE_LOG_MS) <=
+             (xTaskGetTickCount() - last_log_tick)))
         {
             bridge_log_source_markers(&accumulator, &quality_result);
             last_log_tick = xTaskGetTickCount();

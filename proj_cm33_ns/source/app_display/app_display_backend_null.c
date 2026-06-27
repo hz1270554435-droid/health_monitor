@@ -35,13 +35,6 @@ static const char *app_display_backend_mock_scenario(
 
 cy_rslt_t app_display_backend_null_init(void)
 {
-    printf("[DISPLAY] backend=null init, min_log_ms=%lu, smoke=%lu, "
-           "final_mock=%lu product_screen=%lu\r\n",
-           (unsigned long)APP_DISPLAY_NULL_LOG_MIN_PERIOD_MS,
-           (unsigned long)APP_DISPLAY_SMOKE_ENABLE,
-           (unsigned long)APP_DISPLAY_FINAL_MOCK_ENABLE,
-           (unsigned long)APP_DISPLAY_PRODUCT_SCREEN_ENABLE);
-    fflush(stdout);
     return CY_RSLT_SUCCESS;
 }
 
@@ -52,6 +45,11 @@ void app_display_backend_null_render_snapshot(
     uint32_t now_ms = app_display_backend_now_ms();
 
     if (NULL == snapshot)
+    {
+        return;
+    }
+
+    if (!APP_DISPLAY_NULL_SNAPSHOT_LOG_ENABLE)
     {
         return;
     }
@@ -175,6 +173,11 @@ static void app_display_backend_print_home_page(
 {
     const e84_display_snapshot_t *snapshot = &view->snapshot;
 
+    if (!APP_DISPLAY_NULL_PAGE_LOG_ENABLE)
+    {
+        return;
+    }
+
     printf("[DISPLAY_PAGE] t_ms=%lu page=%s previous=%s reason=%s "
            "state=%s radar_presence=%u breath_rate_bpm=",
            (unsigned long)now_ms,
@@ -206,6 +209,11 @@ static void app_display_backend_print_alert_page(
     uint32_t elapsed_ms =
         now_ms - view->alert.raised_timestamp_ms;
 
+    if (!APP_DISPLAY_NULL_PAGE_LOG_ENABLE)
+    {
+        return;
+    }
+
     printf("[DISPLAY_PAGE] t_ms=%lu page=ALERT previous=%s reason=%s "
            "severity=%s code=%s title=\"%s\" message=\"%s\" "
            "raised_ms=%lu elapsed_ms=%lu timeout_ms=%lu dismissible=%u "
@@ -231,6 +239,11 @@ static void app_display_backend_print_debug_page(
     const e84_display_view_model_t *view,
     uint32_t now_ms)
 {
+    if (!APP_DISPLAY_NULL_PAGE_LOG_ENABLE)
+    {
+        return;
+    }
+
     printf("[DISPLAY_PAGE] t_ms=%lu page=DEBUG previous=%s reason=%s "
            "last_snapshot_ts_ms=%lu active_page=%s active_alert=%s "
            "dropped=%lu smoke=%u last_refresh_ms=%lu dirty=%u\r\n",

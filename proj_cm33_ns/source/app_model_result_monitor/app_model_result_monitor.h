@@ -130,6 +130,16 @@ typedef struct
     bool has_result;
     /* 是否已经看到至少一个正式 live 结果。 */
     bool has_live_result;
+    /* 最近一次确认咳嗽事件的单 tick 边沿信号。
+     * 仅在 app_model_result_monitor_should_print_event() 返回 true 的
+     * 那一个 tick 为 true；所有其他 tick（含阈值保持、冷却、近期状态保持、
+     * 滚动计数保持、启动恢复）均为 false。
+     */
+    bool last_confirmed_cough_edge;
+    /* 最近一次确认咳嗽事件 id。
+     * 等于 last_event_id，用于 CM33→Monitor Summary 桥接。
+     */
+    uint32_t last_confirmed_cough_event_id;
 } app_model_result_monitor_stats_t;
 
 cy_rslt_t app_model_result_monitor_task_init(void);

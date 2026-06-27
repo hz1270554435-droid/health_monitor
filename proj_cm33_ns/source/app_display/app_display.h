@@ -15,14 +15,11 @@
 
 #include "cy_pdl.h"
 
+#include "app_build_config.h"
 #include "app_display_types.h"
 
 #if defined(__cplusplus)
 extern "C" {
-#endif
-
-#ifndef APP_DISPLAY_ENABLE
-#define APP_DISPLAY_ENABLE                       (0u)
 #endif
 
 #ifndef APP_DISPLAY_TASK_STACK_SIZE
@@ -49,32 +46,8 @@ extern "C" {
 #define APP_DISPLAY_ALERT_DEFAULT_TIMEOUT_MS     (5000u)
 #endif
 
-#ifndef APP_DISPLAY_DEBUG_PAGE_ENABLE
-#define APP_DISPLAY_DEBUG_PAGE_ENABLE            (0u)
-#endif
-
-#ifndef APP_DISPLAY_SUMMARY_ENABLE
-#define APP_DISPLAY_SUMMARY_ENABLE               (0u)
-#endif
-
-#ifndef APP_DISPLAY_PRODUCT_SCREEN_ENABLE
-#define APP_DISPLAY_PRODUCT_SCREEN_ENABLE        (0u)
-#endif
-
 #ifndef APP_DISPLAY_SUMMARY_PERIOD_MS
 #define APP_DISPLAY_SUMMARY_PERIOD_MS            (1000u)
-#endif
-
-#ifndef APP_DISPLAY_FINAL_MOCK_ENABLE
-#define APP_DISPLAY_FINAL_MOCK_ENABLE            (0u)
-#endif
-
-#ifndef APP_DISPLAY_FINAL_MOCK_PERIOD_MS
-#define APP_DISPLAY_FINAL_MOCK_PERIOD_MS         (1000u)
-#endif
-
-#ifndef APP_DISPLAY_SMOKE_ENABLE
-#define APP_DISPLAY_SMOKE_ENABLE                 (0u)
 #endif
 
 #ifndef APP_DISPLAY_SMOKE_SNAPSHOT_PERIOD_MS
@@ -89,86 +62,9 @@ extern "C" {
 #define APP_DISPLAY_SMOKE_ALERT_HOLD_MS          (4000u)
 #endif
 
-#if ((APP_DISPLAY_ENABLE != 0u) && (APP_DISPLAY_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_SMOKE_ENABLE != 0u) && \
-     (APP_DISPLAY_SMOKE_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_SMOKE_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_DEBUG_PAGE_ENABLE != 0u) && \
-     (APP_DISPLAY_DEBUG_PAGE_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_DEBUG_PAGE_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_SUMMARY_ENABLE != 0u) && \
-     (APP_DISPLAY_SUMMARY_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_SUMMARY_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_PRODUCT_SCREEN_ENABLE != 0u) && \
-     (APP_DISPLAY_PRODUCT_SCREEN_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_PRODUCT_SCREEN_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_FINAL_MOCK_ENABLE != 0u) && \
-     (APP_DISPLAY_FINAL_MOCK_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_FINAL_MOCK_ENABLE"
-#endif
-
-#ifndef APP_DISPLAY_LCD_ENABLE
-#define APP_DISPLAY_LCD_ENABLE            (0u)
-#endif
-
-#ifndef APP_DISPLAY_LCD_SMOKE_ONLY
-#define APP_DISPLAY_LCD_SMOKE_ONLY        (0u)
-#endif
-
-#if ((APP_DISPLAY_LCD_ENABLE != 0u) && \
-     (APP_DISPLAY_LCD_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_LCD_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_LCD_SMOKE_ONLY != 0u) && \
-     (APP_DISPLAY_LCD_SMOKE_ONLY != 1u))
-#error "Unsupported APP_DISPLAY_LCD_SMOKE_ONLY"
-#endif
-
-#ifndef APP_DISPLAY_LCD_SKIP_PANEL_RESET
-#define APP_DISPLAY_LCD_SKIP_PANEL_RESET  (0u)
-#endif
-
-#if ((APP_DISPLAY_LCD_SKIP_PANEL_RESET != 0u) && \
-     (APP_DISPLAY_LCD_SKIP_PANEL_RESET != 1u))
-#error "Unsupported APP_DISPLAY_LCD_SKIP_PANEL_RESET"
-#endif
-
-#ifndef APP_DISPLAY_LCD_SKIP_GFXSS_INIT
-#define APP_DISPLAY_LCD_SKIP_GFXSS_INIT  (0u)
-#endif
-
-#if ((APP_DISPLAY_LCD_SKIP_GFXSS_INIT != 0u) && \
-     (APP_DISPLAY_LCD_SKIP_GFXSS_INIT != 1u))
-#error "Unsupported APP_DISPLAY_LCD_SKIP_GFXSS_INIT"
-#endif
-
-#ifndef APP_DISPLAY_LCD_PANEL_POST_RESET_DELAY_MS
-#define APP_DISPLAY_LCD_PANEL_POST_RESET_DELAY_MS (120u)
-#endif
-
-#ifndef APP_DISPLAY_LCD_DRIVER_SELECT
-#define APP_DISPLAY_LCD_DRIVER_SELECT    0
-#endif
-
 #define APP_DISPLAY_LCD_DRIVER_NONE         0
 #define APP_DISPLAY_LCD_DRIVER_WAVESHARE    1
 #define APP_DISPLAY_LCD_DRIVER_EK79007AD3   2
-
-#ifndef APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY
-#define APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY (0u)
-#endif
 
 #if (APP_DISPLAY_ENABLE)
 

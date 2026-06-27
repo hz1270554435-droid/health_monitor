@@ -98,6 +98,7 @@ typedef struct
     float mic_cough_prob;
     uint16_t cough_count_1min;
     uint16_t cough_count_5min;
+    uint32_t cough_event_count_total;
     uint8_t audio_quality;
     uint8_t fusion_confidence;
     bool ble_connected;

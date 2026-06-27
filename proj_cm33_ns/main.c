@@ -39,6 +39,7 @@
 *******************************************************************************/
 
 #include "app_pdm_pcm.h"
+#include "app_audio_replay.h"
 #include "app_get_data.h"
 #include "app_audio_preprocess.h"
 #include "app_model_result_monitor.h"
@@ -47,6 +48,8 @@
 #include "app_radar_bridge.h"
 #include "app_csv_export.h"
 #include "app_ble_config.h"
+#include "app_board_time.h"
+#include "app_build_config.h"
 #include "app_monitor_summary.h"
 #if (APP_BLE_ENABLE)
 #include "app_ble_stream.h"
@@ -67,25 +70,6 @@
 /* App boot address for CM55 project. */
 #define CM55_APP_BOOT_ADDR                (CYMEM_CM33_0_m55_nvm_START + \
                                            CYBSP_MCUBOOT_HEADER_SIZE)
-
-/* 应用运行模式。
- *
- * 注意：app_pdm_pcm 内部只有一个 PDM block 队列。CSV 导出、MIC 自检和正式
- * 音频前处理都属于这个队列的“消费者”，同一时间只能启用其中一个，否则同一个
- * PCM block 会被其中一个任务抢走，另一个任务就会看到不连续数据。
- *
- * 默认使用正式业务链路：CM33 做音频输入前处理，把处理好的 float32 特征写入
- * m33_m55_shared，后续由 CM55 推理任务读取。需要采集训练数据时，把
- * APP_RUNTIME_MODE 改成 APP_RUNTIME_MODE_CSV_EXPORT；需要只看 MIC 数据质量时，
- * 改成 APP_RUNTIME_MODE_MIC_SELF_TEST。
- */
-#define APP_RUNTIME_MODE_AUDIO_PREPROCESS (0u)
-#define APP_RUNTIME_MODE_CSV_EXPORT       (1u)
-#define APP_RUNTIME_MODE_MIC_SELF_TEST    (2u)
-
-#ifndef APP_RUNTIME_MODE
-#define APP_RUNTIME_MODE                  APP_RUNTIME_MODE_AUDIO_PREPROCESS
-#endif
 
 /* Debug UART 波特率选择接口。
  *
@@ -109,20 +93,6 @@
 #endif
 #endif
 
-/* CM55 结果观察开关。
- * 0：正式部署时可关闭，不打印 CM55 结果，避免 debug UART 对实时链路产生干扰；
- * 1：在正式音频前处理模式下额外启动结果观察任务，只读共享内存 result 区。
- * 该任务不消费 PDM 队列，因此不会影响 app_audio_preprocess。
- * 当前为了上板 baseline 烟雾测试默认打开；模型链路验证通过后可改回 0。
- */
-#ifndef APP_MODEL_RESULT_MONITOR_ENABLE
-#define APP_MODEL_RESULT_MONITOR_ENABLE   (1u)
-#endif
-
-#ifndef APP_UART_SANITY_TEST_ENABLE
-#define APP_UART_SANITY_TEST_ENABLE       (0u)
-#endif
-
 #ifndef APP_UART_SANITY_OUTPUT_METHOD
 #define APP_UART_SANITY_OUTPUT_METHOD     (1u)
 #endif
@@ -134,122 +104,6 @@
 #define APP_UART_SANITY_METHOD_PRINTF     (0u)
 #define APP_UART_SANITY_METHOD_BLOCKING   (1u)
 #define APP_UART_SANITY_LINE_COUNT        (100u)
-
-/* BLE bring-up 调试开关。
- * 0：正常运行现有音频前处理 + CM55 推理链路；
- * 1：临时暂停 AUDIO_PREPROCESS 模式下的 PDM、音频前处理、结果监控和 CM55 boot，
- *    让串口和 CPU 资源优先留给 BLE stack/advertising 诊断。
- */
-#ifndef APP_BLE_DEBUG_DISABLE_INFERENCE
-#define APP_BLE_DEBUG_DISABLE_INFERENCE   (0u)
-#endif
-
-#ifndef APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE
-#define APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE (0u)
-#endif
-
-#ifndef APP_CM55_INFERENCE_ENABLE
-#define APP_CM55_INFERENCE_ENABLE         (1u)
-#endif
-
-#ifndef APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE
-#define APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE
-#define APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_DIAG_ENABLE
-#define APP_DISPLAY_DIAG_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_CM33_DIAG_POLL_ENABLE
-#define APP_DISPLAY_CM33_DIAG_POLL_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
-#define APP_DISPLAY_CM55_UART_LOG_ENABLE (1u)
-#endif
-
-/* Optional Display/UI layer.
- * Default off. When enabled, Stage 1 starts a low-priority null backend task
- * that logs display snapshots/alerts only; it does not initialize real display
- * hardware and does not touch BLE wire format, shared memory ABI, PDM buffers,
- * radar UART raw buffers, or the CM55 inference path.
- */
-#ifndef APP_DISPLAY_ENABLE
-#define APP_DISPLAY_ENABLE                (0u)
-#endif
-
-#ifndef APP_DISPLAY_LCD_ENABLE
-#define APP_DISPLAY_LCD_ENABLE            (0u)
-#endif
-
-#ifndef APP_DISPLAY_LCD_SMOKE_ONLY
-#define APP_DISPLAY_LCD_SMOKE_ONLY        (0u)
-#endif
-
-#if ((APP_RUNTIME_MODE != APP_RUNTIME_MODE_AUDIO_PREPROCESS) && \
-     (APP_RUNTIME_MODE != APP_RUNTIME_MODE_CSV_EXPORT) && \
-     (APP_RUNTIME_MODE != APP_RUNTIME_MODE_MIC_SELF_TEST))
-#error "Unsupported APP_RUNTIME_MODE"
-#endif
-
-#if ((APP_MODEL_RESULT_MONITOR_ENABLE != 0u) && \
-     (APP_MODEL_RESULT_MONITOR_ENABLE != 1u))
-#error "Unsupported APP_MODEL_RESULT_MONITOR_ENABLE"
-#endif
-
-#if ((APP_BLE_DEBUG_DISABLE_INFERENCE != 0u) && \
-     (APP_BLE_DEBUG_DISABLE_INFERENCE != 1u))
-#error "Unsupported APP_BLE_DEBUG_DISABLE_INFERENCE"
-#endif
-
-#if ((APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE != 0u) && \
-     (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE"
-#endif
-
-#if ((APP_CM55_INFERENCE_ENABLE != 0u) && \
-     (APP_CM55_INFERENCE_ENABLE != 1u))
-#error "Unsupported APP_CM55_INFERENCE_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE != 0u) && \
-     (APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_CM33_LAUNCHER_HEARTBEAT_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE != 0u) && \
-     (APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_CM33_LAUNCHER_UART_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_DIAG_ENABLE != 0u) && \
-     (APP_DISPLAY_DIAG_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_DIAG_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_CM33_DIAG_POLL_ENABLE != 0u) && \
-     (APP_DISPLAY_CM33_DIAG_POLL_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_CM33_DIAG_POLL_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_CM55_UART_LOG_ENABLE != 0u) && \
-     (APP_DISPLAY_CM55_UART_LOG_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_CM55_UART_LOG_ENABLE"
-#endif
-
-#if ((APP_DISPLAY_ENABLE != 0u) && \
-     (APP_DISPLAY_ENABLE != 1u))
-#error "Unsupported APP_DISPLAY_ENABLE"
-#endif
-
-#if ((APP_MONITOR_SUMMARY_ENABLE != 0u) && \
-     (APP_MONITOR_SUMMARY_ENABLE != 1u))
-#error "Unsupported APP_MONITOR_SUMMARY_ENABLE"
-#endif
 
 /* 编译期限制 Debug UART 只使用已经计算并验证过 divider 的速率。 */
 #if ((APP_DEBUG_UART_BAUD_RATE != RETARGET_IO_BAUD_115200) && \
@@ -407,6 +261,15 @@ int main(void)
 #endif
 
     app_model_ipc_smoke_log_init();
+    result = app_board_time_init();
+    if (CY_RSLT_SUCCESS != result)
+    {
+        printf("[BOOT] board time init failed, result=0x%08lx\r\n",
+               (unsigned long)result);
+        fflush(stdout);
+    }
+    handle_app_error(result);
+
     printf("[BOOT] CM33 alive, mode=%lu, uart_baud=%lu, shared_ver=%lu\r\n",
            (unsigned long)APP_RUNTIME_MODE,
            (unsigned long)APP_DEBUG_UART_BAUD_RATE,
@@ -476,10 +339,17 @@ int main(void)
      (APP_CSV_EXPORT_MIC_CAPTURE_ENABLE))
 #if !((APP_BLE_DEBUG_DISABLE_INFERENCE) && \
       (APP_RUNTIME_MODE == APP_RUNTIME_MODE_AUDIO_PREPROCESS))
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    result = app_audio_replay_init();
+    handle_app_error(result);
+    printf("[BOOT] replay provider init complete\r\n");
+    fflush(stdout);
+#else
     result = app_pdm_pcm_task_init();
     handle_app_error(result);
     printf("[BOOT] PDM PCM task created\r\n");
     fflush(stdout);
+#endif
 #else
     printf("[BOOT] BLE debug disabled PDM/inference path\r\n");
     fflush(stdout);

@@ -1,13 +1,10 @@
 #include "app_display_summary_adapter.h"
 
 #include "app_display.h"
+#include "app_build_config.h"
 
 #if (APP_DISPLAY_ENABLE && APP_DISPLAY_SUMMARY_ENABLE && \
      !APP_DISPLAY_SMOKE_ENABLE && !APP_DISPLAY_FINAL_MOCK_ENABLE)
-
-#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE
-#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
-#endif
 
 #if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
 #include "app_display_cm55_bridge.h"
@@ -15,14 +12,6 @@
 
 #include <stdbool.h>
 #include <string.h>
-
-#ifndef APP_MONITOR_SUMMARY_ENABLE
-#define APP_MONITOR_SUMMARY_ENABLE            (0u)
-#endif
-
-#ifndef APP_BLE_ENABLE
-#define APP_BLE_ENABLE                        (0u)
-#endif
 
 #if (APP_MONITOR_SUMMARY_ENABLE)
 #include "app_monitor_summary.h"
@@ -40,6 +29,10 @@ static uint32_t summary_last_publish_ms;
 #if (APP_MONITOR_SUMMARY_ENABLE)
 static uint32_t summary_last_event_id;
 static e84_display_alert_t summary_last_display_alert;
+static bool summary_last_cough_total_valid;
+static uint32_t summary_last_cough_total;
+static uint32_t summary_pending_display_source_event_id;
+static bool summary_pending_display_from_cough_edge;
 #endif
 
 #if (APP_MONITOR_SUMMARY_ENABLE)
@@ -56,6 +49,10 @@ static uint8_t app_display_summary_monitor_severity(
     app_monitor_alert_level_t alert_level);
 static uint32_t app_display_summary_monitor_flags(
     const app_monitor_summary_event_t *event);
+static void app_display_summary_log_count_change(
+    const e84_display_snapshot_t *snapshot,
+    const app_monitor_summary_snapshot_t *summary,
+    uint32_t now_ms);
 static void app_display_summary_publish_monitor_event(
     const app_monitor_summary_snapshot_t *summary);
 #else
@@ -97,6 +94,7 @@ cy_rslt_t app_display_summary_adapter_tick(uint32_t now_ms)
         (void)app_display_cm55_bridge_publish(&snapshot);
 #endif
         app_display_summary_publish_monitor_event(&summary);
+        app_display_summary_log_count_change(&snapshot, &summary, now_ms);
         return CY_RSLT_SUCCESS;
     }
 #else
@@ -145,6 +143,7 @@ static void app_display_summary_build_from_monitor(
         ((float)summary->audio.cough_prob_x100) / 100.0f;
     snapshot->cough_count_1min = summary->cough_count_1min;
     snapshot->cough_count_5min = summary->cough_count_5min;
+    snapshot->cough_event_count_total = summary->cough_event_count_total;
     snapshot->audio_quality = summary->audio.audio_quality;
     snapshot->fusion_confidence = summary->fusion_confidence;
     snapshot->ble_connected = app_display_summary_ble_connected() ||
@@ -263,7 +262,7 @@ static e84_display_alert_t app_display_summary_monitor_alert(
     {
         return E84_DISPLAY_ALERT_SYSTEM_ERROR;
     }
-    if ((APP_MONITOR_EVENT_AUDIO_CANDIDATE == event_type) ||
+    if ((APP_MONITOR_EVENT_CONFIRMED_COUGH == event_type) ||
         (APP_MONITOR_EVENT_COUGH_BURST == event_type))
     {
         return E84_DISPLAY_ALERT_COUGH_BURST;
@@ -303,6 +302,86 @@ static uint8_t app_display_summary_monitor_severity(
     }
 }
 
+static void app_display_summary_log_count_change(
+    const e84_display_snapshot_t *snapshot,
+    const app_monitor_summary_snapshot_t *summary,
+    uint32_t now_ms)
+{
+#if (APP_DISPLAY_LOG_COUNT_ENABLE)
+    const char *source = "NONE";
+    uint32_t before;
+    uint32_t after;
+    uint32_t increment;
+
+    if ((NULL == snapshot) || (NULL == summary))
+    {
+        return;
+    }
+
+    after = snapshot->cough_event_count_total;
+    if (!summary_last_cough_total_valid)
+    {
+        summary_last_cough_total = after;
+        summary_last_cough_total_valid = true;
+        return;
+    }
+    if (after == summary_last_cough_total)
+    {
+        return;
+    }
+
+    before = summary_last_cough_total;
+    increment = (after > before) ? 1u : 0u;
+    if (increment &&
+        summary_pending_display_from_cough_edge &&
+        (0u != summary_pending_display_source_event_id))
+    {
+        source = "COUGH_EDGE";
+    }
+    else if (0u != (summary->flags & APP_MONITOR_SNAPSHOT_FLAG_MOCK_DATA))
+    {
+        source = "MOCK";
+    }
+    else if (increment)
+    {
+        source = "OTHER";
+    }
+
+    if (0u != summary_pending_display_source_event_id)
+    {
+        printf("[DISPLAY] t_ms=%lu cough_count_before=%lu "
+               "cough_count_after=%lu increment=%lu source_event_id=%lu "
+               "source=%s\r\n",
+               (unsigned long)now_ms,
+               (unsigned long)before,
+               (unsigned long)after,
+               (unsigned long)increment,
+               (unsigned long)summary_pending_display_source_event_id,
+               source);
+    }
+    else
+    {
+        printf("[DISPLAY] t_ms=%lu cough_count_before=%lu "
+               "cough_count_after=%lu increment=%lu source_event_id=none "
+               "source=%s\r\n",
+               (unsigned long)now_ms,
+               (unsigned long)before,
+               (unsigned long)after,
+               (unsigned long)increment,
+               source);
+    }
+    fflush(stdout);
+
+    summary_last_cough_total = after;
+    summary_pending_display_source_event_id = 0u;
+    summary_pending_display_from_cough_edge = false;
+#else
+    (void)snapshot;
+    (void)summary;
+    (void)now_ms;
+#endif
+}
+
 static void app_display_summary_publish_monitor_event(
     const app_monitor_summary_snapshot_t *summary)
 {
@@ -319,6 +398,13 @@ static void app_display_summary_publish_monitor_event(
         return;
     }
     summary_last_event_id = event.event_id;
+    if ((APP_MONITOR_EVENT_CONFIRMED_COUGH == event.event_type) &&
+        (0u != summary->audio.confirmed_cough_event_id))
+    {
+        summary_pending_display_source_event_id =
+            summary->audio.confirmed_cough_event_id;
+        summary_pending_display_from_cough_edge = true;
+    }
 
     display_alert = app_display_summary_monitor_alert(event.event_type,
                                                       event.alert_level);
@@ -388,6 +474,7 @@ static void app_display_summary_build_snapshot(
         0.0f;
     snapshot->cough_count_1min = 0u;
     snapshot->cough_count_5min = 0u;
+    snapshot->cough_event_count_total = 0u;
     snapshot->audio_quality = app_display_summary_audio_quality(model_stats);
     snapshot->fusion_confidence = 0u;
     snapshot->ble_connected = ble_connected;

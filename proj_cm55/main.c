@@ -45,24 +45,9 @@
 #include "cybsp.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "app_build_config.h"
 #include "app_display_diag.h"
 #include <stdio.h>
-
-#ifndef APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE
-#define APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE (0u)
-#endif
-
-#ifndef APP_CM55_INFERENCE_ENABLE
-#define APP_CM55_INFERENCE_ENABLE (1u)
-#endif
-
-#ifndef APP_DISPLAY_DIAG_ENABLE
-#define APP_DISPLAY_DIAG_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
-#define APP_DISPLAY_CM55_UART_LOG_ENABLE (1u)
-#endif
 
 #if (APP_DISPLAY_OFFICIAL_CM55_BRINGUP_ENABLE)
 #include "app_cm55_display_bringup.h"

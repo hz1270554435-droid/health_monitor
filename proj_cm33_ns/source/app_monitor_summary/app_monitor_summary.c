@@ -34,6 +34,7 @@ typedef struct
     uint32_t last_diag_ms;
     uint32_t last_session_diag_ms;
     uint32_t next_event_id;
+    uint32_t last_confirmed_cough_source_event_id;
     uint32_t session_cough_prob_sum;
     uint32_t night_cough_prob_sum;
     uint8_t smoothed_cough_prob_x100;
@@ -121,7 +122,8 @@ static app_monitor_event_type_t app_monitor_summary_select_active_event(
     const app_monitor_radar_input_t *radar);
 static app_monitor_event_type_t app_monitor_summary_select_event_type(
     const app_monitor_summary_snapshot_t *old_snapshot,
-    const app_monitor_summary_snapshot_t *new_snapshot);
+    const app_monitor_summary_snapshot_t *new_snapshot,
+    uint32_t last_confirmed_cough_source_event_id);
 static bool app_monitor_summary_event_allowed(
     app_monitor_event_type_t event_type,
     app_monitor_state_t monitor_state,
@@ -275,6 +277,7 @@ cy_rslt_t app_monitor_summary_tick(uint32_t now_ms)
     bool next_have_smoothed;
     bool previous_latched;
     bool next_latched;
+    uint32_t last_confirmed_cough_source_event_id;
 
     taskENTER_CRITICAL();
     app_monitor_summary_ensure_initialized_locked();
@@ -293,6 +296,8 @@ cy_rslt_t app_monitor_summary_tick(uint32_t now_ms)
     previous_smoothed = monitor_summary_owner.smoothed_cough_prob_x100;
     previous_have_smoothed = monitor_summary_owner.have_smoothed_cough;
     previous_latched = monitor_summary_owner.cough_latched;
+    last_confirmed_cough_source_event_id =
+        monitor_summary_owner.last_confirmed_cough_source_event_id;
     taskEXIT_CRITICAL();
 
     app_monitor_summary_build_snapshot(&new_snapshot,
@@ -310,8 +315,10 @@ cy_rslt_t app_monitor_summary_tick(uint32_t now_ms)
                                        &next_smoothed,
                                        &next_have_smoothed,
                                        &next_latched);
-    event_type = app_monitor_summary_select_event_type(&old_snapshot,
-                                                       &new_snapshot);
+    event_type = app_monitor_summary_select_event_type(
+        &old_snapshot,
+        &new_snapshot,
+        last_confirmed_cough_source_event_id);
 
     taskENTER_CRITICAL();
     monitor_summary_owner.snapshot = new_snapshot;
@@ -540,8 +547,6 @@ static void app_monitor_summary_build_snapshot(
     app_monitor_audio_input_t audio = *audio_in;
     app_monitor_radar_input_t radar = *radar_in;
     uint32_t reason_flags;
-    uint8_t threshold = (0u != audio.event_threshold_x100) ?
-        audio.event_threshold_x100 : APP_MONITOR_SUMMARY_COUGH_WARNING_X100;
     uint8_t raw_prob = app_monitor_summary_clamp_u8(audio.cough_prob_x100,
                                                     APP_MONITOR_MAX_PERCENT);
     uint8_t smoothed_prob = 0u;
@@ -569,14 +574,11 @@ static void app_monitor_summary_build_snapshot(
         cough_latched = false;
     }
 
-    if (audio.valid && !audio.stale &&
-        ((raw_prob >= threshold) || (smoothed_prob >= threshold) ||
-         audio.cough_confirmed))
+    if (audio.valid && !audio.stale && audio.confirmed_cough_edge)
     {
         cough_latched = true;
     }
-    else if ((raw_prob <= APP_MONITOR_SUMMARY_COUGH_RELEASE_X100) &&
-             (smoothed_prob <= APP_MONITOR_SUMMARY_COUGH_RELEASE_X100))
+    else if (0u == cough_count_1min)
     {
         cough_latched = false;
     }
@@ -584,7 +586,6 @@ static void app_monitor_summary_build_snapshot(
     audio.cough_prob_x100 = smoothed_prob;
     audio.cough_confirmed = cough_latched;
     audio.cough_density_high =
-        audio.cough_density_high ||
         (cough_count_1min >= APP_MONITOR_SUMMARY_COUGH_BURST_1MIN) ||
         (cough_count_5min >= APP_MONITOR_SUMMARY_COUGH_BURST_5MIN);
     if ((0u == audio.audio_quality) && audio.valid && !audio.stale)
@@ -1071,12 +1072,6 @@ static app_monitor_state_t app_monitor_summary_select_monitor_state(
     {
         return APP_MONITOR_STATE_WARNING;
     }
-    if (audio->cough_prob_x100 >= APP_MONITOR_SUMMARY_COUGH_WARNING_X100)
-    {
-        return (radar->valid &&
-                (APP_MONITOR_PRESENCE_ABSENT == radar->presence_state)) ?
-            APP_MONITOR_STATE_ATTENTION : APP_MONITOR_STATE_WARNING;
-    }
     if (audio->cough_confirmed || radar_vitals_attention)
     {
         return APP_MONITOR_STATE_ATTENTION;
@@ -1157,13 +1152,13 @@ static app_monitor_event_type_t app_monitor_summary_select_active_event(
          (APP_MONITOR_VITAL_LOW == radar->heart_state) ||
          (APP_MONITOR_VITAL_HIGH == radar->heart_state));
 
+    if (audio->valid && !audio->stale && audio->confirmed_cough_edge)
+    {
+        return APP_MONITOR_EVENT_CONFIRMED_COUGH;
+    }
     if (audio->valid && !audio->stale && audio->cough_density_high)
     {
         return APP_MONITOR_EVENT_COUGH_BURST;
-    }
-    if (audio->valid && !audio->stale && audio->cough_confirmed)
-    {
-        return APP_MONITOR_EVENT_AUDIO_CANDIDATE;
     }
     if (vitals_attention)
     {
@@ -1175,17 +1170,25 @@ static app_monitor_event_type_t app_monitor_summary_select_active_event(
 
 static app_monitor_event_type_t app_monitor_summary_select_event_type(
     const app_monitor_summary_snapshot_t *old_snapshot,
-    const app_monitor_summary_snapshot_t *new_snapshot)
+    const app_monitor_summary_snapshot_t *new_snapshot,
+    uint32_t last_confirmed_cough_source_event_id)
 {
     if (old_snapshot->sequence == 0u)
     {
         return APP_MONITOR_EVENT_SYSTEM_STATUS;
     }
+    if (new_snapshot->audio.confirmed_cough_edge &&
+        (0u != new_snapshot->audio.confirmed_cough_event_id) &&
+        (new_snapshot->audio.confirmed_cough_event_id !=
+         last_confirmed_cough_source_event_id))
+    {
+        return APP_MONITOR_EVENT_CONFIRMED_COUGH;
+    }
     if ((APP_MONITOR_EVENT_NONE != new_snapshot->active_event_type) &&
-        ((old_snapshot->active_event_type !=
-          new_snapshot->active_event_type) ||
-         (!old_snapshot->audio.cough_confirmed &&
-          new_snapshot->audio.cough_confirmed)))
+        (APP_MONITOR_EVENT_CONFIRMED_COUGH !=
+         new_snapshot->active_event_type) &&
+        (old_snapshot->active_event_type !=
+         new_snapshot->active_event_type))
     {
         return new_snapshot->active_event_type;
     }
@@ -1214,6 +1217,11 @@ static bool app_monitor_summary_event_allowed(
     uint32_t now_ms)
 {
     bool allowed = true;
+
+    if (APP_MONITOR_EVENT_CONFIRMED_COUGH == event_type)
+    {
+        return true;
+    }
 
     taskENTER_CRITICAL();
     if ((event_type == monitor_summary_owner.last_event_type) &&
@@ -1266,6 +1274,11 @@ static void app_monitor_summary_publish_event(
     if (app_monitor_summary_event_is_cough(event.event_type))
     {
         monitor_summary_owner.snapshot.cough_event_count_total++;
+        if (0u != snapshot->audio.confirmed_cough_event_id)
+        {
+            monitor_summary_owner.last_confirmed_cough_source_event_id =
+                snapshot->audio.confirmed_cough_event_id;
+        }
     }
     monitor_summary_owner.event_ring[
         monitor_summary_owner.event_ring_write_index] = event;
@@ -1631,7 +1644,7 @@ static uint8_t app_monitor_summary_event_source_flags(
 {
     uint8_t flags = 0u;
 
-    if ((APP_MONITOR_EVENT_AUDIO_CANDIDATE == event_type) ||
+    if ((APP_MONITOR_EVENT_CONFIRMED_COUGH == event_type) ||
         (APP_MONITOR_EVENT_COUGH_BURST == event_type))
     {
         flags |= (uint8_t)APP_MONITOR_SOURCE_AUDIO;
@@ -1651,8 +1664,7 @@ static uint8_t app_monitor_summary_event_source_flags(
 static bool app_monitor_summary_event_is_cough(
     app_monitor_event_type_t event_type)
 {
-    return (APP_MONITOR_EVENT_AUDIO_CANDIDATE == event_type) ||
-           (APP_MONITOR_EVENT_COUGH_BURST == event_type);
+    return (APP_MONITOR_EVENT_CONFIRMED_COUGH == event_type);
 }
 
 static bool app_monitor_summary_event_is_warning(

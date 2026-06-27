@@ -8,6 +8,7 @@ extern "C" {
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "app_build_config.h"
 #include "cy_pdl.h"
 #include "FreeRTOS.h"
 #include "task.h"

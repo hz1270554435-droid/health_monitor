@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "app_build_config.h"
 #include "cy_pdl.h"
 
 #include "app_monitor_summary_types.h"
@@ -18,24 +19,8 @@
 extern "C" {
 #endif
 
-#ifndef APP_MONITOR_SUMMARY_ENABLE
-#define APP_MONITOR_SUMMARY_ENABLE              (0u)
-#endif
-
-#ifndef APP_MONITOR_SUMMARY_DIAG_ENABLE
-#define APP_MONITOR_SUMMARY_DIAG_ENABLE         (0u)
-#endif
-
-#ifndef APP_MONITOR_SUMMARY_MOCK_ENABLE
-#define APP_MONITOR_SUMMARY_MOCK_ENABLE         (0u)
-#endif
-
 #ifndef APP_MONITOR_SUMMARY_EVENT_COOLDOWN_MS
 #define APP_MONITOR_SUMMARY_EVENT_COOLDOWN_MS   (1500u)
-#endif
-
-#ifndef APP_MONITOR_SUMMARY_EVENT_RING_SIZE
-#define APP_MONITOR_SUMMARY_EVENT_RING_SIZE     (32u)
 #endif
 
 #ifndef APP_MONITOR_SUMMARY_DIAG_PERIOD_MS
@@ -108,21 +93,6 @@ extern "C" {
 
 #ifndef APP_MONITOR_SUMMARY_HR_HIGH_BPM_X10
 #define APP_MONITOR_SUMMARY_HR_HIGH_BPM_X10     (1400u)
-#endif
-
-#if ((APP_MONITOR_SUMMARY_ENABLE != 0u) && \
-     (APP_MONITOR_SUMMARY_ENABLE != 1u))
-#error "Unsupported APP_MONITOR_SUMMARY_ENABLE"
-#endif
-
-#if ((APP_MONITOR_SUMMARY_DIAG_ENABLE != 0u) && \
-     (APP_MONITOR_SUMMARY_DIAG_ENABLE != 1u))
-#error "Unsupported APP_MONITOR_SUMMARY_DIAG_ENABLE"
-#endif
-
-#if ((APP_MONITOR_SUMMARY_MOCK_ENABLE != 0u) && \
-     (APP_MONITOR_SUMMARY_MOCK_ENABLE != 1u))
-#error "Unsupported APP_MONITOR_SUMMARY_MOCK_ENABLE"
 #endif
 
 #if (APP_MONITOR_SUMMARY_EVENT_RING_SIZE < 4u)

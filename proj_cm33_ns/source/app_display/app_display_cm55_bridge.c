@@ -11,14 +11,12 @@
 
 #if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
 
+#include "app_build_config.h"
 #include "app_display_cm55_shared.h"
+#include "app_board_time.h"
 
 #include <stdio.h>
 #include <string.h>
-
-#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_DIAG_ENABLE
-#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_DIAG_ENABLE (0u)
-#endif
 
 static uint32_t bridge_heartbeat;
 
@@ -86,9 +84,25 @@ cy_rslt_t app_display_cm55_bridge_publish(
 
     snap->cough_count_1min = snapshot->cough_count_1min;
     snap->cough_count_5min = snapshot->cough_count_5min;
+    snap->cough_event_count_total = snapshot->cough_event_count_total;
 
     snap->fusion_confidence = snapshot->fusion_confidence;
     snap->ble_connected = snapshot->ble_connected ? 1u : 0u;
+    uint32_t wall_epoch_s = 0u;
+    if (app_board_time_now_epoch_s(&wall_epoch_s))
+    {
+        snap->wall_epoch_s = wall_epoch_s;
+        snap->wall_time_flags = app_board_time_get_flags() &
+                                (DISPLAY_CM55_TIME_FLAG_VALID |
+                                 DISPLAY_CM55_TIME_FLAG_NVM_LOADED |
+                                 DISPLAY_CM55_TIME_FLAG_NVM_SAVED |
+                                 DISPLAY_CM55_TIME_FLAG_BLE_SYNCED);
+    }
+    else
+    {
+        snap->wall_epoch_s = 0u;
+        snap->wall_time_flags = 0u;
+    }
 
     snap->heartbeat = bridge_heartbeat;
 

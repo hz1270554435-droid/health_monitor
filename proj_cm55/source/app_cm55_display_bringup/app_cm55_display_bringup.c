@@ -6,6 +6,7 @@
 
 #include "app_cm55_display_bringup.h"
 
+#include "app_build_config.h"
 #include "app_display_diag.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -15,10 +16,6 @@
 #include "mtb_disp_dsi_waveshare_4p3.h"
 #include "vg_lite.h"
 #include "vg_lite_platform.h"
-
-#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE
-#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
-#endif
 
 #if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE) || (APP_DISPLAY_LVGL_ENABLE)
 #include "app_display_cm55_shared.h"
@@ -35,14 +32,6 @@
 
 #pragma GCC optimize ("no-tree-vectorize")
 
-#ifndef APP_DISPLAY_DIAG_ENABLE
-#define APP_DISPLAY_DIAG_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_CM55_UART_LOG_ENABLE
-#define APP_DISPLAY_CM55_UART_LOG_ENABLE (1u)
-#endif
-
 #ifndef APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE
 #define APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE (0u)
 #endif
@@ -53,10 +42,6 @@
 
 #ifndef APP_DISPLAY_PANEL_I2C_LOWLEVEL_PROBE_ENABLE
 #define APP_DISPLAY_PANEL_I2C_LOWLEVEL_PROBE_ENABLE (0u)
-#endif
-
-#ifndef APP_DISPLAY_LVGL_ENABLE
-#define APP_DISPLAY_LVGL_ENABLE (0u)
 #endif
 
 #define CM55_DISP_HOR_RES               (832U)
@@ -783,7 +768,7 @@ static void draw_live_frame(uint16_t *fb)
 
     /* === Alert state machine === */
     /* Cough: reset if new cough detected while alert active */
-    if (snap->cough_count_1min > 0U)
+    if (snap->cough_count_5min > 0U)
     {
         if (0U == cough_alert_ms || (now_ms - cough_alert_ms) > alert_dur)
             cough_alert_ms = now_ms;
@@ -917,31 +902,31 @@ static void draw_live_frame(uint16_t *fb)
         draw_cn_char_scaled(fb, cx, card_y2 + 10U, 0x4EF6, c_label, cs);
     }
     {
-        uint16_t c1 = snap->cough_count_1min;
         uint16_t c5 = snap->cough_count_5min;
+        uint32_t c_total = snap->cough_event_count_total;
         uint32_t lx;
 
         /* 整晚 X 次 */
         lx = card_x1 + 20U;
         draw_cn_char_scaled(fb, lx, card_y2 + 48U, 0x6574, c_label, cs); lx += 18U * cs;
         draw_cn_char_scaled(fb, lx, card_y2 + 48U, 0x665A, c_label, cs); lx += 18U * cs;
-        draw_number(fb, lx, card_y2 + 48U, c5, c_value, ns); lx += 60U;
+        draw_number(fb, lx, card_y2 + 48U, c_total, c_value, ns); lx += 60U;
         draw_cn_char_scaled(fb, lx, card_y2 + 60U, 0x6B21, c_unit, cs);
 
-        /* 近半小时 X 次 */
+        /* 近5分钟 X 次 */
         lx = card_x1 + 20U;
         draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x8FD1, c_label, cs); lx += 18U * cs;
-        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x534A, c_label, cs); lx += 18U * cs;
-        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x5C0F, c_label, cs); lx += 18U * cs;
-        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x65F6, c_label, cs); lx += 18U * cs;
-        draw_number(fb, lx, card_y2 + 92U, c1, c_value, 3U); lx += 54U;
+        draw_number(fb, lx, card_y2 + 92U, 5U, c_label, 3U); lx += 30U;
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x5206, c_label, cs); lx += 18U * cs;
+        draw_cn_char_scaled(fb, lx, card_y2 + 92U, 0x949F, c_label, cs); lx += 18U * cs;
+        draw_number(fb, lx, card_y2 + 92U, c5, c_value, 3U); lx += 54U;
         draw_cn_char_scaled(fb, lx, card_y2 + 100U, 0x6B21, c_unit, cs);
 
         /* 当前状态 */
         lx = card_x1 + 20U;
         draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x5F53, c_label, cs); lx += 18U * cs;
         draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x524D, c_label, cs); lx += 18U * cs;
-        if (c1 > 0U)
+        if (c5 > 0U)
         {
             draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x6709, c_yellow, cs); lx += 18U * cs;
             draw_cn_char_scaled(fb, lx, card_y2 + 130U, 0x54B3, c_yellow, cs); lx += 18U * cs;

@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "app_audio_replay.h"
+#include "app_build_config.h"
 #include "app_model_ipc_smoke.h"
 
 #if ((APP_AUDIO_SPECTRUM_BACKEND != APP_AUDIO_SPECTRUM_BACKEND_DFT) && \
@@ -317,6 +319,8 @@ static void app_audio_preprocess_event_dump_append_hex_halfword(size_t *used,
 static void app_audio_preprocess_event_dump_append_text(size_t *used,
                                                         const char *text);
 #endif
+static bool app_audio_preprocess_receive_input_block(app_pdm_pcm_block_t *block);
+static void app_audio_preprocess_release_input_block(uint8_t block_index);
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE)
 static void app_audio_preprocess_event_feature_remember(
     const app_model_audio_feature_desc_t *desc,
@@ -415,7 +419,7 @@ void app_audio_preprocess_task(void *pvParameters)
         app_pdm_pcm_block_t block;
 
         /* 正式业务链路阻塞等待 10 ms PCM block；不做忙轮询，避免无谓占用 CPU。 */
-        if (!app_pdm_pcm_receive_block(&block, portMAX_DELAY))
+        if (!app_audio_preprocess_receive_input_block(&block))
         {
             continue;
         }
@@ -468,8 +472,26 @@ void app_audio_preprocess_task(void *pvParameters)
         }
 
         /* 无论 block 是否有效，最终都必须把采集块归还给上游缓冲池。 */
-        app_pdm_pcm_release_block(block.block_index);
+        app_audio_preprocess_release_input_block(block.block_index);
     }
+}
+
+static bool app_audio_preprocess_receive_input_block(app_pdm_pcm_block_t *block)
+{
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    return app_audio_replay_receive_block(block, portMAX_DELAY);
+#else
+    return app_pdm_pcm_receive_block(block, portMAX_DELAY);
+#endif
+}
+
+static void app_audio_preprocess_release_input_block(uint8_t block_index)
+{
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    app_audio_replay_release_block(block_index);
+#else
+    app_pdm_pcm_release_block(block_index);
+#endif
 }
 
 cy_rslt_t app_audio_preprocess_configure(
@@ -1023,14 +1045,30 @@ static void app_audio_preprocess_reset_stream_state(void)
 static bool app_audio_preprocess_block_is_valid(
     const app_pdm_pcm_block_t *block)
 {
-    /* 校验 block 描述符，防止消费者误读到不属于 recorded_data 的指针。 */
-    return ((NULL != block) &&
-            (NULL != block->data) &&
-            (APP_PDM_PCM_BLOCK_SAMPLES == block->sample_count) &&
-            (APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK ==
-             block->samples_per_channel) &&
-            (APP_PDM_PCM_BLOCK_COUNT > block->block_index) &&
+    bool shape_valid;
+
+    shape_valid = ((NULL != block) &&
+                   (NULL != block->data) &&
+                   (APP_PDM_PCM_BLOCK_SAMPLES == block->sample_count) &&
+                   (APP_PDM_PCM_SAMPLES_PER_CH_PER_BLOCK ==
+                    block->samples_per_channel));
+    if (!shape_valid)
+    {
+        return false;
+    }
+
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    /* Replay provider does not allocate from recorded_data; it only guarantees
+     * the same 10 ms stereo block shape and timing contract.
+     */
+    return true;
+#else
+    /* Live PDM capture must still prove the block belongs to recorded_data so
+     * the consumer never reads an unexpected pointer.
+     */
+    return ((APP_PDM_PCM_BLOCK_COUNT > block->block_index) &&
             (&recorded_data[block->block_index][0] == block->data));
+#endif
 }
 
 static uint8_t app_audio_preprocess_choose_channel(

@@ -77,6 +77,12 @@ extern "C" {
 #define DISPLAY_CM55_FLAG_ALERT_LATCHED            (1u << 6)
 #define DISPLAY_CM55_FLAG_COUGH_MODEL_NOT_VERIFIED (1u << 7)
 
+/* Wall-clock time flags. The epoch field is valid only when bit 0 is set. */
+#define DISPLAY_CM55_TIME_FLAG_VALID      (1u << 0)
+#define DISPLAY_CM55_TIME_FLAG_NVM_LOADED (1u << 1)
+#define DISPLAY_CM55_TIME_FLAG_NVM_SAVED  (1u << 2)
+#define DISPLAY_CM55_TIME_FLAG_BLE_SYNCED (1u << 3)
+
 /* Display snapshot bridge structure.
  * All fields are fixed-width for ABI stability. CM33 writes, CM55 reads.
  * seq_begin/seq_end bracket the write; CM55 reads seq_end first, then
@@ -115,14 +121,19 @@ typedef struct
     /* Cough counts. */
     volatile uint16_t cough_count_1min;
     volatile uint16_t cough_count_5min;
+    volatile uint32_t cough_event_count_total;
 
     /* Fusion and BLE. */
     volatile uint8_t  fusion_confidence; /* 0..100 */
     volatile uint8_t  ble_connected;     /* 1=connected */
     volatile uint16_t reserved0;
 
+    /* Wall-clock time, supplied by CM33 board-time service. */
+    volatile uint32_t wall_epoch_s;       /* Unix epoch seconds, 0=N/A */
+    volatile uint32_t wall_time_flags;    /* DISPLAY_CM55_TIME_FLAG_* */
+
     /* Reserved for future use. */
-    volatile uint32_t reserved[8];
+    volatile uint32_t reserved[5];
 } app_display_cm55_snapshot_t;
 
 #define APP_DISPLAY_CM55_SNAPSHOT \

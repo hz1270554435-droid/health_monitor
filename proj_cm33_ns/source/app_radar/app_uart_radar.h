@@ -11,6 +11,7 @@ extern "C" {
 #include "cy_pdl.h"
 #include "mtb_hal.h"
 #include "cybsp.h"
+#include "app_build_config.h"
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "task.h"
@@ -38,10 +39,6 @@ extern "C" {
  * existing retarget/debug UART. Do not enable another real inference consumer
  * on the same radar queue at the same time.
  */
-#ifndef APP_UART_RADAR_TEST_ENABLE
-#define APP_UART_RADAR_TEST_ENABLE                 (1u)
-#endif
-
 #define APP_UART_RADAR_TEST_TASK_STACK_SIZE        (1024u)
 #define APP_UART_RADAR_TEST_TASK_PRIORITY          (APP_UART_RADAR_TASK_PRIORITY - 1u)
 #define APP_UART_RADAR_TEST_PRINT_MS               (1000u)

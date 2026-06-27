@@ -1,4 +1,5 @@
 #include "app_display.h"
+#include "app_build_config.h"
 
 #if (APP_DISPLAY_ENABLE)
 
@@ -110,10 +111,6 @@ static void app_display_lcd_smoke_tick(uint32_t now_ms);
 #if (APP_DISPLAY_LCD_BACKLIGHT_SMOKE_ONLY)
 static void app_display_lcd_backlight_smoke_tick(uint32_t now_ms);
 #endif
-#endif
-
-#ifndef APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE
-#define APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE (0u)
 #endif
 
 #if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
