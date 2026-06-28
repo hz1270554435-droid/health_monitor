@@ -74,6 +74,8 @@ static void app_ble_stream_maybe_publish_fake(uint32_t now_ms);
 #endif
 #if (APP_BLE_SUMMARY_ENABLE)
 static void app_ble_stream_maybe_publish_summary(uint32_t now_ms);
+static bool app_ble_stream_publish_summary_event(
+    const app_monitor_summary_event_t *summary_event);
 #endif
 static void app_ble_stream_run_fake_commands_once(void);
 #if (APP_BLE_FAKE_DATA_ENABLE && !APP_BLE_STACK_ENABLE)
@@ -623,6 +625,7 @@ static void app_ble_stream_maybe_publish_summary(uint32_t now_ms)
          ((now_ms - summary_last_realtime_ms) >= APP_BLE_REALTIME_PERIOD_MS));
     app_monitor_summary_snapshot_t summary;
     app_monitor_summary_event_t summary_event;
+    uint32_t pending_count;
 
     memset(&summary, 0, sizeof(summary));
     if (CY_RSLT_SUCCESS == app_monitor_summary_get_snapshot(&summary))
@@ -637,15 +640,70 @@ static void app_ble_stream_maybe_publish_summary(uint32_t now_ms)
         }
     }
 
-    if (app_monitor_summary_get_latest_event(&summary_event) &&
-        (summary_event.event_id != summary_last_event_id))
+    if (!app_monitor_summary_get_latest_event(&summary_event))
     {
-        app_ble_event_t event;
+        return;
+    }
 
-        app_ble_stream_fill_event_from_summary(&summary_event, &event);
-        (void)app_ble_publish_event(&event);
+    if (summary_event.event_id == summary_last_event_id)
+    {
+        return;
+    }
+
+    pending_count = app_monitor_summary_get_event_count();
+    while (pending_count > 0u)
+    {
+        if (!app_monitor_summary_get_event_by_age(pending_count - 1u,
+                                                  &summary_event))
+        {
+            break;
+        }
+        pending_count--;
+
+        if (summary_event.event_id <= summary_last_event_id)
+        {
+            continue;
+        }
+
+        if (!app_ble_stream_publish_summary_event(&summary_event))
+        {
+            break;
+        }
         summary_last_event_id = summary_event.event_id;
     }
+}
+
+static bool app_ble_stream_publish_summary_event(
+    const app_monitor_summary_event_t *summary_event)
+{
+    app_ble_event_t event;
+
+    if (NULL == summary_event)
+    {
+        return false;
+    }
+
+    app_ble_stream_fill_event_from_summary(summary_event, &event);
+    if (CY_RSLT_SUCCESS != app_ble_publish_event(&event))
+    {
+        return false;
+    }
+
+#if (APP_BLE_LOG_LEVEL >= APP_BLE_LOG_LEVEL_STAT)
+    printf("[BLE_ALERT_MAP] summary_event_id=%lu summary_type=%u ble_event_type=%u "
+           "event_id=%lu ts_s=%lu severity=%u confidence=%u duration_s=%u "
+           "source_flags=0x%02x\r\n",
+           (unsigned long)summary_event->event_id,
+           (unsigned int)summary_event->event_type,
+           (unsigned int)event.event_type,
+           (unsigned long)event.event_id,
+           (unsigned long)event.ts_s,
+           (unsigned int)event.severity,
+           (unsigned int)event.confidence,
+           (unsigned int)event.duration_s,
+           (unsigned int)event.source_flags);
+#endif
+    return true;
 }
 #endif
 
