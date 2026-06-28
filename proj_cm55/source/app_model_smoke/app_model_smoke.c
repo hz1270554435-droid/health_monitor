@@ -155,6 +155,7 @@ static const app_model_smoke_expected_t app_model_smoke_expected[] =
 static float app_model_smoke_softmax_cough_prob(float output0,
                                                 float output1);
 static float app_model_smoke_absf(float value);
+static bool app_model_smoke_publish_trace(uint32_t stage, float detail);
 static bool app_model_smoke_publish_result(uint32_t sample_index,
                                            const float *output,
                                            float cough_prob,
@@ -179,16 +180,22 @@ bool app_model_smoke_run_once(void)
         return false;
     }
 
+    (void)app_model_smoke_publish_trace(1u, (float)APP_AUDIO_MODEL_SELECT);
+
     if (AUDIO_TEST_VECTOR_COUNT != APP_MODEL_SMOKE_EXPECTED_COUNT)
     {
+        (void)app_model_smoke_publish_trace(90u,
+                                            (float)AUDIO_TEST_VECTOR_COUNT);
         return false;
     }
 
+    (void)app_model_smoke_publish_trace(2u, 0.0f);
     init_ret = APP_AUDIO_ACTIVE_MODEL_INIT();
     if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != init_ret)
     {
         float empty_output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
 
+        (void)app_model_smoke_publish_trace(91u, (float)init_ret);
         (void)app_model_smoke_publish_result(
             0u,
             empty_output,
@@ -198,6 +205,7 @@ bool app_model_smoke_run_once(void)
             (uint8_t)APP_MODEL_INFERENCE_STATUS_INVALID_INPUT);
         return false;
     }
+    (void)app_model_smoke_publish_trace(3u, (float)init_ret);
 
     for (uint32_t i = 0u; i < AUDIO_TEST_VECTOR_COUNT; i++)
     {
@@ -209,9 +217,11 @@ bool app_model_smoke_run_once(void)
 
         (void)APP_AUDIO_ACTIVE_MODEL_SOFT_RESET();
 
+        (void)app_model_smoke_publish_trace(4u, (float)(i + 1u));
         start_ms = app_model_smoke_now_ms();
         APP_AUDIO_ACTIVE_MODEL_COMPUTE(audio_test_vectors[i], output);
         elapsed_ms = app_model_smoke_now_ms() - start_ms;
+        (void)app_model_smoke_publish_trace(5u, (float)elapsed_ms);
 
         cough_prob = app_model_smoke_softmax_cough_prob(output[0], output[1]);
         diff = app_model_smoke_absf(cough_prob -
@@ -230,6 +240,7 @@ bool app_model_smoke_run_once(void)
                 elapsed_ms,
                 (uint8_t)APP_MODEL_INFERENCE_STATUS_OK))
         {
+            (void)app_model_smoke_publish_trace(92u, (float)(i + 1u));
             return false;
         }
 
@@ -259,6 +270,37 @@ static float app_model_smoke_softmax_cough_prob(float output0,
 static float app_model_smoke_absf(float value)
 {
     return (0.0f <= value) ? value : -value;
+}
+
+static bool app_model_smoke_publish_trace(uint32_t stage, float detail)
+{
+    volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+    app_model_inference_result_t result;
+
+    APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
+    if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
+        (APP_MODEL_SHARED_VERSION != shared->version))
+    {
+        return false;
+    }
+
+    memset(&result, 0, sizeof(result));
+    result.input_sequence = 0u;
+    result.timestamp_ms = app_model_smoke_now_ms();
+    result.inference_time_ms = 0u;
+    result.class_count = 2u;
+    result.status = (uint8_t)APP_MODEL_INFERENCE_STATUS_OK;
+    result.scores[0] = (float)stage;
+    result.scores[1] = detail;
+
+    shared->result_state = APP_MODEL_SHARED_RESULT_WRITING;
+    shared->result = result;
+    shared->result_sequence = APP_MODEL_RESULT_SEQUENCE_SMOKE_BASE;
+    __DMB();
+    shared->result_state = APP_MODEL_SHARED_RESULT_READY;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+    return true;
 }
 
 static bool app_model_smoke_publish_result(uint32_t sample_index,

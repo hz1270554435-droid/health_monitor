@@ -101,6 +101,19 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 #define APP_MODEL_SUPPRESS_LOG_RATE_LIMIT_MS     APP_MODEL_LOG_RATE_LIMIT_MS
 #endif
 
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+#define APP_MODEL_3W_SCORE_BUFFER_VALID           (5u)
+#define APP_MODEL_3W_SCORE_WARMUP                 (6u)
+#define APP_MODEL_3W_SCORE_LOCAL_BACKGROUND       (7u)
+#define APP_MODEL_3W_SCORE_LOCAL_CONTRAST         (8u)
+#define APP_MODEL_3W_SCORE_THRESHOLD_PASS         (9u)
+#define APP_MODEL_3W_SCORE_CONTRAST_PASS          (10u)
+#define APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE      (11u)
+#define APP_MODEL_3W_SCORE_CONFIRMED_EVENT        (12u)
+#define APP_MODEL_3W_SCORE_EVENT_ID               (13u)
+#define APP_MODEL_3W_SCORE_TICK_ID                (14u)
+#endif
+
 #if (APP_BLE_ENABLE)
 #include "app_ble_cmd.h"
 #include "app_ble_diag.h"
@@ -201,6 +214,8 @@ static void app_model_result_monitor_print_float(float value);
 static void app_model_result_monitor_print_float_force(float value);
 static void app_model_result_monitor_print_boot_marker(void);
 static void app_model_result_monitor_print_deployment_info(void);
+static void app_model_result_monitor_print_smoke_trace(
+    const app_model_inference_result_t *result);
 static void app_model_result_monitor_update_status_counts(
     const app_model_inference_result_t *result);
 static void app_model_result_monitor_note_live_result(
@@ -428,7 +443,12 @@ void app_model_result_monitor_task(void *pvParameters)
                                                             now_ms);
 #endif
 
-            if ((APP_MODEL_INFERENCE_STATUS_OK == result.status) &&
+            if ((APP_MODEL_RESULT_SEQUENCE_SMOKE_BASE == result_sequence) &&
+                (0u == result.input_sequence))
+            {
+                app_model_result_monitor_print_smoke_trace(&result);
+            }
+            else if ((APP_MODEL_INFERENCE_STATUS_OK == result.status) &&
                 (APP_MODEL_RESULT_SEQUENCE_SMOKE_BASE <= result_sequence) &&
                 (2u <= result.class_count))
             {
@@ -656,6 +676,45 @@ static void app_model_result_monitor_build_replay_window_suffix(
     app_audio_replay_format_seconds(replay_time_sec,
                                     sizeof(replay_time_sec),
                                     window_info.start_ms);
+    if (APP_AUDIO_REPLAY_FEATURE_PHASE_NONE != window_info.phase)
+    {
+        const char *phase_name = "none";
+
+        if (APP_AUDIO_REPLAY_FEATURE_PHASE_PREV2 == window_info.phase)
+        {
+            phase_name = "prev2";
+        }
+        else if (APP_AUDIO_REPLAY_FEATURE_PHASE_PREV1 == window_info.phase)
+        {
+            phase_name = "prev1";
+        }
+        else if (APP_AUDIO_REPLAY_FEATURE_PHASE_CURRENT == window_info.phase)
+        {
+            phase_name = "current";
+        }
+
+        (void)snprintf(
+            suffix,
+            suffix_size,
+            " replay_mode=1 chunk_id=%s replay_window_index=%lu replay_time_sec=%s"
+            " ref_tick_id=%lu phase=%s prev2_sec=%lu.%03lu prev1_sec=%lu.%03lu"
+            " current_sec=%lu.%03lu current_end_sec=%lu.%03lu",
+            (NULL != runtime_info.chunk_id) ? runtime_info.chunk_id : "null",
+            (unsigned long)window_info.replay_window_index,
+            replay_time_sec,
+            (unsigned long)window_info.reference_tick_id,
+            phase_name,
+            (unsigned long)(window_info.prev2_start_ms / 1000u),
+            (unsigned long)(window_info.prev2_start_ms % 1000u),
+            (unsigned long)(window_info.prev1_start_ms / 1000u),
+            (unsigned long)(window_info.prev1_start_ms % 1000u),
+            (unsigned long)(window_info.current_start_ms / 1000u),
+            (unsigned long)(window_info.current_start_ms % 1000u),
+            (unsigned long)(window_info.current_end_ms / 1000u),
+            (unsigned long)(window_info.current_end_ms % 1000u));
+        return;
+    }
+
     (void)snprintf(
         suffix,
         suffix_size,
@@ -1078,11 +1137,18 @@ static void app_model_result_monitor_print_smoke_result(
     const app_model_inference_result_t *result)
 {
     uint32_t log_start_ms;
+    const char *predicted_class;
+    const char *expected_class;
+    const char *smoke_status;
 
     if (NULL == result)
     {
         return;
     }
+
+    predicted_class = (result->scores[2] >= 0.5f) ? "cough" : "non_cough";
+    expected_class = (result->scores[5] >= 0.5f) ? "cough" : "non_cough";
+    smoke_status = (result->scores[6] <= 0.01f) ? "PASS" : "FAIL";
 
     /* Smoke output is intentionally not rate-limited and always prints numeric
      * values, even if live float printing is disabled.
@@ -1100,8 +1166,71 @@ static void app_model_result_monitor_print_smoke_result(
     app_model_result_monitor_print_float_force(result->scores[5]);
     printf(", diff=");
     app_model_result_monitor_print_float_force(result->scores[6]);
-    printf(", infer_ms=%lu\r\n",
+    printf(", predicted_class=%s, expected_class=%s, status=%s, infer_ms=%lu\r\n",
+           predicted_class,
+           expected_class,
+           smoke_status,
            (unsigned long)result->inference_time_ms);
+    app_model_result_monitor_log_end(log_start_ms);
+}
+
+static void app_model_result_monitor_print_smoke_trace(
+    const app_model_inference_result_t *result)
+{
+    uint32_t log_start_ms;
+    uint32_t stage;
+    const char *stage_name;
+
+    if (NULL == result)
+    {
+        return;
+    }
+
+    stage = (uint32_t)result->scores[0];
+    switch (stage)
+    {
+        case 1u:
+            stage_name = "dispatcher_enter";
+            break;
+        case 2u:
+            stage_name = "model_init_start";
+            break;
+        case 3u:
+            stage_name = "model_init_done";
+            break;
+        case 4u:
+            stage_name = "compute_start";
+            break;
+        case 5u:
+            stage_name = "compute_done";
+            break;
+        case 6u:
+            stage_name = "sample_publish_done";
+            break;
+        case 7u:
+            stage_name = "smoke_run_complete";
+            break;
+        case 90u:
+            stage_name = "vector_count_mismatch";
+            break;
+        case 91u:
+            stage_name = "model_init_fail";
+            break;
+        case 92u:
+            stage_name = "sample_publish_fail";
+            break;
+        default:
+            stage_name = "unknown";
+            break;
+    }
+
+    log_start_ms = app_model_result_monitor_log_start();
+    printf("[MODEL_SMOKE_TRACE] t_ms=%lu, stage=%lu(%s), detail=",
+           (unsigned long)app_model_result_monitor_now_ms(),
+           (unsigned long)stage,
+           stage_name);
+    app_model_result_monitor_print_float_force(result->scores[1]);
+    printf("\r\n");
     app_model_result_monitor_log_end(log_start_ms);
 }
 
@@ -1253,6 +1382,32 @@ static void app_model_result_monitor_print_event(
         return;
     }
 
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+    log_start_ms = app_model_result_monitor_log_start();
+    printf("[MODEL_EVENT] t_ms=%lu, event_id=%lu, tick_id=%lu, cough_prob=",
+           (unsigned long)app_model_result_monitor_now_ms(),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_EVENT_ID] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_TICK_ID] + 0.5f));
+    app_model_result_monitor_print_float(result->scores[2]);
+    printf(", local_background=");
+    app_model_result_monitor_print_float(
+        result->scores[APP_MODEL_3W_SCORE_LOCAL_BACKGROUND]);
+    printf(", local_contrast=");
+    app_model_result_monitor_print_float(
+        result->scores[APP_MODEL_3W_SCORE_LOCAL_CONTRAST]);
+    printf(", threshold_pass=%lu, contrast_pass=%lu, refractory_active=%lu, "
+           "confirmed_event=%lu, input_seq=%lu, result_seq=%lu, decision=%s\r\n",
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_THRESHOLD_PASS] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_CONTRAST_PASS] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT] + 0.5f),
+           (unsigned long)result->input_sequence,
+           (unsigned long)result_sequence,
+           decision);
+    app_model_result_monitor_log_end(log_start_ms);
+    return;
+#endif
+
     model_result_runtime.event_id++;
     model_result_monitor_stats.events_printed++;
     model_result_monitor_stats.last_event_id = model_result_runtime.event_id;
@@ -1334,6 +1489,24 @@ static bool app_model_result_monitor_should_print_event(
     uint32_t candidate_id;
     uint32_t duration_ms;
     uint32_t peak_x100;
+
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+    (void)result_sequence;
+
+    if (NULL == result)
+    {
+        return false;
+    }
+
+    model_result_runtime.event_id =
+        (uint32_t)(result->scores[APP_MODEL_3W_SCORE_EVENT_ID] + 0.5f);
+    model_result_runtime.last_event_start_input_sequence = result->input_sequence;
+    model_result_runtime.last_event_end_input_sequence = result->input_sequence;
+    model_result_runtime.last_event_ms = now_ms;
+    model_result_runtime.last_event_max_energy = result->scores[3];
+
+    return (0.5f <= result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT]);
+#endif
 
     if ((NULL == result) ||
         (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
@@ -1810,6 +1983,29 @@ static void app_model_result_monitor_maybe_print_demo_change(
     app_model_result_monitor_build_replay_window_suffix(result->input_sequence,
                                                         replay_suffix,
                                                         sizeof(replay_suffix));
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+    printf("[MIC3W] t_ms=%lu tick_id=%lu event_id=%lu pred=%s cough_x100=%lu "
+           "buffer_valid=%lu warmup=%lu bg_x100=%lu contrast_x100=%ld "
+           "threshold_pass=%lu contrast_pass=%lu refractory_active=%lu "
+           "confirmed_event=%lu input_seq=%lu result_seq=%lu%s\r\n",
+           (unsigned long)now_ms,
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_TICK_ID] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_EVENT_ID] + 0.5f),
+           curr_pred,
+           (unsigned long)cough_x100,
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_BUFFER_VALID] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_WARMUP] + 0.5f),
+           (unsigned long)app_model_result_monitor_prob_to_x100(
+               result->scores[APP_MODEL_3W_SCORE_LOCAL_BACKGROUND]),
+           (long)(result->scores[APP_MODEL_3W_SCORE_LOCAL_CONTRAST] * 100.0f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_THRESHOLD_PASS] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_CONTRAST_PASS] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE] + 0.5f),
+           (unsigned long)(result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT] + 0.5f),
+           (unsigned long)result->input_sequence,
+           (unsigned long)result_sequence,
+           replay_suffix);
+#else
     printf("[MIC_WIN] t_ms=%lu idx=%lu pred=%s cough_x100=%lu "
            "non_cough_x100=%lu input_seq=%lu result_seq=%lu%s\r\n",
            (unsigned long)now_ms,
@@ -1820,6 +2016,7 @@ static void app_model_result_monitor_maybe_print_demo_change(
            (unsigned long)result->input_sequence,
            (unsigned long)result_sequence,
            replay_suffix);
+#endif
     fflush(stdout);
     app_model_result_monitor_log_end(log_start_ms);
 #else
@@ -1836,9 +2033,28 @@ static void app_model_result_monitor_print_idle_diag(
     app_audio_preprocess_stats_t stats;
     app_pdm_pcm_stats_t pdm_stats;
     uint32_t log_start_ms;
+    const char *busy_reason = "idle";
 
     app_audio_preprocess_get_stats(&stats);
     app_pdm_pcm_get_stats(&pdm_stats);
+
+    if (APP_MODEL_SHARED_INPUT_READY == shared->input_state)
+    {
+        busy_reason = (shared->consumer_sequence < shared->producer_sequence) ?
+            "previous_input_not_consumed" : "input_ready";
+    }
+    else if (APP_MODEL_SHARED_INPUT_READING == shared->input_state)
+    {
+        busy_reason = "cm55_reading_or_stalled";
+    }
+    else if (APP_MODEL_SHARED_RESULT_READY == shared->result_state)
+    {
+        busy_reason = "result_pending_read";
+    }
+    else if ((0u < stats.windows_published) && (0u == shared->consumer_sequence))
+    {
+        busy_reason = "consumer_inactive";
+    }
 
     /* 无结果时的低频诊断。
      * 这条日志用于区分“串口/烧录没有起来”和“模型链路暂时没有输出”：
@@ -1863,8 +2079,9 @@ static void app_model_result_monitor_print_idle_diag(
            (unsigned long)stats.windows_energy_gated,
            (unsigned long)stats.shared_busy);
     app_model_result_monitor_print_float(stats.last_energy);
-    printf(", dropped=%lu, dropped_queue=%lu, dropped_no_free=%lu, "
+    printf(", busy_reason=%s, dropped=%lu, dropped_queue=%lu, dropped_no_free=%lu, "
            "dropped_paused=%lu, queue_depth=%lu\r\n",
+           busy_reason,
            (unsigned long)pdm_stats.dropped_total,
            (unsigned long)pdm_stats.dropped_queue_full,
            (unsigned long)pdm_stats.dropped_no_free_block,

@@ -79,7 +79,7 @@ APP_BUILD_PROFILE?=inference_default
 # Add additional defines to the build process (without a leading -D).
 # Keep CR/LF conversion disabled: training export sends binary PCM frames over
 # retarget-io, and translating 0x0A bytes would corrupt the payload.
-APP_AUDIO_MODEL_SELECT?=3
+APP_AUDIO_MODEL_SELECT?=5
 APP_MODEL_SMOKE_TEST_ENABLE?=0
 APP_MODEL_RUNTIME_PROFILE_ENABLE?=1
 APP_MODEL_LOG_LEVEL?=0
@@ -118,10 +118,10 @@ APP_UART_SANITY_TEST_ENABLE?=0
 APP_UART_SANITY_OUTPUT_METHOD?=1
 APP_UART_SANITY_LINE_DELAY_MS?=10
 APP_PDM_PCM_BLOCK_COUNT?=32
-APP_MODEL_EVENT_THRESHOLD?=0.20f
+APP_MODEL_EVENT_THRESHOLD?=0.92f
 APP_MODEL_EVENT_MIN_HITS?=2
-APP_MODEL_EVENT_WINDOW_MS?=1000
-APP_MODEL_EVENT_COOLDOWN_MS?=2000
+APP_MODEL_EVENT_WINDOW_MS?=1500
+APP_MODEL_EVENT_COOLDOWN_MS?=2500
 APP_MODEL_EVENT_MIN_ENERGY?=0.0f
 APP_CSV_EXPORT_CAPTURE_MODE?=0
 APP_BLE_ENABLE?=0
@@ -207,6 +207,15 @@ endif
 ifeq ($(APP_DISPLAY_SUMMARY_ENABLE),1)
 ifeq ($(APP_DISPLAY_ENABLE),0)
 $(error APP_DISPLAY_SUMMARY_ENABLE=1 requires APP_DISPLAY_ENABLE=1)
+endif
+endif
+
+ifeq ($(APP_BLE_SUMMARY_ENABLE),1)
+ifeq ($(APP_BLE_ENABLE),0)
+$(error APP_BLE_SUMMARY_ENABLE=1 requires APP_BLE_ENABLE=1)
+endif
+ifeq ($(APP_MONITOR_SUMMARY_ENABLE),0)
+$(error APP_BLE_SUMMARY_ENABLE=1 requires APP_MONITOR_SUMMARY_ENABLE=1)
 endif
 endif
 
@@ -431,6 +440,10 @@ endif
 
 ifeq ($(APP_MONITOR_SUMMARY_ENABLE),0)
 CY_IGNORE+=source/app_monitor_summary/app_monitor_summary.c
+endif
+
+ifeq ($(APP_AUDIO_REPLAY_TEST_ENABLE),0)
+CY_IGNORE+=source/app_audio_replay_selected_asset.c
 endif
 
 # Select softfp or hardfp floating point. Default is softfp.

@@ -79,9 +79,8 @@ LVGL_CSRCS := $(filter-out %/src/themes/simple/%,$(LVGL_CSRCS))
 LVGL_CSRCS := $(filter-out %/src/draw/sw/blend/helium/%,$(LVGL_CSRCS))
 LVGL_CSRCS := $(filter-out %/src/draw/sw/blend/neon/%,$(LVGL_CSRCS))
 
-# Add each directory containing LVGL .c files to SOURCES
-# Exclude directories that contain only .S (assembly) files
-LVGL_SOURCE_DIRS := $(sort $(dir $(LVGL_CSRCS)))
-LVGL_SOURCE_DIRS := $(filter-out %/helium/,$(LVGL_SOURCE_DIRS))
-LVGL_SOURCE_DIRS := $(filter-out %/neon/,$(LVGL_SOURCE_DIRS))
-SOURCES += $(LVGL_SOURCE_DIRS)
+# Add the concrete LVGL source files to SOURCES.
+# Passing only directories here lets the MTB auto-discovery skip the external
+# LVGL implementation units, which then leaves ui_health_dashboard.o with
+# unresolved lv_* symbols at link time.
+SOURCES += $(LVGL_CSRCS)

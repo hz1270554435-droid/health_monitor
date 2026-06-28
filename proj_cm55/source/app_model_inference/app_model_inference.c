@@ -1,5 +1,6 @@
 #include "app_model_inference.h"
 
+#include <stdio.h>
 #include <math.h>
 #include <string.h>
 
@@ -41,6 +42,56 @@ static TaskHandle_t model_inference_task_handle = NULL;
 static app_model_inference_stats_t model_inference_stats;
 static float model_input_payload[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
 static bool model_runtime_initialized;
+
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+#define APP_MODEL_3W_WINDOW_COUNT                 (3u)
+#define APP_MODEL_3W_INPUT_ELEMENTS               \
+    (APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS * APP_MODEL_3W_WINDOW_COUNT)
+#define APP_MODEL_3W_REPLAY_PHASE_NONE            (0u)
+#define APP_MODEL_3W_REPLAY_PHASE_PREV2           (1u)
+#define APP_MODEL_3W_REPLAY_PHASE_PREV1           (2u)
+#define APP_MODEL_3W_REPLAY_PHASE_CURRENT         (3u)
+#define APP_MODEL_3W_REPLAY_PHASE_MASK            (0xF0u)
+#define APP_MODEL_3W_REPLAY_PHASE_SHIFT           (4u)
+#define APP_MODEL_3W_POLICY_THRESHOLD             (0.95f)
+#define APP_MODEL_3W_POLICY_LOCAL_CONTRAST_MIN    (0.10f)
+#define APP_MODEL_3W_POLICY_REFRACTORY_TICKS      (10u)
+#define APP_MODEL_3W_SCORE_BUFFER_VALID           (5u)
+#define APP_MODEL_3W_SCORE_WARMUP                 (6u)
+#define APP_MODEL_3W_SCORE_LOCAL_BACKGROUND       (7u)
+#define APP_MODEL_3W_SCORE_LOCAL_CONTRAST         (8u)
+#define APP_MODEL_3W_SCORE_THRESHOLD_PASS         (9u)
+#define APP_MODEL_3W_SCORE_CONTRAST_PASS          (10u)
+#define APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE      (11u)
+#define APP_MODEL_3W_SCORE_CONFIRMED_EVENT        (12u)
+#define APP_MODEL_3W_SCORE_EVENT_ID               (13u)
+#define APP_MODEL_3W_SCORE_TICK_ID                (14u)
+
+static float model_input_payload_3w[APP_MODEL_3W_INPUT_ELEMENTS];
+static float model_window_history[APP_MODEL_3W_WINDOW_COUNT]
+                                 [APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+static float model_prob_history[APP_MODEL_3W_WINDOW_COUNT];
+static uint32_t model_3w_tick_id;
+static uint32_t model_3w_event_id;
+static uint32_t model_3w_last_confirmed_tick;
+static uint32_t model_3w_valid_window_count;
+
+static void app_model_inference_selector6_shift_windows(const float *payload);
+static void app_model_inference_selector6_store_replay_phase(uint8_t phase,
+                                                             const float *payload);
+static void app_model_inference_selector6_compose_input(float *payload_3w);
+static bool app_model_inference_selector6_should_run_inference(
+    const app_model_audio_feature_desc_t *desc,
+    uint8_t replay_phase);
+static void app_model_inference_selector6_fill_result(
+    const app_model_audio_feature_desc_t *desc,
+    app_model_inference_result_t *result,
+    const float *output,
+    float cough_prob);
+static float app_model_inference_selector6_background(void);
+static uint8_t app_model_inference_selector6_replay_phase(
+    const app_model_audio_feature_desc_t *desc);
+#endif
 #if (APP_MODEL_INPUT_DUMP_ENABLE)
 static uint32_t model_input_dump_results_written;
 #endif
@@ -67,6 +118,9 @@ static void app_model_inference_publish_result(
     const app_model_audio_feature_desc_t *desc,
     const app_model_inference_result_t *result,
     uint32_t inference_time_ms);
+#if (APP_MODEL_SMOKE_TEST_ENABLE)
+static bool app_model_inference_wait_for_shared_ready(uint32_t timeout_ms);
+#endif
 #if (APP_MODEL_INPUT_DUMP_ENABLE)
 static void app_model_inference_fill_input_stats(
     const app_model_audio_feature_desc_t *desc,
@@ -109,7 +163,11 @@ void app_model_inference_task(void *pvParameters)
 #if (APP_MODEL_SMOKE_TEST_ENABLE)
     /* 第一阶段 baseline：先用 PC 生成的 Log-Mel 测试向量直接跑 active model API。
      * 该测试不依赖实时 MIC 前处理，便于确认模型代码、ML runtime 和 CM55 链路已经部署成功。
+     * 这里先等待 shared region 的 magic/version 就绪；否则如果 smoke 比 CM33
+     * 共享区初始化更早执行，会因为 result 发布前置检查失败而静默丢失全部
+     * [MODEL_SMOKE] 结果。
      */
+    (void)app_model_inference_wait_for_shared_ready(2000u);
     (void)app_model_smoke_run_once();
 #endif
 
@@ -487,6 +545,92 @@ static app_model_inference_status_t app_model_inference_run_model(
         return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
     }
 
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+    {
+        uint8_t replay_phase =
+            app_model_inference_selector6_replay_phase(desc);
+        bool should_run_inference;
+
+        if (0u != replay_phase)
+        {
+            app_model_inference_selector6_store_replay_phase(replay_phase,
+                                                             payload);
+        }
+        else
+        {
+            app_model_inference_selector6_shift_windows(payload);
+        }
+
+        should_run_inference =
+            app_model_inference_selector6_should_run_inference(desc,
+                                                               replay_phase);
+
+        if (!should_run_inference)
+        {
+            result->input_sequence = desc->sequence;
+            result->timestamp_ms = app_model_inference_now_ms();
+            result->class_count = 0u;
+            result->scores[0] = 0.0f;
+            result->scores[1] = 0.0f;
+            result->scores[2] = 0.0f;
+            result->scores[3] = desc->energy;
+            result->scores[4] = (float)desc->selected_channel;
+            result->scores[APP_MODEL_3W_SCORE_BUFFER_VALID] =
+                (model_3w_valid_window_count >= APP_MODEL_3W_WINDOW_COUNT) ? 1.0f : 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_WARMUP] =
+                (model_3w_valid_window_count < APP_MODEL_3W_WINDOW_COUNT) ? 1.0f : 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_LOCAL_BACKGROUND] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_LOCAL_CONTRAST] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_THRESHOLD_PASS] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_CONTRAST_PASS] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT] = 0.0f;
+            result->scores[APP_MODEL_3W_SCORE_EVENT_ID] = (float)model_3w_event_id;
+            result->scores[APP_MODEL_3W_SCORE_TICK_ID] = (float)model_3w_tick_id;
+            return APP_MODEL_INFERENCE_STATUS_OK;
+        }
+    }
+
+    result->input_sequence = desc->sequence;
+    result->timestamp_ms = app_model_inference_now_ms();
+    result->class_count = APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT;
+    result->scores[0] = 0.0f;
+    result->scores[1] = 0.0f;
+    result->scores[2] = 0.0f;
+    result->scores[3] = desc->energy;
+    result->scores[4] = (float)desc->selected_channel;
+    result->scores[APP_MODEL_3W_SCORE_BUFFER_VALID] =
+        (model_3w_valid_window_count >= APP_MODEL_3W_WINDOW_COUNT) ? 1.0f : 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_WARMUP] =
+        (model_3w_valid_window_count < APP_MODEL_3W_WINDOW_COUNT) ? 1.0f : 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_LOCAL_BACKGROUND] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_LOCAL_CONTRAST] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_THRESHOLD_PASS] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_CONTRAST_PASS] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_EVENT_ID] = (float)model_3w_event_id;
+    result->scores[APP_MODEL_3W_SCORE_TICK_ID] = (float)model_3w_tick_id;
+
+    if (model_3w_valid_window_count < APP_MODEL_3W_WINDOW_COUNT)
+    {
+        model_3w_tick_id++;
+        return APP_MODEL_INFERENCE_STATUS_OK;
+    }
+
+    app_model_inference_selector6_compose_input(model_input_payload_3w);
+    APP_AUDIO_ACTIVE_MODEL_COMPUTE(model_input_payload_3w, output);
+
+    app_model_inference_selector6_fill_result(desc,
+                                              result,
+                                              output,
+                                              app_model_inference_softmax_cough_prob(
+                                                  output[0],
+                                                  output[1]));
+    model_3w_tick_id++;
+    return APP_MODEL_INFERENCE_STATUS_OK;
+#endif
+
 #if (APP_MODEL_INPUT_DUMP_ENABLE)
     /* 调试模式下，把输入统计写入 result->scores 的保留槽位，
      * 便于在不额外打印大块特征的情况下快速核对输入分布。
@@ -551,3 +695,239 @@ static uint32_t app_model_inference_now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
+
+#if (APP_MODEL_SMOKE_TEST_ENABLE)
+static bool app_model_inference_wait_for_shared_ready(uint32_t timeout_ms)
+{
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout_ms);
+
+    for (;;)
+    {
+        volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+
+        APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
+        if ((APP_MODEL_SHARED_MAGIC == shared->magic) &&
+            (APP_MODEL_SHARED_VERSION == shared->version))
+        {
+            return true;
+        }
+
+        if ((xTaskGetTickCount() - start_tick) >= timeout_ticks)
+        {
+            return false;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10u));
+    }
+}
+#endif
+
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
+static void app_model_inference_selector6_shift_windows(const float *payload)
+{
+    if (NULL == payload)
+    {
+        return;
+    }
+
+    memcpy(&model_window_history[0][0],
+           &model_window_history[1][0],
+           sizeof(model_window_history[0]));
+    memcpy(&model_window_history[1][0],
+           &model_window_history[2][0],
+           sizeof(model_window_history[1]));
+    memcpy(&model_window_history[2][0],
+           payload,
+           sizeof(model_window_history[2]));
+
+    if (model_3w_valid_window_count < APP_MODEL_3W_WINDOW_COUNT)
+    {
+        model_3w_valid_window_count++;
+    }
+}
+
+static void app_model_inference_selector6_store_replay_phase(uint8_t phase,
+                                                             const float *payload)
+{
+    if (NULL == payload)
+    {
+        return;
+    }
+
+    if (APP_MODEL_3W_REPLAY_PHASE_PREV2 == phase)
+    {
+        memcpy(&model_window_history[0][0],
+               payload,
+               sizeof(model_window_history[0]));
+    }
+    else if (APP_MODEL_3W_REPLAY_PHASE_PREV1 == phase)
+    {
+        memcpy(&model_window_history[1][0],
+               payload,
+               sizeof(model_window_history[1]));
+    }
+    else if (APP_MODEL_3W_REPLAY_PHASE_CURRENT == phase)
+    {
+        memcpy(&model_window_history[2][0],
+               payload,
+               sizeof(model_window_history[2]));
+        if (model_3w_valid_window_count < APP_MODEL_3W_WINDOW_COUNT)
+        {
+            model_3w_valid_window_count++;
+        }
+    }
+}
+
+static void app_model_inference_selector6_compose_input(float *payload_3w)
+{
+    if (NULL == payload_3w)
+    {
+        return;
+    }
+
+    memcpy(&payload_3w[0],
+           &model_window_history[0][0],
+           sizeof(model_window_history[0]));
+    memcpy(&payload_3w[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS],
+           &model_window_history[1][0],
+           sizeof(model_window_history[1]));
+    memcpy(&payload_3w[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS * 2u],
+           &model_window_history[2][0],
+           sizeof(model_window_history[2]));
+}
+
+static bool app_model_inference_selector6_should_run_inference(
+    const app_model_audio_feature_desc_t *desc,
+    uint8_t replay_phase)
+{
+    if (NULL == desc)
+    {
+        return false;
+    }
+
+    if (0u == replay_phase)
+    {
+        return true;
+    }
+
+    if (APP_MODEL_3W_REPLAY_PHASE_CURRENT == replay_phase)
+    {
+        model_3w_tick_id =
+            (uint32_t)((desc->sequence - 1u) / APP_MODEL_3W_WINDOW_COUNT);
+        return true;
+    }
+
+    return false;
+}
+
+static float app_model_inference_selector6_background(void)
+{
+    float sorted[APP_MODEL_3W_WINDOW_COUNT];
+    uint32_t count = 0u;
+
+    for (uint32_t i = 0u; i < APP_MODEL_3W_WINDOW_COUNT; i++)
+    {
+        if (0.0f < model_prob_history[i])
+        {
+            sorted[count++] = model_prob_history[i];
+        }
+    }
+
+    if (0u == count)
+    {
+        return 0.0f;
+    }
+
+    for (uint32_t i = 0u; i < count; i++)
+    {
+        for (uint32_t j = i + 1u; j < count; j++)
+        {
+            if (sorted[j] < sorted[i])
+            {
+                float tmp = sorted[i];
+                sorted[i] = sorted[j];
+                sorted[j] = tmp;
+            }
+        }
+    }
+
+    if (0u != (count & 1u))
+    {
+        return sorted[count / 2u];
+    }
+
+    return 0.5f * (sorted[(count / 2u) - 1u] + sorted[count / 2u]);
+}
+
+static void app_model_inference_selector6_fill_result(
+    const app_model_audio_feature_desc_t *desc,
+    app_model_inference_result_t *result,
+    const float *output,
+    float cough_prob)
+{
+    float local_background;
+    float local_contrast;
+    bool threshold_pass;
+    bool contrast_pass;
+    bool refractory_active;
+    bool confirmed_event;
+
+    local_background = app_model_inference_selector6_background();
+    local_contrast = cough_prob - local_background;
+    threshold_pass = (cough_prob >= APP_MODEL_3W_POLICY_THRESHOLD);
+    contrast_pass = (local_contrast >= APP_MODEL_3W_POLICY_LOCAL_CONTRAST_MIN);
+    refractory_active =
+        (model_3w_last_confirmed_tick != 0xffffffffu) &&
+        ((model_3w_tick_id - model_3w_last_confirmed_tick) <=
+         APP_MODEL_3W_POLICY_REFRACTORY_TICKS);
+    confirmed_event = threshold_pass && contrast_pass && (!refractory_active);
+
+    result->input_sequence = desc->sequence;
+    result->timestamp_ms = app_model_inference_now_ms();
+    result->class_count = APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT;
+    result->scores[0] = output[0];
+    result->scores[1] = output[1];
+    result->scores[2] = cough_prob;
+    result->scores[3] = desc->energy;
+    result->scores[4] = (float)desc->selected_channel;
+    result->scores[APP_MODEL_3W_SCORE_BUFFER_VALID] = 1.0f;
+    result->scores[APP_MODEL_3W_SCORE_WARMUP] = 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_LOCAL_BACKGROUND] = local_background;
+    result->scores[APP_MODEL_3W_SCORE_LOCAL_CONTRAST] = local_contrast;
+    result->scores[APP_MODEL_3W_SCORE_THRESHOLD_PASS] =
+        threshold_pass ? 1.0f : 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_CONTRAST_PASS] =
+        contrast_pass ? 1.0f : 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_REFRACTORY_ACTIVE] =
+        refractory_active ? 1.0f : 0.0f;
+    result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT] =
+        confirmed_event ? 1.0f : 0.0f;
+
+    if (confirmed_event)
+    {
+        model_3w_event_id++;
+        model_3w_last_confirmed_tick = model_3w_tick_id;
+    }
+
+    result->scores[APP_MODEL_3W_SCORE_EVENT_ID] = (float)model_3w_event_id;
+    result->scores[APP_MODEL_3W_SCORE_TICK_ID] = (float)model_3w_tick_id;
+
+    memmove(&model_prob_history[0],
+            &model_prob_history[1],
+            sizeof(model_prob_history[0]) * (APP_MODEL_3W_WINDOW_COUNT - 1u));
+    model_prob_history[APP_MODEL_3W_WINDOW_COUNT - 1u] = cough_prob;
+}
+
+static uint8_t app_model_inference_selector6_replay_phase(
+    const app_model_audio_feature_desc_t *desc)
+{
+    if (NULL == desc)
+    {
+        return 0u;
+    }
+
+    return (uint8_t)((desc->selected_channel & APP_MODEL_3W_REPLAY_PHASE_MASK) >>
+                     APP_MODEL_3W_REPLAY_PHASE_SHIFT);
+}
+#endif

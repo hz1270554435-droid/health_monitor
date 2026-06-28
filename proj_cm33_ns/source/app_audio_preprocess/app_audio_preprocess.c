@@ -32,6 +32,10 @@
 #define APP_MODEL_RUNTIME_PROFILE_ENABLE        (0u)
 #endif
 
+#ifndef APP_MODEL_SMOKE_TEST_ENABLE
+#define APP_MODEL_SMOKE_TEST_ENABLE             (0u)
+#endif
+
 #ifndef APP_AUDIO_FEATURE_DUMP_ENABLE
 #define APP_AUDIO_FEATURE_DUMP_ENABLE           (0u)
 #endif
@@ -42,6 +46,12 @@
 
 #define APP_MODEL_SHARED_BOOT_GATE_DIAG_MS      (5000u)
 #define APP_MODEL_SHARED_BOOT_GATE_POLL_MS      (100u)
+#define APP_AUDIO_REPLAY_FEATURE_PHASE_SHIFT     (4u)
+/* Replay feature-sequence mode reuses selected_channel as a small debug tag.
+ * Keep the low nibble distinct from normal channel ids so the high nibble can
+ * carry prev2/prev1/current phase to CM55 without being overwritten by 0xFF.
+ */
+#define APP_AUDIO_REPLAY_FEATURE_CHANNEL_TAG     (0x0Fu)
 
 #if (APP_AUDIO_EVENT_FEATURE_DUMP_ENABLE && \
      (0u == APP_AUDIO_EVENT_FEATURE_DUMP_RING_DEPTH))
@@ -192,6 +202,9 @@ static float window_buffer[APP_AUDIO_PREPROCESS_MAX_WINDOW_SAMPLES];
 static float frame_buffer[APP_AUDIO_PREPROCESS_MAX_FRAME_SAMPLES];
 static float power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
 static float model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
+static app_audio_replay_feature_publish_info_t replay_feature_publish_info;
+static bool replay_feature_pending_valid;
+static uint32_t replay_feature_pending_retry_count;
 #if (APP_AUDIO_SPECTRUM_COMPARE_ENABLE)
 static float compare_power_spectrum[APP_AUDIO_PREPROCESS_MAX_SPECTRUM_BINS];
 static float compare_model_input_feature[APP_MODEL_AUDIO_FEATURE_MAX_ELEMENTS];
@@ -342,6 +355,7 @@ static void app_audio_preprocess_event_pcm_remember(
 static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
                                                  float energy);
+static bool app_audio_preprocess_publish_replay_feature(void);
 #if (APP_MODEL_IPC_SMOKE_FORCE_WARM_STALE_INPUT_ENABLE)
 static void app_model_shared_boot_arm_stale_input(
     volatile app_model_shared_region_t *shared);
@@ -416,6 +430,17 @@ void app_audio_preprocess_task(void *pvParameters)
 
     for (;;)
     {
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+        if (app_audio_replay_is_feature_sequence_mode())
+        {
+            if (app_audio_preprocess_publish_replay_feature())
+            {
+                audio_preprocess_stats.windows_ready++;
+                audio_preprocess_stats.windows_published++;
+            }
+            continue;
+        }
+#endif
         app_pdm_pcm_block_t block;
 
         /* 正式业务链路阻塞等待 10 ms PCM block；不做忙轮询，避免无谓占用 CPU。 */
@@ -479,6 +504,10 @@ void app_audio_preprocess_task(void *pvParameters)
 static bool app_audio_preprocess_receive_input_block(app_pdm_pcm_block_t *block)
 {
 #if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    if (app_audio_replay_is_feature_sequence_mode())
+    {
+        return false;
+    }
     return app_audio_replay_receive_block(block, portMAX_DELAY);
 #else
     return app_pdm_pcm_receive_block(block, portMAX_DELAY);
@@ -491,6 +520,78 @@ static void app_audio_preprocess_release_input_block(uint8_t block_index)
     app_audio_replay_release_block(block_index);
 #else
     app_pdm_pcm_release_block(block_index);
+#endif
+}
+
+static bool app_audio_preprocess_publish_replay_feature(void)
+{
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    static uint32_t replay_feature_trace_count;
+    static uint32_t replay_feature_retry_trace_count;
+    uint32_t timestamp_ms;
+
+    if (!replay_feature_pending_valid)
+    {
+        memset(&replay_feature_publish_info, 0, sizeof(replay_feature_publish_info));
+        if (!app_audio_replay_receive_feature(model_input_feature,
+                                              APP_MODEL_AUDIO_MODEL_FLOAT_COUNT,
+                                              &replay_feature_publish_info,
+                                              portMAX_DELAY))
+        {
+            return false;
+        }
+
+        replay_feature_pending_valid = true;
+        replay_feature_pending_retry_count = 0u;
+        audio_preprocess_stats.blocks_received++;
+        audio_preprocess_stats.last_selected_channel =
+            (uint8_t)(APP_AUDIO_REPLAY_FEATURE_CHANNEL_TAG |
+                      (uint8_t)(replay_feature_publish_info.phase <<
+                                APP_AUDIO_REPLAY_FEATURE_PHASE_SHIFT));
+        if (replay_feature_trace_count < 12u)
+        {
+            printf("[REPLAY_FEAT_PUB] seq_next=%lu phase=%lu selected_channel=%lu "
+                   "ref_tick=%lu start_ms=%lu end_ms=%lu pending=1 retry=0\r\n",
+                   (unsigned long)(APP_MODEL_SHARED_REGION->producer_sequence + 1u),
+                   (unsigned long)replay_feature_publish_info.phase,
+                   (unsigned long)audio_preprocess_stats.last_selected_channel,
+                   (unsigned long)replay_feature_publish_info.reference_tick_id,
+                   (unsigned long)replay_feature_publish_info.window_start_ms,
+                   (unsigned long)replay_feature_publish_info.window_end_ms);
+            fflush(stdout);
+            replay_feature_trace_count++;
+        }
+    }
+
+    timestamp_ms = app_audio_preprocess_now_ms();
+    if (app_audio_preprocess_publish_feature(timestamp_ms,
+                                             audio_preprocess_stats.last_selected_channel,
+                                             1.0f))
+    {
+        replay_feature_pending_valid = false;
+        replay_feature_pending_retry_count = 0u;
+        return true;
+    }
+
+    replay_feature_pending_retry_count++;
+    if (replay_feature_retry_trace_count < 12u)
+    {
+        printf("[REPLAY_FEAT_RETRY] seq_next=%lu phase=%lu ref_tick=%lu retry=%lu "
+               "input_state=%lu producer=%lu consumer=%lu\r\n",
+               (unsigned long)(APP_MODEL_SHARED_REGION->producer_sequence + 1u),
+               (unsigned long)replay_feature_publish_info.phase,
+               (unsigned long)replay_feature_publish_info.reference_tick_id,
+               (unsigned long)replay_feature_pending_retry_count,
+               (unsigned long)APP_MODEL_SHARED_REGION->input_state,
+               (unsigned long)APP_MODEL_SHARED_REGION->producer_sequence,
+               (unsigned long)APP_MODEL_SHARED_REGION->consumer_sequence);
+        fflush(stdout);
+        replay_feature_retry_trace_count++;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10u));
+    return false;
+#else
+    return false;
 #endif
 }
 
@@ -2143,6 +2244,21 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
                                                  uint8_t selected_channel,
                                                  float energy)
 {
+#if (APP_MODEL_SMOKE_TEST_ENABLE)
+    static bool smoke_publish_skip_logged;
+
+    (void)timestamp_ms;
+    (void)selected_channel;
+    (void)energy;
+
+    if (!smoke_publish_skip_logged)
+    {
+        printf("[MODEL_SMOKE_MODE] live_feature_publish=0 reason=fixed_vector_only\r\n");
+        fflush(stdout);
+        smoke_publish_skip_logged = true;
+    }
+    return false;
+#else
     /* 发布策略：共享区只有一个输入槽。
      * 如果 CM55 还没消费上一帧，则本帧丢弃并计数 shared_busy，避免覆盖正在推理的数据。
      */
@@ -2285,6 +2401,7 @@ static bool app_audio_preprocess_publish_feature(uint32_t timestamp_ms,
 #endif
 
     return true;
+#endif
 }
 
 #if (APP_AUDIO_EVENT_ANY_DUMP_ENABLE)

@@ -9,7 +9,9 @@
 #include <stdio.h>
 #include <string.h>
 
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
 #include "app_audio_replay_selected_asset.h"
+#endif
 
 typedef struct
 {
@@ -19,15 +21,36 @@ typedef struct
     TickType_t last_wake_tick;
     uint32_t mono_cursor;
     uint32_t block_sequence;
+    uint32_t feature_sequence;
+    uint32_t feature_entry_index;
     int16_t stereo_block[APP_PDM_PCM_BLOCK_SAMPLES];
 } app_audio_replay_state_t;
 
 static app_audio_replay_state_t app_audio_replay_state;
 
+static bool app_audio_replay_asset_is_feature_mode(
+    const app_audio_replay_asset_t *asset);
+
+#if (!APP_AUDIO_REPLAY_TEST_ENABLE)
+static const app_audio_replay_asset_t app_audio_replay_disabled_asset =
+{
+    .asset_id = APP_AUDIO_REPLAY_ASSET_ID_ANY,
+    .chunk_id = "live_mic_mode",
+    .asset_name = "replay_disabled",
+    .sample_rate_hz = 16000u,
+    .sample_count = 0u,
+    .total_blocks = 0u,
+    .duration_ms = 0u,
+    .pcm_mono = NULL,
+};
+#endif
+
 #if (APP_AUDIO_REPLAY_TEST_ENABLE)
 static bool app_audio_replay_asset_is_valid(
     const app_audio_replay_asset_t *asset);
 static void app_audio_replay_print_ready_marker(
+    const app_audio_replay_asset_t *asset);
+static bool app_audio_replay_asset_is_pcm_mode(
     const app_audio_replay_asset_t *asset);
 #endif
 
@@ -86,7 +109,8 @@ bool app_audio_replay_receive_block(app_pdm_pcm_block_t *block,
     uint32_t i;
 
     if ((!app_audio_replay_state.initialized) || (NULL == block) ||
-        (!app_audio_replay_asset_is_valid(asset)))
+        (!app_audio_replay_asset_is_valid(asset)) ||
+        (!app_audio_replay_asset_is_pcm_mode(asset)))
     {
         return false;
     }
@@ -149,6 +173,92 @@ bool app_audio_replay_receive_block(app_pdm_pcm_block_t *block,
 #endif
 }
 
+bool app_audio_replay_receive_feature(float *feature,
+                                      uint32_t feature_capacity_floats,
+                                      app_audio_replay_feature_publish_info_t *info,
+                                      TickType_t ticks_to_wait)
+{
+#if (!APP_AUDIO_REPLAY_TEST_ENABLE)
+    (void)feature;
+    (void)feature_capacity_floats;
+    (void)info;
+    (void)ticks_to_wait;
+    return false;
+#else
+    const app_audio_replay_asset_t *asset = app_audio_replay_get_selected_asset();
+    const app_audio_replay_feature_entry_t *entry;
+    uint32_t stride_floats;
+    const float *src;
+
+    if ((!app_audio_replay_state.initialized) || (NULL == feature) ||
+        (!app_audio_replay_asset_is_valid(asset)) ||
+        (!app_audio_replay_asset_is_feature_mode(asset)))
+    {
+        return false;
+    }
+
+    if (app_audio_replay_state.completed)
+    {
+        vTaskDelay((ticks_to_wait > 0) ? ticks_to_wait : pdMS_TO_TICKS(250u));
+        return false;
+    }
+
+    if (app_audio_replay_state.feature_entry_index >= asset->feature_entry_count)
+    {
+        app_audio_replay_state.completed = true;
+        printf("[BOOT] replay_provider_complete chunk_id=%s total_rows=%lu\r\n",
+               (NULL != asset->chunk_id) ? asset->chunk_id : "null",
+               (unsigned long)asset->feature_entry_count);
+        fflush(stdout);
+        return false;
+    }
+
+    if (!app_audio_replay_state.pacing_started)
+    {
+        app_audio_replay_state.last_wake_tick = xTaskGetTickCount();
+        app_audio_replay_state.pacing_started = true;
+    }
+    else
+    {
+        vTaskDelayUntil(&app_audio_replay_state.last_wake_tick,
+                        pdMS_TO_TICKS(500u));
+    }
+
+    stride_floats = asset->feature_stride_floats;
+    if ((0u == stride_floats) || (feature_capacity_floats < stride_floats))
+    {
+        return false;
+    }
+
+    entry = &asset->feature_entries[app_audio_replay_state.feature_entry_index];
+    src = &asset->feature_payload_f32[
+        app_audio_replay_state.feature_entry_index * stride_floats];
+    memcpy(feature, src, stride_floats * sizeof(feature[0]));
+
+    app_audio_replay_state.feature_sequence++;
+    if (NULL != info)
+    {
+        memset(info, 0, sizeof(*info));
+        info->phase = entry->phase;
+        info->reference_tick_id = (uint8_t)entry->reference_tick_id;
+        info->window_start_ms = entry->window_start_ms;
+        info->window_end_ms = entry->window_end_ms;
+    }
+
+    app_audio_replay_state.feature_entry_index++;
+    if (app_audio_replay_state.feature_entry_index >= asset->feature_entry_count)
+    {
+        app_audio_replay_state.completed = true;
+        printf("[BOOT] replay_provider_complete chunk_id=%s total_rows=%lu\r\n",
+               (NULL != asset->chunk_id) ? asset->chunk_id : "null",
+               (unsigned long)asset->feature_entry_count);
+        fflush(stdout);
+    }
+
+    return true;
+#endif
+}
+
 void app_audio_replay_release_block(uint8_t block_index)
 {
     (void)block_index;
@@ -181,10 +291,31 @@ bool app_audio_replay_get_window_info(uint32_t input_sequence,
                                       app_audio_replay_window_info_t *info)
 {
     uint32_t start_ms;
+    const app_audio_replay_asset_t *asset = app_audio_replay_get_selected_asset();
 
     if ((0u == input_sequence) || (NULL == info))
     {
         return false;
+    }
+
+    if ((NULL != asset) &&
+        app_audio_replay_asset_is_feature_mode(asset) &&
+        (input_sequence <= asset->feature_entry_count))
+    {
+        const app_audio_replay_feature_entry_t *entry =
+            &asset->feature_entries[input_sequence - 1u];
+
+        memset(info, 0, sizeof(*info));
+        info->replay_window_index = input_sequence;
+        info->start_ms = entry->window_start_ms;
+        info->end_ms = entry->window_end_ms;
+        info->reference_tick_id = entry->reference_tick_id;
+        info->prev2_start_ms = entry->prev2_start_ms;
+        info->prev1_start_ms = entry->prev1_start_ms;
+        info->current_start_ms = entry->current_start_ms;
+        info->current_end_ms = entry->current_end_ms;
+        info->phase = entry->phase;
+        return true;
     }
 
     start_ms = (input_sequence - 1u) * 500u;
@@ -198,13 +329,27 @@ bool app_audio_replay_get_window_info(uint32_t input_sequence,
 
 const app_audio_replay_asset_t *app_audio_replay_get_selected_asset(void)
 {
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
     return &g_app_audio_replay_selected_asset;
+#else
+    return &app_audio_replay_disabled_asset;
+#endif
 }
 
 bool app_audio_replay_is_enabled(void)
 {
 #if (APP_AUDIO_REPLAY_TEST_ENABLE)
     return true;
+#else
+    return false;
+#endif
+}
+
+bool app_audio_replay_is_feature_sequence_mode(void)
+{
+#if (APP_AUDIO_REPLAY_TEST_ENABLE)
+    return app_audio_replay_asset_is_feature_mode(
+        app_audio_replay_get_selected_asset());
 #else
     return false;
 #endif
@@ -231,29 +376,65 @@ void app_audio_replay_format_seconds(char *buffer,
                    (unsigned long)millis);
 }
 
+static bool app_audio_replay_asset_is_feature_mode(
+    const app_audio_replay_asset_t *asset)
+{
+    return ((NULL != asset) &&
+            (APP_AUDIO_REPLAY_ASSET_MODE_FEATURE_SEQUENCE == asset->asset_mode));
+}
+
 #if (APP_AUDIO_REPLAY_TEST_ENABLE)
 static bool app_audio_replay_asset_is_valid(
     const app_audio_replay_asset_t *asset)
 {
-    if ((NULL == asset) || (NULL == asset->pcm_mono) ||
-        (NULL == asset->chunk_id) || (NULL == asset->asset_name))
+    if ((NULL == asset) || (NULL == asset->chunk_id) ||
+        (NULL == asset->asset_name))
     {
         return false;
     }
 
-    if ((16000u != asset->sample_rate_hz) || (0u == asset->sample_count) ||
-        (0u == asset->total_blocks) || (0u == asset->duration_ms))
+    if (app_audio_replay_asset_is_pcm_mode(asset))
     {
-        return false;
+        if ((NULL == asset->pcm_mono) ||
+            (16000u != asset->sample_rate_hz) || (0u == asset->sample_count) ||
+            (0u == asset->total_blocks) || (0u == asset->duration_ms))
+        {
+            return false;
+        }
+        return true;
     }
 
-    return true;
+    if (app_audio_replay_asset_is_feature_mode(asset))
+    {
+        if ((0u == asset->feature_entry_count) ||
+            (0u == asset->feature_stride_floats) ||
+            (NULL == asset->feature_entries) ||
+            (NULL == asset->feature_payload_f32))
+        {
+            return false;
+        }
+        return true;
+    }
+
+    return false;
 }
 
 static void app_audio_replay_print_ready_marker(
     const app_audio_replay_asset_t *asset)
 {
     char duration_sec[24];
+
+    if (app_audio_replay_asset_is_feature_mode(asset))
+    {
+        printf("[BOOT] replay_provider_ready chunk_id=%s asset_name=%s "
+               "mode=feature_sequence total_rows=%lu stride_floats=%lu\r\n",
+               asset->chunk_id,
+               asset->asset_name,
+               (unsigned long)asset->feature_entry_count,
+               (unsigned long)asset->feature_stride_floats);
+        fflush(stdout);
+        return;
+    }
 
     app_audio_replay_format_seconds(duration_sec,
                                     sizeof(duration_sec),
@@ -266,5 +447,12 @@ static void app_audio_replay_print_ready_marker(
            (unsigned long)asset->total_blocks,
            duration_sec);
     fflush(stdout);
+}
+
+static bool app_audio_replay_asset_is_pcm_mode(
+    const app_audio_replay_asset_t *asset)
+{
+    return ((NULL != asset) &&
+            (APP_AUDIO_REPLAY_ASSET_MODE_PCM == asset->asset_mode));
 }
 #endif
