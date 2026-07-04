@@ -29,8 +29,10 @@ static void app_display_backend_print_debug_page(
 static void app_display_backend_print_final_mock_screen(
     const e84_display_view_model_t *view,
     uint32_t now_ms);
+#if (APP_DISPLAY_FINAL_UART_LOG_ENABLE)
 static const char *app_display_backend_mock_scenario(
     const e84_display_snapshot_t *snapshot);
+#endif
 #endif
 
 cy_rslt_t app_display_backend_null_init(void)
@@ -285,6 +287,7 @@ static void app_display_backend_print_float_3(float value)
 }
 
 #if (APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE)
+#if (APP_DISPLAY_FINAL_UART_LOG_ENABLE)
 static const char *app_display_backend_radar_source_label(
     e84_display_radar_source_state_t state);
 static const char *app_display_backend_radar_presence_text(
@@ -308,11 +311,13 @@ static void app_display_backend_print_final_audit(
     bool rr_live,
     bool hr_live,
     bool distance_live);
+#endif
 
 static void app_display_backend_print_final_mock_screen(
     const e84_display_view_model_t *view,
     uint32_t now_ms)
 {
+#if (APP_DISPLAY_FINAL_UART_LOG_ENABLE)
     const e84_display_snapshot_t *snapshot = &view->snapshot;
     bool radar_normal =
         (E84_DISPLAY_RADAR_SOURCE_NORMAL == snapshot->radar_source_state);
@@ -402,8 +407,13 @@ static void app_display_backend_print_final_mock_screen(
                                           radar_normal && rr_valid,
                                           radar_normal && hr_valid,
                                           distance_live);
+#else
+    (void)view;
+    (void)now_ms;
+#endif
 }
 
+#if (APP_DISPLAY_FINAL_UART_LOG_ENABLE)
 static const char *app_display_backend_main_status_text(
     const e84_display_snapshot_t *snapshot)
 {
@@ -649,6 +659,8 @@ static const char *app_display_backend_radar_quality_id(
             return "not_verified";
     }
 }
+
+#endif /* APP_DISPLAY_FINAL_UART_LOG_ENABLE */
 
 #endif /* APP_DISPLAY_FINAL_MOCK_ENABLE || APP_DISPLAY_PRODUCT_SCREEN_ENABLE */
 

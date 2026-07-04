@@ -137,6 +137,10 @@
 #define APP_DISPLAY_FINAL_MOCK_PERIOD_MS          (1000u)
 #endif
 
+#ifndef APP_DISPLAY_FINAL_UART_LOG_ENABLE
+#define APP_DISPLAY_FINAL_UART_LOG_ENABLE         (1u)
+#endif
+
 #ifndef APP_DISPLAY_LOG_COUNT_ENABLE
 #define APP_DISPLAY_LOG_COUNT_ENABLE              (0u)
 #endif
@@ -379,6 +383,11 @@
 #if ((APP_DISPLAY_FINAL_MOCK_ENABLE != 0u) && \
      (APP_DISPLAY_FINAL_MOCK_ENABLE != 1u))
 #error "Unsupported APP_DISPLAY_FINAL_MOCK_ENABLE"
+#endif
+
+#if ((APP_DISPLAY_FINAL_UART_LOG_ENABLE != 0u) && \
+     (APP_DISPLAY_FINAL_UART_LOG_ENABLE != 1u))
+#error "Unsupported APP_DISPLAY_FINAL_UART_LOG_ENABLE"
 #endif
 
 #if ((APP_DISPLAY_LOG_COUNT_ENABLE != 0u) && \
