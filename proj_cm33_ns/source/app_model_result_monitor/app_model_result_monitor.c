@@ -501,7 +501,11 @@ void app_model_result_monitor_task(void *pvParameters)
                             replay_suffix,
                             sizeof(replay_suffix));
                         printf("[COUGH_EDGE] id=%lu t_ms=%lu "
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+                               "source=PROB_THRESHOLD%s\r\n",
+#else
                                "source=C2_ACCEPTED%s\r\n",
+#endif
                                (unsigned long)model_result_runtime.event_id,
                                (unsigned long)
                                    app_model_result_monitor_now_ms(),
@@ -1408,9 +1412,11 @@ static void app_model_result_monitor_print_event(
     return;
 #endif
 
+#if (APP_AUDIO_MODEL_SELECT != APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
     model_result_runtime.event_id++;
     model_result_monitor_stats.events_printed++;
     model_result_monitor_stats.last_event_id = model_result_runtime.event_id;
+#endif
 
     log_start_ms = app_model_result_monitor_log_start();
     printf("[MODEL_EVENT] t_ms=%lu, event_id=%lu, cough_prob=",
@@ -1485,11 +1491,6 @@ static bool app_model_result_monitor_should_print_event(
     uint32_t result_sequence,
     uint32_t now_ms)
 {
-    float candidate_energy;
-    uint32_t candidate_id;
-    uint32_t duration_ms;
-    uint32_t peak_x100;
-
 #if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
     (void)result_sequence;
 
@@ -1506,7 +1507,37 @@ static bool app_model_result_monitor_should_print_event(
     model_result_runtime.last_event_max_energy = result->scores[3];
 
     return (0.5f <= result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT]);
-#endif
+#elif (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+    (void)result_sequence;
+
+    if ((NULL == result) ||
+        (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
+    {
+        return false;
+    }
+
+    if ((0u != model_result_runtime.last_event_ms) &&
+        (0u < APP_MODEL_EVENT_COOLDOWN_MS) &&
+        ((now_ms - model_result_runtime.last_event_ms) <
+         APP_MODEL_EVENT_COOLDOWN_MS))
+    {
+        return false;
+    }
+
+    model_result_runtime.event_id++;
+    model_result_runtime.last_event_start_input_sequence =
+        result->input_sequence;
+    model_result_runtime.last_event_end_input_sequence =
+        result->input_sequence;
+    model_result_runtime.last_event_max_energy = result->scores[3];
+    model_result_runtime.last_event_ms = now_ms;
+
+    return true;
+#else
+    float candidate_energy;
+    uint32_t candidate_id;
+    uint32_t duration_ms;
+    uint32_t peak_x100;
 
     if ((NULL == result) ||
         (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
@@ -1722,6 +1753,7 @@ static bool app_model_result_monitor_should_print_event(
     model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
     model_result_runtime.last_event_ms = now_ms;
     return true;
+#endif
 }
 
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
