@@ -47,12 +47,12 @@
 #define APP_AUDIO_3W_E2_PEAK_PREVIEW_INPUT_SHAPE      "[3,40,101]"
 #define APP_AUDIO_3W_E2_PEAK_PREVIEW_COUGH_THRESHOLD  (0.95f)
 
-#define APP_AUDIO_HZ2_0_B0_MODEL_NAME       "audio_hz2_cleanline_1w"
-#define APP_AUDIO_HZ2_0_B0_MODEL_VERSION    "hz2.0-B0"
+#define APP_AUDIO_HZ2_0_B0_MODEL_NAME       "audio_hz2mix_bssilver_bw1_1w"
+#define APP_AUDIO_HZ2_0_B0_MODEL_VERSION    "hz2mix-boardspeechsilver-warm-bw1.0"
 #define APP_AUDIO_HZ2_0_B0_FRONTEND_NAME    "board_htk_no_norm_v1"
 #define APP_AUDIO_HZ2_0_B0_CLASS_ORDER      "non_cough,cough"
 #define APP_AUDIO_HZ2_0_B0_INPUT_SHAPE      "1x1x40x94"
-#define APP_AUDIO_HZ2_0_B0_COUGH_THRESHOLD  (0.60f)
+#define APP_AUDIO_HZ2_0_B0_COUGH_THRESHOLD  (0.70f)
 
 #if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_V3_BOARD_HTK_HARDNEG)
 #define APP_AUDIO_ACTIVE_MODEL_NAME       APP_AUDIO_V3_MODEL_NAME

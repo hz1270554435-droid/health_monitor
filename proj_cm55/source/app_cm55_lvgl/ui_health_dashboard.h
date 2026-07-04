@@ -3,7 +3,7 @@
  * Health monitor dashboard UI — LVGL implementation.
  *
  * Dark-theme night monitoring layout:
- *   Header:  "夜间健康监测"  +  green "实时监测中" capsule
+ *   Header:  RAM-only "起夜N次" capsule + green "实时监测中" capsule
  *   Cards:   2×2 grid — 呼吸率 | 心率 | 咳嗽事件 | 雷达
  *   Footer:  trend text + MIC/Radar/BLE status dots
  *

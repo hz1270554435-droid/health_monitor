@@ -2,9 +2,9 @@
 * ImagiNet Compiler 5.9.4927.65534+e5b229f227997e1d3e75ed83c30a1bcf08976921
 * Copyright © 2023- Imagimob AB, All Rights Reserved.
 * 
-* Generated at 07/04/2026 02:54:02 UTC. Any changes will be lost.
+* Generated at 07/04/2026 12:45:14 UTC. Any changes will be lost.
 * 
-* Model ID  b53fa698-7cdf-45fe-b1a8-11963e6b9293
+* Model ID  e0922366-526d-4513-aea9-3f3cdadba9ed
 * 
 * Memory    Size                      Efficiency
 * Buffers   8 bytes (RAM)             100 %
@@ -62,7 +62,7 @@ typedef int64_t q63_t;       // 64-bit fractional data type in Q1.63 format.
 typedef float timestamp_t;
 
 // Model GUID (16 bytes)
-#define AUDIO_MODEL_ID {0x98, 0xa6, 0x3f, 0xb5, 0xdf, 0x7c, 0xfe, 0x45, 0xb1, 0xa8, 0x11, 0x96, 0x3e, 0x6b, 0x92, 0x93}
+#define AUDIO_MODEL_ID {0x66, 0x23, 0x92, 0xe0, 0x6d, 0x52, 0x13, 0x45, 0xae, 0xa9, 0x3f, 0x3c, 0xda, 0xdb, 0xa9, 0xed}
 
 
 // First nibble is bit encoding, second nibble is number of bytes
@@ -180,7 +180,7 @@ extern mtb_ml_model_t* AUDIO_mtb_models[AUDIO_MAX_MTB_MODELS];
     #define AUDIO_REGIONS_COUNT 4
     #define AUDIO_REGIONS_NAMES {\
     	"SET INPUT 0",\
-    	"INVOKE HZ2_B0",\
+    	"INVOKE HZ2MIX_BOARDSPEECHSILVER_WARM_BW1_0",\
     	"GET OUTPUT 0",\
     	"GET OUTPUT 1",\
     }

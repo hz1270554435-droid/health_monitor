@@ -5,8 +5,7 @@
  * Layout (800 × 480 visible, 832 frame, 32px HOFFSET):
  *   ┌─────────────────────────────────────────────────────────┐
  *   │  (outer rounded container 14..818, 14..466)              │
- *   │  夜间健康监测                      [● 实时监测中]         │
- *   │  今晚状态整体平稳                                        │
+ *   │  [ 起夜0次 ]                      [● 实时监测中]         │
  *   ├───────────────────────┬─────────────────────────────────┤
  *   │  ◉ 呼吸率              │  ◉ 心率                         │
  *   │      17  bpm           │      112  bpm                   │
@@ -62,7 +61,9 @@
 
 #define TITLE_X            (OUTER_X + 32U)
 #define TITLE_Y            (OUTER_Y + 20U)
-#define SUBTITLE_Y         (TITLE_Y + 42U)
+#define WAKE_CAPSULE_W     176U
+#define WAKE_CAPSULE_H     46U
+#define WAKE_CAPSULE_R     8U
 
 #define CAPSULE_W          190U
 #define CAPSULE_H          46U
@@ -101,6 +102,7 @@
 #define C_OUTER_BORDER  lv_color_hex(0x1A2535)
 #define C_CARD_BG       lv_color_hex(0x0B1520)
 #define C_CARD_BORDER   lv_color_hex(0x1D2B3A)
+#define C_WHITE         lv_color_hex(0xFFFFFF)
 #define C_TEXT          lv_color_hex(0xECF0F5)
 #define C_TEXT_DIM      lv_color_hex(0x6B7A8D)
 #define C_CYAN          lv_color_hex(0x00D4C8)
@@ -149,9 +151,27 @@ static lv_obj_t *lbl_trend;
 static lv_obj_t *lbl_diag;
 static lv_obj_t *dot_mic, *dot_radar, *dot_ble;
 
-/* Display-local state only for log dedup. Counts remain producer-owned. */
+/* Display-local state only: demo wake count is RAM-only and resets on reboot. */
 static bool s_logged_total_valid;
 static uint32_t s_last_logged_total;
+
+#define WAKE_FAR_DELTA_CM          (50U)
+#define WAKE_WINDOW_MS             (30U * 1000U)
+#define WAKE_ABSENT_CONFIRM_HITS   (2U)
+
+typedef enum
+{
+    WAKE_STATE_WAIT_PRESENT = 0,
+    WAKE_STATE_PRESENT,
+    WAKE_STATE_FAR_WINDOW,
+    WAKE_STATE_ABSENT_COUNTED
+} wake_state_t;
+
+static wake_state_t s_wake_state;
+static uint32_t s_wake_count;
+static uint32_t s_wake_window_start_ms;
+static uint16_t s_wake_near_distance_cm;
+static uint8_t s_wake_absent_hits;
 
 /* ------------------------------------------------------------------ */
 /* Helpers                                                            */
@@ -229,23 +249,133 @@ static void set_badge_pill(lv_obj_t *pill, const char *text,
     lv_obj_set_width(pill, LV_SIZE_CONTENT);
 }
 
-static void set_status_hint(const char *text, lv_color_t bg, lv_color_t fg)
+static void set_wake_capsule(void)
 {
+    char buf[32];
     if (NULL == lbl_subtitle)
     {
         return;
     }
 
-    lv_label_set_text(lbl_subtitle, text);
-    lv_obj_set_style_text_color(lbl_subtitle, fg, 0);
-    lv_obj_set_style_bg_color(lbl_subtitle, bg, 0);
+    snprintf(buf, sizeof(buf), "起夜%lu次", (unsigned long)s_wake_count);
+    lv_label_set_text(lbl_subtitle, buf);
+    lv_obj_set_size(lbl_subtitle, WAKE_CAPSULE_W, WAKE_CAPSULE_H);
+    lv_obj_set_style_text_color(lbl_subtitle, C_WHITE, 0);
+    lv_obj_set_style_bg_color(lbl_subtitle, C_CARD_BG, 0);
     lv_obj_set_style_bg_opa(lbl_subtitle, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(lbl_subtitle, fg, 0);
+    lv_obj_set_style_border_color(lbl_subtitle, C_CARD_BORDER, 0);
     lv_obj_set_style_border_width(lbl_subtitle, 1, 0);
-    lv_obj_set_style_radius(lbl_subtitle, 16, 0);
-    lv_obj_set_style_pad_hor(lbl_subtitle, 12, 0);
-    lv_obj_set_style_pad_ver(lbl_subtitle, 3, 0);
-    lv_obj_set_width(lbl_subtitle, LV_SIZE_CONTENT);
+    lv_obj_set_style_radius(lbl_subtitle, WAKE_CAPSULE_R, 0);
+    lv_obj_set_style_pad_hor(lbl_subtitle, 18, 0);
+    lv_obj_set_style_pad_ver(lbl_subtitle, 8, 0);
+    lv_obj_set_style_text_align(lbl_subtitle, LV_TEXT_ALIGN_CENTER, 0);
+}
+
+static bool wake_radar_is_usable(const app_display_cm55_snapshot_t *snap)
+{
+    return (NULL != snap) && (DISPLAY_CM55_RADAR_NORMAL == snap->radar_source);
+}
+
+static bool wake_distance_is_far(uint16_t distance_cm)
+{
+    if ((0U == s_wake_near_distance_cm) || (0U == distance_cm))
+    {
+        return false;
+    }
+
+    return ((uint32_t)distance_cm >=
+            ((uint32_t)s_wake_near_distance_cm + WAKE_FAR_DELTA_CM));
+}
+
+static void wake_note_present_distance(uint16_t distance_cm)
+{
+    if (0U == distance_cm)
+    {
+        return;
+    }
+
+    if ((0U == s_wake_near_distance_cm) ||
+        (distance_cm < s_wake_near_distance_cm))
+    {
+        s_wake_near_distance_cm = distance_cm;
+    }
+}
+
+static bool wake_window_expired(uint32_t now_ms)
+{
+    return ((uint32_t)(now_ms - s_wake_window_start_ms) > WAKE_WINDOW_MS);
+}
+
+static void wake_start_far_window(uint32_t now_ms)
+{
+    s_wake_state = WAKE_STATE_FAR_WINDOW;
+    s_wake_window_start_ms = now_ms;
+    s_wake_absent_hits = 0U;
+}
+
+static void update_wake_state(const app_display_cm55_snapshot_t *snap,
+                              uint32_t now_ms)
+{
+    if (!wake_radar_is_usable(snap))
+    {
+        return;
+    }
+
+    if ((0U != snap->radar_presence) && (snap->distance_cm > 0U))
+    {
+        bool far_now;
+
+        if ((WAKE_STATE_WAIT_PRESENT == s_wake_state) ||
+            (WAKE_STATE_ABSENT_COUNTED == s_wake_state))
+        {
+            s_wake_state = WAKE_STATE_PRESENT;
+            s_wake_near_distance_cm = snap->distance_cm;
+            s_wake_window_start_ms = now_ms;
+            s_wake_absent_hits = 0U;
+            return;
+        }
+
+        wake_note_present_distance(snap->distance_cm);
+        far_now = wake_distance_is_far(snap->distance_cm);
+        if (far_now)
+        {
+            if ((WAKE_STATE_FAR_WINDOW != s_wake_state) ||
+                wake_window_expired(now_ms))
+            {
+                wake_start_far_window(now_ms);
+            }
+        }
+        else
+        {
+            s_wake_state = WAKE_STATE_PRESENT;
+            s_wake_window_start_ms = now_ms;
+            s_wake_absent_hits = 0U;
+        }
+        return;
+    }
+
+    if ((0U == snap->radar_presence) &&
+        (WAKE_STATE_FAR_WINDOW == s_wake_state))
+    {
+        if (wake_window_expired(now_ms))
+        {
+            s_wake_state = WAKE_STATE_WAIT_PRESENT;
+            s_wake_window_start_ms = now_ms;
+            s_wake_absent_hits = 0U;
+            return;
+        }
+
+        if (s_wake_absent_hits < WAKE_ABSENT_CONFIRM_HITS)
+        {
+            s_wake_absent_hits++;
+        }
+        if (s_wake_absent_hits >= WAKE_ABSENT_CONFIRM_HITS)
+        {
+            s_wake_count++;
+            s_wake_state = WAKE_STATE_ABSENT_COUNTED;
+            s_wake_absent_hits = 0U;
+        }
+    }
 }
 
 static void set_metric_value(lv_obj_t *value, lv_obj_t *unit,
@@ -544,7 +674,6 @@ static void run_minimal_realtime(uint32_t tick)
     uint32_t cough_1min = snap->cough_count_1min;
     uint32_t cough_5min = snap->cough_count_5min;
     uint32_t cough_event_total = snap->cough_event_count_total;
-    uint32_t health_state = snap->health_state;
     uint32_t flags = snap->flags;
     uint32_t ble_connected = snap->ble_connected;
     uint32_t wall_epoch_s = snap->wall_epoch_s;
@@ -561,14 +690,7 @@ static void run_minimal_realtime(uint32_t tick)
         s_snap_fail_count++;
     }
 
-    if (1U == health_state)
-        set_status_hint("今晚状态整体平稳", C_GREEN_DIM, C_GREEN);
-    else if (2U == health_state)
-        set_status_hint("请注意呼吸异常", C_AMBER_DIM, C_AMBER);
-    else if (3U == health_state)
-        set_status_hint("警告：请检查", C_ROSE_DIM, C_ROSE);
-    else
-        set_status_hint("实时数据同步中", C_CYAN_DIM, C_CYAN);
+    set_wake_capsule();
 
     update_clock_label(wall_epoch_s, wall_time_flags);
 
@@ -679,17 +801,11 @@ void ui_health_dashboard_init(void)
     lv_obj_set_style_pad_all(outer, 0, 0);
     lv_obj_clear_flag(outer, LV_OBJ_FLAG_SCROLLABLE);
 
-    /* ---- Title ---- */
-    lv_obj_t *lbl_title = lv_label_create(outer);
-    lv_label_set_text(lbl_title, "夜间健康监测");
-    lv_obj_set_style_text_color(lbl_title, C_TEXT, 0);
-    lv_obj_set_style_text_font(lbl_title, FONT_28, 0);
-    lv_obj_set_pos(lbl_title, TITLE_X - OUTER_X, TITLE_Y - OUTER_Y);
-
+    /* ---- Wake capsule ---- */
     lbl_subtitle = lv_label_create(outer);
-    lv_obj_set_style_text_font(lbl_subtitle, FONT_20, 0);
-    lv_obj_set_pos(lbl_subtitle, TITLE_X - OUTER_X, SUBTITLE_Y - OUTER_Y + 4);
-    set_status_hint("今晚状态整体平稳", C_GREEN_DIM, C_GREEN);
+    lv_obj_set_style_text_font(lbl_subtitle, FONT_28, 0);
+    lv_obj_set_pos(lbl_subtitle, TITLE_X - OUTER_X, TITLE_Y - OUTER_Y);
+    set_wake_capsule();
 
     lbl_clock = lv_label_create(outer);
     lv_label_set_text(lbl_clock, "--:--");
@@ -923,7 +1039,7 @@ void ui_health_dashboard_update(void)
 
     app_display_cm55_snapshot_t snap;
     if (!read_snapshot(&snap)) {
-        lv_label_set_text(lbl_subtitle, "等待数据...");
+        set_wake_capsule();
         update_clock_label(0u, 0u);
         set_snapshot_diag(&snap);
         return;
@@ -938,25 +1054,12 @@ void ui_health_dashboard_update(void)
 
     char buf[48];
 
-    /* ---- Subtitle (also shows debug info) ---- */
-    {
-        volatile app_display_cm55_snapshot_t *raw = APP_DISPLAY_CM55_SNAPSHOT;
-        APP_DISPLAY_CM55_INVALIDATE_CACHE((uint32_t)raw, sizeof(*raw));
-        if (raw->magic != APP_DISPLAY_CM55_SNAPSHOT_MAGIC) {
-            snprintf(buf, sizeof(buf), "MAGIC=0x%08lX", (unsigned long)raw->magic);
-            set_status_hint(buf, C_ROSE_DIM, C_ROSE);
-        } else if (snap.health_state == 1U) {
-            set_status_hint("今晚状态整体平稳", C_GREEN_DIM, C_GREEN);
-        } else if (snap.health_state == 2U) {
-            set_status_hint("请注意呼吸异常", C_AMBER_DIM, C_AMBER);
-        } else if (snap.health_state == 3U) {
-            set_status_hint("警告：请检查", C_ROSE_DIM, C_ROSE);
-        } else {
-            snprintf(buf, sizeof(buf), "INIT seq=%lu rr=%u",
-                     (unsigned long)raw->seq_begin, snap.rr_bpm_x10);
-            set_status_hint(buf, C_CYAN_DIM, C_CYAN);
-        }
-    }
+    /* ---- Wake capsule: RAM-only demo count from radar distance/presence ---- */
+    uint32_t wake_now_ms = (snap.timestamp_ms > 0U) ?
+                           snap.timestamp_ms :
+                           (s_update_count * 1000U);
+    update_wake_state(&snap, wake_now_ms);
+    set_wake_capsule();
 
     update_clock_label(snap.wall_epoch_s, snap.wall_time_flags);
 
