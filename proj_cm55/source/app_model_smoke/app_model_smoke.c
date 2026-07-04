@@ -11,6 +11,9 @@
 #include "app_audio_deployment_config.h"
 #include "app_model_shared.h"
 #include APP_AUDIO_ACTIVE_MODEL_HEADER
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+#error "selector 7 fixed-vector smoke requires a dedicated 40x94 hz2 test vector header"
+#endif
 #include APP_AUDIO_ACTIVE_TEST_VECTOR_HEADER
 
 #endif /* APP_MODEL_SMOKE_TEST_ENABLE */
@@ -210,6 +213,9 @@ bool app_model_smoke_run_once(void)
     for (uint32_t i = 0u; i < AUDIO_TEST_VECTOR_COUNT; i++)
     {
         float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+        float aux_logits[APP_AUDIO_ACTIVE_MODEL_AUX_OUT_COUNT] = { 0.0f };
+#endif
         uint32_t start_ms;
         uint32_t elapsed_ms;
         float cough_prob;
@@ -219,7 +225,11 @@ bool app_model_smoke_run_once(void)
 
         (void)app_model_smoke_publish_trace(4u, (float)(i + 1u));
         start_ms = app_model_smoke_now_ms();
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+        (void)AUDIO_compute(audio_test_vectors[i], aux_logits, output);
+#else
         APP_AUDIO_ACTIVE_MODEL_COMPUTE(audio_test_vectors[i], output);
+#endif
         elapsed_ms = app_model_smoke_now_ms() - start_ms;
         (void)app_model_smoke_publish_trace(5u, (float)elapsed_ms);
 

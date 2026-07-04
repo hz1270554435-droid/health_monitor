@@ -28,12 +28,12 @@
 /* 本文件是 CM55 侧模型任务框架。
  *
  * 数据边界：
- * - CM33 只把“已前处理、float32 40x101”的模型输入写入共享内存；
+ * - CM33 只把“已前处理、float32 40xT”的模型输入写入共享内存；
  * - CM55 从共享内存取走输入后复制到本地缓冲，再释放共享输入槽；
  * - 原始 PDM/PCM 永远不进入这块共享协议，避免采集数据和模型输入互相干扰。
  *
  * 当前模型接入点：
- * - active model compute API 输入必须是 PC/CM33 一致的 NCHW 展平 float[40 * 101]；
+ * - active model compute API 输入必须是 PC/CM33 一致的 NCHW 展平 float[40 * T]；
  * - 如果模型输入 shape、格式或输出类别数改变，同步更新 shared/app_model_shared.h；
  * - 模型内部状态由导出代码管理，本模块只持有一份本地输入缓冲。
  */
@@ -489,10 +489,13 @@ static app_model_inference_status_t app_model_inference_run_model(
     /* 正式 MIC 推理入口。
      *
      * CM33 已经把 1 s MIC 窗口转换成和 PC 测试向量一致的 NCHW 展平 float32：
-     * payload[mel * 101 + time]。这里不再做反量化或额外转置，直接送入
+     * payload[mel * T + time]。这里不再做反量化或额外转置，直接送入
      * 已验证过的 active model compute API。
      */
     float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+    float aux_logits[APP_AUDIO_ACTIVE_MODEL_AUX_OUT_COUNT] = { 0.0f };
+#endif
 
     /* 任何一个关键输入为空，都说明调用链路不完整，直接按非法输入处理。 */
     if ((NULL == desc) || (NULL == payload) || (NULL == result))
@@ -638,8 +641,16 @@ static app_model_inference_status_t app_model_inference_run_model(
     app_model_inference_fill_input_stats(desc, payload, result);
 #endif
 
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+    if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS !=
+        AUDIO_compute(payload, aux_logits, output))
+    {
+        return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
+    }
+#else
     /* 真正调用导入后的模型计算入口。 */
     APP_AUDIO_ACTIVE_MODEL_COMPUTE(payload, output);
+#endif
 
     /* 把模型原始输出与辅助调试字段统一封装进共享结果结构。 */
     result->input_sequence = desc->sequence;

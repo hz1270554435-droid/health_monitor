@@ -1047,12 +1047,21 @@ static cy_rslt_t app_audio_preprocess_validate_and_plan(
         return CY_RSLT_TYPE_ERROR;
     }
 
-    /* 训练端 librosa.melspectrogram() 默认 center=True，会在 1 s 音频两端按
-     * n_fft/2 补零。因此 16000 点、hop=160 时得到 1 + 16000 / 160 = 101 帧。
-     * 这里显式按 center padding 计算时间帧数，保证输出 shape 与模型一致。
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+    /* hz2 cleanline uses center=false:
+     * floor((16000 - 1024) / 160) + 1 = 94 frames.
+     */
+    plan->time_bins =
+        (uint16_t)(1u +
+                   ((plan->window_samples - config->fft_size) /
+                    plan->frame_hop_samples));
+#else
+    /* Legacy selectors use center=True:
+     * 16000 samples, hop=160 -> 1 + 16000 / 160 = 101 frames.
      */
     plan->time_bins =
         (uint16_t)(1u + (plan->window_samples / plan->frame_hop_samples));
+#endif
     if ((0u == plan->time_bins) ||
         (APP_MODEL_AUDIO_MODEL_TIME_BINS != plan->time_bins))
     {
@@ -1343,12 +1352,18 @@ static bool app_audio_preprocess_extract_and_publish(uint32_t timestamp_ms,
 
     for (uint16_t t = 0; t < audio_preprocess_plan.time_bins; t++)
     {
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+        int32_t frame_start =
+            ((int32_t)t * (int32_t)audio_preprocess_plan.frame_hop_samples);
+#else
         int32_t frame_start =
             ((int32_t)t * (int32_t)audio_preprocess_plan.frame_hop_samples) -
             ((int32_t)audio_preprocess_plan.frame_len_samples / 2);
+#endif
 
-        /* center=True 对应窗口中心落在 t * hop 的位置。
-         * 超出 1 s 原始窗口的左右边界按 0 补齐；这正是 PC 侧 librosa 默认行为。
+        /* Legacy selectors use center=True padding. Selector 7 uses the hz2
+         * cleanline center=false contract and therefore starts each frame at
+         * t * hop with no edge padding.
          */
         memset(frame_buffer, 0,
                (size_t)audio_preprocess_config.fft_size * sizeof(frame_buffer[0]));

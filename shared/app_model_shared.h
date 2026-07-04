@@ -14,6 +14,7 @@
 
 #include <stdint.h>
 
+#include "app_audio_deployment_config.h"
 #include "cy_pdl.h"
 #if defined(COMPONENT_CM55)
 #include "cymem_CM55_0.h"
@@ -49,12 +50,15 @@ extern "C" {
 
 /* 当前真实音频模型的固定输入形状。
  *
- * CM55 已导入的 AUDIO_compute() 入口要求输入 float[1,40,101]，PC 测试向量也按
- * NCHW 顺序展平成 40 * 101 个 float32。第一版 MIC demo 先把共享协议固定到这个
- * shape，避免 CM33 前处理和 CM55 模型各自解释一套尺寸。
+ * Legacy selectors use the board 40x101 payload. Selector 7 is the cleanline
+ * hz2 1W path and uses the board_htk_no_norm_v1 40x94 current-window payload.
  */
 #define APP_MODEL_AUDIO_MODEL_MEL_BINS         (40u)
+#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
+#define APP_MODEL_AUDIO_MODEL_TIME_BINS        (94u)
+#else
 #define APP_MODEL_AUDIO_MODEL_TIME_BINS        (101u)
+#endif
 #define APP_MODEL_AUDIO_MODEL_FLOAT_COUNT      (APP_MODEL_AUDIO_MODEL_MEL_BINS * \
                                                 APP_MODEL_AUDIO_MODEL_TIME_BINS)
 #define APP_MODEL_AUDIO_MODEL_INPUT_BYTES      (APP_MODEL_AUDIO_MODEL_FLOAT_COUNT * \
