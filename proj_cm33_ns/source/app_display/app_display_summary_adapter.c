@@ -29,13 +29,21 @@ static uint32_t summary_last_publish_ms;
 #if (APP_MONITOR_SUMMARY_ENABLE)
 static uint32_t summary_last_event_id;
 static e84_display_alert_t summary_last_display_alert;
+#if (APP_DISPLAY_LOG_COUNT_ENABLE)
 static bool summary_last_cough_total_valid;
 static uint32_t summary_last_cough_total;
 static uint32_t summary_pending_display_source_event_id;
 static bool summary_pending_display_from_cough_edge;
 #endif
+static uint32_t summary_last_cough_event_id;
+static uint32_t summary_cough_alert_until_ms;
+#endif
 
 #if (APP_MONITOR_SUMMARY_ENABLE)
+#ifndef APP_DISPLAY_COUGH_EVENT_HOLD_MS
+#define APP_DISPLAY_COUGH_EVENT_HOLD_MS (3000u)
+#endif
+
 static void app_display_summary_build_from_monitor(
     e84_display_snapshot_t *snapshot,
     const app_monitor_summary_snapshot_t *summary,
@@ -54,7 +62,17 @@ static void app_display_summary_log_count_change(
     const app_monitor_summary_snapshot_t *summary,
     uint32_t now_ms);
 static void app_display_summary_publish_monitor_event(
-    const app_monitor_summary_snapshot_t *summary);
+    const app_monitor_summary_snapshot_t *summary,
+    const app_monitor_summary_event_t *event,
+    uint32_t now_ms);
+static void app_display_summary_poll_monitor_events(
+    const app_monitor_summary_snapshot_t *summary,
+    uint32_t now_ms);
+static void app_display_summary_apply_event_latch(
+    e84_display_snapshot_t *snapshot,
+    uint32_t now_ms);
+static bool app_display_summary_deadline_active(uint32_t deadline_ms,
+                                                uint32_t now_ms);
 #else
 static void app_display_summary_build_snapshot(
     e84_display_snapshot_t *snapshot,
@@ -87,13 +105,18 @@ cy_rslt_t app_display_summary_adapter_tick(uint32_t now_ms)
         {
             return CY_RSLT_TYPE_ERROR;
         }
+        app_display_summary_poll_monitor_events(&summary, now_ms);
+        if (CY_RSLT_SUCCESS != app_monitor_summary_get_snapshot(&summary))
+        {
+            return CY_RSLT_TYPE_ERROR;
+        }
         app_display_summary_build_from_monitor(&snapshot, &summary, now_ms);
+        app_display_summary_apply_event_latch(&snapshot, now_ms);
         summary_last_publish_ms = now_ms;
         (void)app_display_publish_snapshot(&snapshot);
 #if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
         (void)app_display_cm55_bridge_publish(&snapshot);
 #endif
-        app_display_summary_publish_monitor_event(&summary);
         app_display_summary_log_count_change(&snapshot, &summary, now_ms);
         return CY_RSLT_SUCCESS;
     }
@@ -122,7 +145,6 @@ static void app_display_summary_build_from_monitor(
     uint32_t flags = 0u;
     bool rr_valid;
     bool hr_valid;
-    bool distance_valid;
 
     memset(snapshot, 0, sizeof(*snapshot));
     snapshot->timestamp_ms = now_ms;
@@ -144,6 +166,7 @@ static void app_display_summary_build_from_monitor(
     snapshot->cough_count_1min = summary->cough_count_1min;
     snapshot->cough_count_5min = summary->cough_count_5min;
     snapshot->cough_event_count_total = summary->cough_event_count_total;
+    snapshot->last_cough_event_id = summary_last_cough_event_id;
     snapshot->audio_quality = summary->audio.audio_quality;
     snapshot->fusion_confidence = summary->fusion_confidence;
     snapshot->ble_connected = app_display_summary_ble_connected() ||
@@ -169,11 +192,6 @@ static void app_display_summary_build_from_monitor(
         (APP_MONITOR_VITAL_NORMAL == summary->radar.heart_state) ||
         (APP_MONITOR_VITAL_LOW == summary->radar.heart_state) ||
         (APP_MONITOR_VITAL_HIGH == summary->radar.heart_state);
-    /* distance_valid is display-only: distance_cm=0 shows N/A in the backend
-     * but does NOT force LOW_QUALITY state.  LD6002 may report distance=0
-     * while still providing valid presence/RR/HR data. */
-    distance_valid = (0u != summary->radar.distance_cm);
-
     if (rr_valid)
     {
         flags |= E84_DISPLAY_FLAG_RR_VALID;
@@ -383,12 +401,61 @@ static void app_display_summary_log_count_change(
 }
 
 static void app_display_summary_publish_monitor_event(
-    const app_monitor_summary_snapshot_t *summary)
+    const app_monitor_summary_snapshot_t *summary,
+    const app_monitor_summary_event_t *event,
+    uint32_t now_ms)
 {
-    app_monitor_summary_event_t event;
     e84_display_alert_t display_alert;
     uint8_t severity;
 
+    if ((NULL == summary) || (NULL == event))
+    {
+        return;
+    }
+    (void)summary;
+
+    if (APP_MONITOR_EVENT_CONFIRMED_COUGH == event->event_type)
+    {
+#if (APP_DISPLAY_LOG_COUNT_ENABLE)
+        summary_pending_display_source_event_id = event->event_id;
+        summary_pending_display_from_cough_edge = true;
+#endif
+        summary_last_cough_event_id = event->event_id;
+        summary_cough_alert_until_ms =
+            now_ms + (uint32_t)APP_DISPLAY_COUGH_EVENT_HOLD_MS;
+    }
+
+    display_alert = app_display_summary_monitor_alert(event->event_type,
+                                                      event->alert_level);
+    severity = app_display_summary_monitor_severity(event->alert_level);
+    if ((E84_DISPLAY_ALERT_NONE != display_alert) &&
+        (severity >= (uint8_t)E84_DISPLAY_SEVERITY_WARNING))
+    {
+        summary_last_display_alert = display_alert;
+        (void)app_display_raise_alert(display_alert,
+                                      severity,
+                                      event->confidence,
+                                      app_display_summary_monitor_flags(event));
+    }
+    else if ((APP_MONITOR_ALERT_LEVEL_NONE == event->alert_level) &&
+             (E84_DISPLAY_ALERT_NONE != summary_last_display_alert))
+    {
+        (void)app_display_clear_alert(summary_last_display_alert);
+        summary_last_display_alert = E84_DISPLAY_ALERT_NONE;
+    }
+}
+
+static void app_display_summary_poll_monitor_events(
+    const app_monitor_summary_snapshot_t *summary,
+    uint32_t now_ms)
+{
+    app_monitor_summary_event_t event;
+    uint32_t pending_count;
+
+    if (NULL == summary)
+    {
+        return;
+    }
     if (!app_monitor_summary_get_latest_event(&event))
     {
         return;
@@ -397,33 +464,49 @@ static void app_display_summary_publish_monitor_event(
     {
         return;
     }
-    summary_last_event_id = event.event_id;
-    if ((APP_MONITOR_EVENT_CONFIRMED_COUGH == event.event_type) &&
-        (0u != summary->audio.confirmed_cough_event_id))
+
+    pending_count = app_monitor_summary_get_event_count();
+    while (pending_count > 0u)
     {
-        summary_pending_display_source_event_id =
-            summary->audio.confirmed_cough_event_id;
-        summary_pending_display_from_cough_edge = true;
+        if (!app_monitor_summary_get_event_by_age(pending_count - 1u,
+                                                  &event))
+        {
+            break;
+        }
+        pending_count--;
+
+        if (event.event_id <= summary_last_event_id)
+        {
+            continue;
+        }
+
+        app_display_summary_publish_monitor_event(summary, &event, now_ms);
+        summary_last_event_id = event.event_id;
+    }
+}
+
+static void app_display_summary_apply_event_latch(
+    e84_display_snapshot_t *snapshot,
+    uint32_t now_ms)
+{
+    if (NULL == snapshot)
+    {
+        return;
+    }
+    if (!app_display_summary_deadline_active(summary_cough_alert_until_ms,
+                                             now_ms))
+    {
+        return;
     }
 
-    display_alert = app_display_summary_monitor_alert(event.event_type,
-                                                      event.alert_level);
-    severity = app_display_summary_monitor_severity(event.alert_level);
-    if ((E84_DISPLAY_ALERT_NONE != display_alert) &&
-        (severity >= (uint8_t)E84_DISPLAY_SEVERITY_WARNING))
-    {
-        summary_last_display_alert = display_alert;
-        (void)app_display_raise_alert(display_alert,
-                                      severity,
-                                      event.confidence,
-                                      app_display_summary_monitor_flags(&event));
-    }
-    else if ((APP_MONITOR_ALERT_LEVEL_NONE == event.alert_level) &&
-             (E84_DISPLAY_ALERT_NONE != summary_last_display_alert))
-    {
-        (void)app_display_clear_alert(summary_last_display_alert);
-        summary_last_display_alert = E84_DISPLAY_ALERT_NONE;
-    }
+    snapshot->active_alert = E84_DISPLAY_ALERT_COUGH_BURST;
+    snapshot->flags |= E84_DISPLAY_FLAG_ALERT_LATCHED;
+}
+
+static bool app_display_summary_deadline_active(uint32_t deadline_ms,
+                                                uint32_t now_ms)
+{
+    return ((int32_t)(deadline_ms - now_ms) > 0);
 }
 
 static uint32_t app_display_summary_monitor_flags(
@@ -475,6 +558,7 @@ static void app_display_summary_build_snapshot(
     snapshot->cough_count_1min = 0u;
     snapshot->cough_count_5min = 0u;
     snapshot->cough_event_count_total = 0u;
+    snapshot->last_cough_event_id = 0u;
     snapshot->audio_quality = app_display_summary_audio_quality(model_stats);
     snapshot->fusion_confidence = 0u;
     snapshot->ble_connected = ble_connected;

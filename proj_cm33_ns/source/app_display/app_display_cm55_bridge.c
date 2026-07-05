@@ -103,6 +103,7 @@ cy_rslt_t app_display_cm55_bridge_publish(
         snap->wall_epoch_s = 0u;
         snap->wall_time_flags = 0u;
     }
+    snap->last_cough_event_id = snapshot->last_cough_event_id;
 
     snap->heartbeat = bridge_heartbeat;
 

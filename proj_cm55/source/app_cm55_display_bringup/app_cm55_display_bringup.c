@@ -32,6 +32,14 @@
 
 #pragma GCC optimize ("no-tree-vectorize")
 
+#ifndef APP_DISPLAY_LVGL_DATA_UPDATE_TICKS
+#define APP_DISPLAY_LVGL_DATA_UPDATE_TICKS (30U)
+#endif
+
+#if (APP_DISPLAY_LVGL_DATA_UPDATE_TICKS < 1)
+#error "APP_DISPLAY_LVGL_DATA_UPDATE_TICKS must be >= 1"
+#endif
+
 #ifndef APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE
 #define APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE (0u)
 #endif
@@ -1638,9 +1646,9 @@ static void cm55_gfx_task(void *arg)
     for (;;)
     {
 #if (APP_DISPLAY_LVGL_ENABLE)
-        /* LVGL mode: ~30 FPS timer handler + ~1 Hz data update */
+        /* LVGL mode: ~30 FPS timer handler + configurable data update. */
         lv_timer_handler();
-        if ((tick_count % 30U) == 0U)
+        if ((tick_count % APP_DISPLAY_LVGL_DATA_UPDATE_TICKS) == 0U)
         {
             ui_health_dashboard_update();
         }

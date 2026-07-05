@@ -1508,11 +1508,25 @@ static bool app_model_result_monitor_should_print_event(
 
     return (0.5f <= result->scores[APP_MODEL_3W_SCORE_CONFIRMED_EVENT]);
 #elif (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
-    (void)result_sequence;
-
     if ((NULL == result) ||
         (APP_MODEL_EVENT_THRESHOLD > result->scores[2]))
     {
+        return false;
+    }
+
+    if (result->scores[3] < APP_MODEL_EVENT_MIN_ENERGY)
+    {
+        model_result_monitor_stats.suppress_count_total++;
+        model_result_runtime.last_suppressed_energy = result->scores[3];
+        if (model_result_runtime.max_suppressed_energy_1s < result->scores[3])
+        {
+            model_result_runtime.max_suppressed_energy_1s = result->scores[3];
+        }
+        app_model_result_monitor_print_suppress(
+            result,
+            result_sequence,
+            now_ms,
+            result->scores[3]);
         return false;
     }
 
@@ -1590,6 +1604,23 @@ static bool app_model_result_monitor_should_print_event(
         return false;
     }
 
+    candidate_energy = result->scores[3];
+    if (candidate_energy < APP_MODEL_EVENT_MIN_ENERGY)
+    {
+        model_result_monitor_stats.suppress_count_total++;
+        model_result_runtime.last_suppressed_energy = candidate_energy;
+        if (model_result_runtime.max_suppressed_energy_1s < candidate_energy)
+        {
+            model_result_runtime.max_suppressed_energy_1s = candidate_energy;
+        }
+        app_model_result_monitor_print_suppress(
+            result,
+            result_sequence,
+            now_ms,
+            candidate_energy);
+        return false;
+    }
+
     if ((0u == model_result_runtime.event_candidate_hits) ||
         ((0u < APP_MODEL_EVENT_WINDOW_MS) &&
          ((now_ms - model_result_runtime.event_candidate_start_ms) >
@@ -1605,7 +1636,6 @@ static bool app_model_result_monitor_should_print_event(
         model_result_runtime.event_candidate_peak_cough_prob = 0.0f;
     }
 
-    candidate_energy = result->scores[3];
     if ((0u == model_result_runtime.event_candidate_hits) ||
         (model_result_runtime.event_candidate_max_energy < candidate_energy))
     {
