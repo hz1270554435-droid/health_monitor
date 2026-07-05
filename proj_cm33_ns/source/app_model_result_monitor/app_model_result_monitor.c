@@ -7,8 +7,10 @@
 #include "app_audio_preprocess.h"
 #include "app_audio_deployment_config.h"
 #include "app_build_config.h"
+#include "app_display_cm55_shared.h"
 #include "app_model_ipc_smoke.h"
 #include "app_monitor_summary.h"
+#include "app_radar/app_uart_radar.h"
 
 #if (APP_MODEL_INFERENCE_MAX_SCORES < 5u)
 #error "app_model_result_monitor requires at least 5 score slots"
@@ -51,6 +53,14 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 
 #ifndef APP_MODEL_LOG_RATE_LIMIT_MS
 #define APP_MODEL_LOG_RATE_LIMIT_MS              (1000u)
+#endif
+
+#ifndef APP_SYSTEM_PERF_PROBE_ENABLE
+#define APP_SYSTEM_PERF_PROBE_ENABLE             (0u)
+#endif
+
+#ifndef APP_SYSTEM_PERF_PROBE_PERIOD_MS
+#define APP_SYSTEM_PERF_PROBE_PERIOD_MS          (1000u)
 #endif
 
 #ifndef APP_MODEL_PRINT_FLOAT_ENABLE
@@ -173,6 +183,37 @@ typedef struct
     bool last_demo_decision_cough;
 } app_model_result_monitor_runtime_t;
 
+#if (APP_SYSTEM_PERF_PROBE_ENABLE)
+typedef struct
+{
+    uint32_t last_print_ms;
+    uint32_t prev_pdm_dropped_total;
+    uint32_t prev_audio_blocks_received;
+    uint32_t prev_audio_sequence_gaps;
+    uint32_t prev_audio_windows_ready;
+    uint32_t prev_audio_windows_published;
+    uint32_t prev_audio_windows_gated;
+    uint32_t prev_audio_shared_busy;
+    uint32_t prev_mel_ms_total;
+    uint32_t prev_mel_windows_profiled;
+    uint32_t prev_condition_ms_total;
+    uint32_t prev_condition_windows_profiled;
+    uint32_t prev_spectrum_ms_total;
+    uint32_t prev_spectrum_windows_profiled;
+    uint32_t prev_melbank_ms_total;
+    uint32_t prev_melbank_windows_profiled;
+    uint32_t prev_results_seen;
+    uint32_t prev_invalid_input_results;
+    uint32_t prev_model_not_ready_results;
+    uint32_t prev_model_error_results;
+    uint32_t prev_radar_received;
+    uint32_t prev_radar_dropped;
+    uint32_t prev_radar_bad_frame;
+    uint32_t prev_radar_resync;
+    uint32_t prev_radar_uart_error;
+} app_system_perf_probe_runtime_t;
+#endif
+
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
 #define APP_MODEL_EVENT_CONTEXT_DEPTH            (5u)
 
@@ -189,6 +230,9 @@ typedef struct
 #endif
 
 static app_model_result_monitor_runtime_t model_result_runtime;
+#if (APP_SYSTEM_PERF_PROBE_ENABLE)
+static app_system_perf_probe_runtime_t system_perf_probe_runtime;
+#endif
 #if (APP_MODEL_IPC_SMOKE_PAYLOAD_ENABLE)
 static uint32_t ipc_smoke_result_check_logs;
 static uint32_t ipc_smoke_result_partial_rejected;
@@ -276,6 +320,11 @@ static void app_model_result_monitor_maybe_print_stat(
 #endif
 static void app_model_result_monitor_print_idle_diag(
     const volatile app_model_shared_region_t *shared);
+#if (APP_SYSTEM_PERF_PROBE_ENABLE)
+static void app_model_result_monitor_maybe_print_system_perf(
+    const volatile app_model_shared_region_t *shared,
+    uint32_t now_ms);
+#endif
 static uint32_t app_model_result_monitor_log_start(void);
 static void app_model_result_monitor_log_end(uint32_t start_ms);
 static uint32_t app_model_result_monitor_now_ms(void);
@@ -595,6 +644,11 @@ void app_model_result_monitor_task(void *pvParameters)
 #if (!APP_MODEL_SMOKE_TEST_ENABLE)
         app_model_result_monitor_bridge_summary(app_model_result_monitor_now_ms());
         model_result_monitor_stats.last_confirmed_cough_edge = false;
+#if (APP_SYSTEM_PERF_PROBE_ENABLE)
+        app_model_result_monitor_maybe_print_system_perf(
+            shared,
+            app_model_result_monitor_now_ms());
+#endif
 #if (APP_MODEL_IPC_SMOKE_EXCLUSIVE_ENABLE)
         app_model_result_monitor_maybe_print_ipc_smoke_stat(
             shared,
@@ -2011,6 +2065,406 @@ static void app_model_result_monitor_maybe_print_stat(
 #endif
 }
 #endif
+#endif
+
+#if (APP_SYSTEM_PERF_PROBE_ENABLE)
+static uint32_t app_model_result_monitor_delta_u32(uint32_t current,
+                                                   uint32_t previous)
+{
+    return current - previous;
+}
+
+static uint32_t app_model_result_monitor_age_ms(uint32_t now_ms,
+                                                uint32_t timestamp_ms)
+{
+    if (0u == timestamp_ms)
+    {
+        return 0u;
+    }
+
+    return (now_ms >= timestamp_ms) ? (now_ms - timestamp_ms) : 0u;
+}
+
+static void app_model_result_monitor_maybe_print_system_perf(
+    const volatile app_model_shared_region_t *shared,
+    uint32_t now_ms)
+{
+    app_audio_preprocess_stats_t audio_stats;
+    app_pdm_pcm_stats_t pdm_stats;
+    app_model_inference_result_t result;
+    uint32_t period_ms;
+    uint32_t pdm_drop_delta;
+    uint32_t audio_blocks_delta;
+    uint32_t audio_gaps_delta;
+    uint32_t windows_ready_delta;
+    uint32_t windows_published_delta;
+    uint32_t windows_gated_delta;
+    uint32_t shared_busy_delta;
+    uint32_t mel_count_delta;
+    uint32_t mel_total_delta;
+    uint32_t mel_ms_avg;
+    uint32_t condition_count_delta;
+    uint32_t condition_total_delta;
+    uint32_t condition_ms_avg;
+    uint32_t spectrum_count_delta;
+    uint32_t spectrum_total_delta;
+    uint32_t spectrum_ms_avg;
+    uint32_t melbank_count_delta;
+    uint32_t melbank_total_delta;
+    uint32_t melbank_ms_avg;
+    uint32_t infer_ms_avg;
+    uint32_t compute_ms_avg;
+    uint32_t result_age_ms;
+    uint32_t input_age_ms;
+    uint32_t end_to_end_ms;
+    uint32_t seq_lag;
+    uint32_t consume_lag;
+    uint32_t result_ready;
+    uint32_t result_seq_mismatch;
+    uint32_t results_delta;
+    uint32_t invalid_delta;
+    uint32_t model_not_ready_delta;
+    uint32_t model_error_delta;
+    uint32_t display_valid = 0u;
+    uint32_t display_torn = 0u;
+    uint32_t display_seq_begin = 0u;
+    uint32_t display_seq_end = 0u;
+    uint32_t display_heartbeat = 0u;
+    uint32_t display_age_ms = 0u;
+    uint32_t display_radar_source = 0u;
+    uint32_t radar_received = 0u;
+    uint32_t radar_dropped = 0u;
+    uint32_t radar_bad_frame = 0u;
+    uint32_t radar_resync = 0u;
+    uint32_t radar_uart_error = 0u;
+    uint32_t radar_max_frame_len = 0u;
+    uint32_t radar_received_delta = 0u;
+    uint32_t radar_dropped_delta = 0u;
+    uint32_t radar_bad_frame_delta = 0u;
+    uint32_t radar_resync_delta = 0u;
+    uint32_t radar_uart_error_delta = 0u;
+    uint32_t log_start_ms;
+
+    if ((NULL == shared) || (0u == APP_SYSTEM_PERF_PROBE_PERIOD_MS))
+    {
+        return;
+    }
+
+    if ((0u != system_perf_probe_runtime.last_print_ms) &&
+        ((now_ms - system_perf_probe_runtime.last_print_ms) <
+         APP_SYSTEM_PERF_PROBE_PERIOD_MS))
+    {
+        return;
+    }
+
+    memset(&result, 0, sizeof(result));
+    result_ready =
+        (APP_MODEL_SHARED_RESULT_READY == shared->result_state) ? 1u : 0u;
+    if (0u != result_ready)
+    {
+        __DMB();
+        memcpy(&result, (const void *)&shared->result, sizeof(result));
+    }
+
+    app_audio_preprocess_get_stats(&audio_stats);
+    app_pdm_pcm_get_stats(&pdm_stats);
+
+    period_ms = (0u != system_perf_probe_runtime.last_print_ms) ?
+        (now_ms - system_perf_probe_runtime.last_print_ms) : 0u;
+    pdm_drop_delta = app_model_result_monitor_delta_u32(
+        pdm_stats.dropped_total,
+        system_perf_probe_runtime.prev_pdm_dropped_total);
+    audio_blocks_delta = app_model_result_monitor_delta_u32(
+        audio_stats.blocks_received,
+        system_perf_probe_runtime.prev_audio_blocks_received);
+    audio_gaps_delta = app_model_result_monitor_delta_u32(
+        audio_stats.sequence_gaps,
+        system_perf_probe_runtime.prev_audio_sequence_gaps);
+    windows_ready_delta = app_model_result_monitor_delta_u32(
+        audio_stats.windows_ready,
+        system_perf_probe_runtime.prev_audio_windows_ready);
+    windows_published_delta = app_model_result_monitor_delta_u32(
+        audio_stats.windows_published,
+        system_perf_probe_runtime.prev_audio_windows_published);
+    windows_gated_delta = app_model_result_monitor_delta_u32(
+        audio_stats.windows_energy_gated,
+        system_perf_probe_runtime.prev_audio_windows_gated);
+    shared_busy_delta = app_model_result_monitor_delta_u32(
+        audio_stats.shared_busy,
+        system_perf_probe_runtime.prev_audio_shared_busy);
+
+    mel_count_delta = app_model_result_monitor_delta_u32(
+        audio_stats.mel_windows_profiled,
+        system_perf_probe_runtime.prev_mel_windows_profiled);
+    mel_total_delta = app_model_result_monitor_delta_u32(
+        audio_stats.mel_ms_total,
+        system_perf_probe_runtime.prev_mel_ms_total);
+    mel_ms_avg = (0u < mel_count_delta) ?
+        (mel_total_delta / mel_count_delta) : 0u;
+
+    condition_count_delta = app_model_result_monitor_delta_u32(
+        audio_stats.condition_windows_profiled,
+        system_perf_probe_runtime.prev_condition_windows_profiled);
+    condition_total_delta = app_model_result_monitor_delta_u32(
+        audio_stats.condition_ms_total,
+        system_perf_probe_runtime.prev_condition_ms_total);
+    condition_ms_avg = (0u < condition_count_delta) ?
+        (condition_total_delta / condition_count_delta) : 0u;
+
+    spectrum_count_delta = app_model_result_monitor_delta_u32(
+        audio_stats.spectrum_windows_profiled,
+        system_perf_probe_runtime.prev_spectrum_windows_profiled);
+    spectrum_total_delta = app_model_result_monitor_delta_u32(
+        audio_stats.spectrum_ms_total,
+        system_perf_probe_runtime.prev_spectrum_ms_total);
+    spectrum_ms_avg = (0u < spectrum_count_delta) ?
+        (spectrum_total_delta / spectrum_count_delta) : 0u;
+
+    melbank_count_delta = app_model_result_monitor_delta_u32(
+        audio_stats.melbank_windows_profiled,
+        system_perf_probe_runtime.prev_melbank_windows_profiled);
+    melbank_total_delta = app_model_result_monitor_delta_u32(
+        audio_stats.melbank_ms_total,
+        system_perf_probe_runtime.prev_melbank_ms_total);
+    melbank_ms_avg = (0u < melbank_count_delta) ?
+        (melbank_total_delta / melbank_count_delta) : 0u;
+
+    infer_ms_avg = (0u < model_result_runtime.infer_ms_count_1s) ?
+        (model_result_runtime.infer_ms_total_1s /
+         model_result_runtime.infer_ms_count_1s) : 0u;
+    compute_ms_avg = mel_ms_avg + infer_ms_avg;
+
+    result_age_ms = (0u != result_ready) ?
+        app_model_result_monitor_age_ms(now_ms, result.timestamp_ms) : 0u;
+    input_age_ms = app_model_result_monitor_age_ms(
+        now_ms,
+        shared->audio.timestamp_ms);
+    end_to_end_ms = ((0u != result_ready) &&
+                     (result.input_sequence == shared->audio.sequence) &&
+                     (result.timestamp_ms >= shared->audio.timestamp_ms)) ?
+        (result.timestamp_ms - shared->audio.timestamp_ms) : 0u;
+    seq_lag = (shared->producer_sequence >= shared->result_sequence) ?
+        (shared->producer_sequence - shared->result_sequence) : 0u;
+    consume_lag = (shared->producer_sequence >= shared->consumer_sequence) ?
+        (shared->producer_sequence - shared->consumer_sequence) : 0u;
+    result_seq_mismatch = ((0u != result_ready) &&
+                           (result.input_sequence != shared->result_sequence)) ?
+        1u : 0u;
+
+    results_delta = app_model_result_monitor_delta_u32(
+        model_result_monitor_stats.results_seen,
+        system_perf_probe_runtime.prev_results_seen);
+    invalid_delta = app_model_result_monitor_delta_u32(
+        model_result_monitor_stats.invalid_input_results,
+        system_perf_probe_runtime.prev_invalid_input_results);
+    model_not_ready_delta = app_model_result_monitor_delta_u32(
+        model_result_monitor_stats.model_not_ready_results,
+        system_perf_probe_runtime.prev_model_not_ready_results);
+    model_error_delta = app_model_result_monitor_delta_u32(
+        model_result_monitor_stats.model_error_results,
+        system_perf_probe_runtime.prev_model_error_results);
+
+#if (APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE)
+    {
+        volatile app_display_cm55_snapshot_t *snap =
+            APP_DISPLAY_CM55_SNAPSHOT;
+        uint32_t display_magic;
+        uint32_t display_version;
+        uint32_t display_timestamp_ms;
+
+        APP_DISPLAY_CM55_INVALIDATE_CACHE((void *)snap, sizeof(*snap));
+        __DMB();
+        display_seq_end = snap->seq_end;
+        display_magic = snap->magic;
+        display_version = snap->version;
+        display_timestamp_ms = snap->timestamp_ms;
+        display_heartbeat = snap->heartbeat;
+        display_radar_source = snap->radar_source;
+        __DMB();
+        display_seq_begin = snap->seq_begin;
+        display_valid = ((APP_DISPLAY_CM55_SNAPSHOT_MAGIC == display_magic) &&
+                         (APP_DISPLAY_CM55_SNAPSHOT_VERSION ==
+                          display_version)) ? 1u : 0u;
+        display_torn = ((0u != display_valid) &&
+                        (display_seq_begin != display_seq_end)) ? 1u : 0u;
+        display_age_ms = (0u != display_valid) ?
+            app_model_result_monitor_age_ms(now_ms,
+                                            display_timestamp_ms) : 0u;
+    }
+#endif
+
+#if (APP_RADAR_BRIDGE_ENABLE || APP_UART_RADAR_TEST_ENABLE)
+    radar_received = app_uart_radar_get_received_count();
+    radar_dropped = app_uart_radar_get_dropped_count();
+    radar_bad_frame = app_uart_radar_get_bad_frame_count();
+    radar_resync = app_uart_radar_get_resync_count();
+    radar_uart_error = app_uart_radar_get_uart_error_count();
+    radar_max_frame_len = app_uart_radar_get_max_frame_len();
+    radar_received_delta = app_model_result_monitor_delta_u32(
+        radar_received,
+        system_perf_probe_runtime.prev_radar_received);
+    radar_dropped_delta = app_model_result_monitor_delta_u32(
+        radar_dropped,
+        system_perf_probe_runtime.prev_radar_dropped);
+    radar_bad_frame_delta = app_model_result_monitor_delta_u32(
+        radar_bad_frame,
+        system_perf_probe_runtime.prev_radar_bad_frame);
+    radar_resync_delta = app_model_result_monitor_delta_u32(
+        radar_resync,
+        system_perf_probe_runtime.prev_radar_resync);
+    radar_uart_error_delta = app_model_result_monitor_delta_u32(
+        radar_uart_error,
+        system_perf_probe_runtime.prev_radar_uart_error);
+#endif
+
+    log_start_ms = app_model_result_monitor_log_start();
+    printf("[SYS_PERF] t_ms=%lu period_ms=%lu input_state=%lu "
+           "result_state=%lu producer_seq=%lu consumer_seq=%lu "
+           "result_seq=%lu result_input_seq=%lu seq_lag=%lu "
+           "consume_lag=%lu result_ready=%lu result_seq_mismatch=%lu "
+           "result_status=%u result_age_ms=%lu input_age_ms=%lu "
+           "e2e_ms=%lu infer_ms_last=%lu infer_ms_avg=%lu "
+           "infer_ms_max=%lu compute_ms_avg=%lu pdm_drop_total=%lu "
+           "pdm_drop_delta=%lu pdm_queue=%lu pdm_free=%u pdm_paused=%u "
+           "pdm_error=%lu audio_blocks=%lu audio_blocks_delta=%lu "
+           "audio_gaps=%lu audio_gaps_delta=%lu windows_ready=%lu "
+           "windows_ready_delta=%lu windows_published=%lu "
+           "windows_published_delta=%lu windows_gated=%lu "
+           "windows_gated_delta=%lu shared_busy=%lu shared_busy_delta=%lu "
+           "mel_ms_last=%lu mel_ms_avg=%lu mel_ms_max=%lu "
+           "condition_ms_avg=%lu condition_ms_max=%lu spectrum_ms_avg=%lu "
+           "spectrum_ms_max=%lu melbank_ms_avg=%lu melbank_ms_max=%lu "
+           "results_seen=%lu results_delta=%lu invalid_inputs=%lu "
+           "invalid_delta=%lu model_not_ready=%lu "
+           "model_not_ready_delta=%lu model_errors=%lu "
+           "model_error_delta=%lu display_valid=%lu display_torn=%lu "
+           "display_seq_begin=%lu display_seq_end=%lu display_hb=%lu "
+           "display_age_ms=%lu display_radar_source=%lu radar_rx=%lu "
+           "radar_rx_delta=%lu radar_drop=%lu radar_drop_delta=%lu "
+           "radar_bad=%lu radar_bad_delta=%lu radar_resync=%lu "
+           "radar_resync_delta=%lu radar_uart_err=%lu "
+           "radar_uart_err_delta=%lu radar_max_len=%lu log_ms=%lu\r\n",
+           (unsigned long)now_ms,
+           (unsigned long)period_ms,
+           (unsigned long)shared->input_state,
+           (unsigned long)shared->result_state,
+           (unsigned long)shared->producer_sequence,
+           (unsigned long)shared->consumer_sequence,
+           (unsigned long)shared->result_sequence,
+           (unsigned long)result.input_sequence,
+           (unsigned long)seq_lag,
+           (unsigned long)consume_lag,
+           (unsigned long)result_ready,
+           (unsigned long)result_seq_mismatch,
+           (unsigned int)result.status,
+           (unsigned long)result_age_ms,
+           (unsigned long)input_age_ms,
+           (unsigned long)end_to_end_ms,
+           (unsigned long)result.inference_time_ms,
+           (unsigned long)infer_ms_avg,
+           (unsigned long)model_result_runtime.infer_ms_max_1s,
+           (unsigned long)compute_ms_avg,
+           (unsigned long)pdm_stats.dropped_total,
+           (unsigned long)pdm_drop_delta,
+           (unsigned long)pdm_stats.queue_depth,
+           (unsigned int)pdm_stats.free_block_count,
+           pdm_stats.capture_paused ? 1u : 0u,
+           (unsigned long)pdm_stats.pdm_error_count,
+           (unsigned long)audio_stats.blocks_received,
+           (unsigned long)audio_blocks_delta,
+           (unsigned long)audio_stats.sequence_gaps,
+           (unsigned long)audio_gaps_delta,
+           (unsigned long)audio_stats.windows_ready,
+           (unsigned long)windows_ready_delta,
+           (unsigned long)audio_stats.windows_published,
+           (unsigned long)windows_published_delta,
+           (unsigned long)audio_stats.windows_energy_gated,
+           (unsigned long)windows_gated_delta,
+           (unsigned long)audio_stats.shared_busy,
+           (unsigned long)shared_busy_delta,
+           (unsigned long)audio_stats.last_mel_ms,
+           (unsigned long)mel_ms_avg,
+           (unsigned long)audio_stats.mel_ms_max,
+           (unsigned long)condition_ms_avg,
+           (unsigned long)audio_stats.condition_ms_max,
+           (unsigned long)spectrum_ms_avg,
+           (unsigned long)audio_stats.spectrum_ms_max,
+           (unsigned long)melbank_ms_avg,
+           (unsigned long)audio_stats.melbank_ms_max,
+           (unsigned long)model_result_monitor_stats.results_seen,
+           (unsigned long)results_delta,
+           (unsigned long)model_result_monitor_stats.invalid_input_results,
+           (unsigned long)invalid_delta,
+           (unsigned long)model_result_monitor_stats.model_not_ready_results,
+           (unsigned long)model_not_ready_delta,
+           (unsigned long)model_result_monitor_stats.model_error_results,
+           (unsigned long)model_error_delta,
+           (unsigned long)display_valid,
+           (unsigned long)display_torn,
+           (unsigned long)display_seq_begin,
+           (unsigned long)display_seq_end,
+           (unsigned long)display_heartbeat,
+           (unsigned long)display_age_ms,
+           (unsigned long)display_radar_source,
+           (unsigned long)radar_received,
+           (unsigned long)radar_received_delta,
+           (unsigned long)radar_dropped,
+           (unsigned long)radar_dropped_delta,
+           (unsigned long)radar_bad_frame,
+           (unsigned long)radar_bad_frame_delta,
+           (unsigned long)radar_resync,
+           (unsigned long)radar_resync_delta,
+           (unsigned long)radar_uart_error,
+           (unsigned long)radar_uart_error_delta,
+           (unsigned long)radar_max_frame_len,
+           (unsigned long)model_result_monitor_stats.last_log_ms);
+    fflush(stdout);
+    app_model_result_monitor_log_end(log_start_ms);
+
+    system_perf_probe_runtime.last_print_ms = now_ms;
+    system_perf_probe_runtime.prev_pdm_dropped_total =
+        pdm_stats.dropped_total;
+    system_perf_probe_runtime.prev_audio_blocks_received =
+        audio_stats.blocks_received;
+    system_perf_probe_runtime.prev_audio_sequence_gaps =
+        audio_stats.sequence_gaps;
+    system_perf_probe_runtime.prev_audio_windows_ready =
+        audio_stats.windows_ready;
+    system_perf_probe_runtime.prev_audio_windows_published =
+        audio_stats.windows_published;
+    system_perf_probe_runtime.prev_audio_windows_gated =
+        audio_stats.windows_energy_gated;
+    system_perf_probe_runtime.prev_audio_shared_busy =
+        audio_stats.shared_busy;
+    system_perf_probe_runtime.prev_mel_ms_total = audio_stats.mel_ms_total;
+    system_perf_probe_runtime.prev_mel_windows_profiled =
+        audio_stats.mel_windows_profiled;
+    system_perf_probe_runtime.prev_condition_ms_total =
+        audio_stats.condition_ms_total;
+    system_perf_probe_runtime.prev_condition_windows_profiled =
+        audio_stats.condition_windows_profiled;
+    system_perf_probe_runtime.prev_spectrum_ms_total =
+        audio_stats.spectrum_ms_total;
+    system_perf_probe_runtime.prev_spectrum_windows_profiled =
+        audio_stats.spectrum_windows_profiled;
+    system_perf_probe_runtime.prev_melbank_ms_total =
+        audio_stats.melbank_ms_total;
+    system_perf_probe_runtime.prev_melbank_windows_profiled =
+        audio_stats.melbank_windows_profiled;
+    system_perf_probe_runtime.prev_results_seen =
+        model_result_monitor_stats.results_seen;
+    system_perf_probe_runtime.prev_invalid_input_results =
+        model_result_monitor_stats.invalid_input_results;
+    system_perf_probe_runtime.prev_model_not_ready_results =
+        model_result_monitor_stats.model_not_ready_results;
+    system_perf_probe_runtime.prev_model_error_results =
+        model_result_monitor_stats.model_error_results;
+    system_perf_probe_runtime.prev_radar_received = radar_received;
+    system_perf_probe_runtime.prev_radar_dropped = radar_dropped;
+    system_perf_probe_runtime.prev_radar_bad_frame = radar_bad_frame;
+    system_perf_probe_runtime.prev_radar_resync = radar_resync;
+    system_perf_probe_runtime.prev_radar_uart_error = radar_uart_error;
+}
 #endif
 
 static void app_model_result_monitor_maybe_print_demo_change(
