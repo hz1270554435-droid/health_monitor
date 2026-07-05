@@ -7,6 +7,7 @@
 #include "app_audio_preprocess.h"
 #include "app_audio_deployment_config.h"
 #include "app_build_config.h"
+#include "app_cm55_fe_bench_result.h"
 #include "app_display_cm55_shared.h"
 #include "app_model_ipc_smoke.h"
 #include "app_monitor_summary.h"
@@ -57,6 +58,10 @@ static app_model_result_monitor_stats_t model_result_monitor_stats;
 
 #ifndef APP_SYSTEM_PERF_PROBE_ENABLE
 #define APP_SYSTEM_PERF_PROBE_ENABLE             (0u)
+#endif
+
+#ifndef APP_CM55_FE_BENCH_ENABLE
+#define APP_CM55_FE_BENCH_ENABLE                 (0u)
 #endif
 
 #ifndef APP_SYSTEM_PERF_PROBE_PERIOD_MS
@@ -266,6 +271,12 @@ static void app_model_result_monitor_note_live_result(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
     uint32_t now_ms);
+#if (APP_CM55_FE_BENCH_ENABLE)
+static void app_model_result_monitor_maybe_print_cm55_fe_bench(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms);
+#endif
 static void app_model_result_monitor_maybe_print_demo_change(
     const app_model_inference_result_t *result,
     uint32_t result_sequence,
@@ -516,6 +527,12 @@ void app_model_result_monitor_task(void *pvParameters)
                 app_model_result_monitor_note_live_result(&result,
                                                           result_sequence,
                                                           now_ms);
+#if (APP_CM55_FE_BENCH_ENABLE)
+                app_model_result_monitor_maybe_print_cm55_fe_bench(
+                    &result,
+                    result_sequence,
+                    now_ms);
+#endif
 #if (APP_MODEL_EVENT_DUMP_CONTEXT_ENABLE)
                 app_model_result_monitor_note_event_context(
                     &result,
@@ -1039,6 +1056,78 @@ static void app_model_result_monitor_note_live_result(
         model_result_runtime.infer_ms_max_1s = result->inference_time_ms;
     }
 }
+
+#if (APP_CM55_FE_BENCH_ENABLE)
+static void app_model_result_monitor_maybe_print_cm55_fe_bench(
+    const app_model_inference_result_t *result,
+    uint32_t result_sequence,
+    uint32_t now_ms)
+{
+    uint32_t log_start_ms;
+    uint32_t run;
+    uint32_t ok;
+    uint32_t total_ms;
+    uint32_t copy_condition_ms;
+    uint32_t spectrum_ms;
+    uint32_t melbank_ms;
+    uint32_t db_ms;
+    uint32_t time_bins;
+    uint32_t mode;
+    uint32_t hash;
+    const char *mode_name;
+
+    if ((NULL == result) ||
+        (result->scores[APP_CM55_FE_BENCH_SCORE_MARKER_INDEX] !=
+         APP_CM55_FE_BENCH_SCORE_MARKER_VALUE))
+    {
+        return;
+    }
+
+    run = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_RUN_INDEX] + 0.5f);
+    ok = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_OK_INDEX] + 0.5f);
+    total_ms = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_TOTAL_MS_INDEX] + 0.5f);
+    copy_condition_ms =
+        (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_CONDITION_MS_INDEX] + 0.5f);
+    spectrum_ms =
+        (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_SPECTRUM_MS_INDEX] + 0.5f);
+    melbank_ms =
+        (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_MELBANK_MS_INDEX] + 0.5f);
+    db_ms = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_DB_MS_INDEX] + 0.5f);
+    time_bins =
+        (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_TIME_BINS_INDEX] + 0.5f);
+    mode = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_MODE_INDEX] + 0.5f);
+    hash = (uint32_t)(result->scores[APP_CM55_FE_BENCH_SCORE_HASH_INDEX] + 0.5f);
+
+    mode_name = (APP_CM55_FE_BENCH_MODE_RFFT_FAST_F32 == mode) ?
+                "rfft_fast_f32" : "synthetic_spectrum_no_rfft";
+
+    log_start_ms = app_model_result_monitor_log_start();
+    printf("[CM55_FE_BENCH] t_ms=%lu run=%lu input_seq=%lu "
+           "result_seq=%lu ok=%lu mode=%s source=synthetic "
+           "total_ms=%lu copy_condition_ms=%lu spectrum_ms=%lu "
+           "melbank_ms=%lu db_ms=%lu infer_gate_ms=180 "
+           "mel_bins=%lu time_bins=%lu full_time_bins=%lu fft=%lu "
+           "hash=0x%04lx\r\n",
+           (unsigned long)now_ms,
+           (unsigned long)run,
+           (unsigned long)result->input_sequence,
+           (unsigned long)result_sequence,
+           (unsigned long)ok,
+           mode_name,
+           (unsigned long)total_ms,
+           (unsigned long)copy_condition_ms,
+           (unsigned long)spectrum_ms,
+           (unsigned long)melbank_ms,
+           (unsigned long)db_ms,
+           (unsigned long)APP_MODEL_AUDIO_MODEL_MEL_BINS,
+           (unsigned long)time_bins,
+           (unsigned long)APP_MODEL_AUDIO_MODEL_TIME_BINS,
+           (unsigned long)APP_AUDIO_PREPROCESS_DEFAULT_FFT_SIZE,
+           (unsigned long)hash);
+    fflush(stdout);
+    app_model_result_monitor_log_end(log_start_ms);
+}
+#endif
 
 static void app_model_result_monitor_bridge_summary(uint32_t now_ms)
 {

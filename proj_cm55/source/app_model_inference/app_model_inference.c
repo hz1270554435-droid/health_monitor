@@ -5,6 +5,7 @@
 #include <string.h>
 
 #include "app_audio_deployment_config.h"
+#include "app_cm55_fe_bench.h"
 #include "app_model_ipc_smoke.h"
 #include "app_model_smoke.h"
 #include APP_AUDIO_ACTIVE_MODEL_HEADER
@@ -250,12 +251,14 @@ void app_model_inference_task(void *pvParameters)
                 desc.sequence,
                 (float)elapsed_ms);
 #endif
+            app_cm55_fe_bench_maybe_run(desc.sequence, &result);
             app_model_inference_publish_result(&desc, &result, elapsed_ms);
 
             model_inference_stats.inference_runs++;
             model_inference_stats.last_input_sequence = desc.sequence;
             model_inference_stats.last_inference_time_ms = elapsed_ms;
             model_inference_stats.last_status = (uint8_t)status;
+
         }
         else
         {
