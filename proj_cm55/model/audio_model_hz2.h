@@ -1,43 +1,41 @@
 /*
 * ImagiNet Compiler 5.9.4927.65534+e5b229f227997e1d3e75ed83c30a1bcf08976921
 * Copyright © 2023- Imagimob AB, All Rights Reserved.
-* 
-* Generated at 07/04/2026 12:45:14 UTC. Any changes will be lost.
-* 
-* Model ID  e0922366-526d-4513-aea9-3f3cdadba9ed
-* 
+*
+* Generated at 07/05/2026 12:09:52 UTC. Any changes will be lost.
+*
+* Model ID  a8ea7d77-2bac-4a94-b41f-20bc63290156
+*
 * Memory    Size                      Efficiency
-* Buffers   8 bytes (RAM)             100 %
-* State     569344 bytes (RAM)        100 %
-* Readonly  106088 bytes (Flash)      100 %
-* 
+* Buffers   3762 bytes (RAM)          100 %
+* State     268304 bytes (RAM)        100 %
+* Readonly  116256 bytes (Flash)      100 %
+*
 * Exported functions:
-* 
-*  @param data_in args_0. Input float[1,40,94].
-*  @param aux_logits aux_logits. Output float[5].
-*  @param binary_logits binary_logits. Output float[2].
-*  @return IPWIN_RET_SUCCESS (0) or IPWIN_RET_NODATA (-1), IPWIN_RET_ERROR (-2), IPWIN_RET_STREAMEND (-3)
-*  int AUDIO_compute(const float *data_in, float *aux_logits, float *binary_logits);
-* 
+*
+*  @param data_in Input features. Input float[1,40,94].
+*  @param data_out Output features. Output float[2].
+*  void AUDIO_compute(const float *data_in, float *data_out);
+*
 *  @description: Closes and flushes streams, free any heap allocated memory.
 *  void AUDIO_finalize(void);
-* 
+*
 *  @description: Resets windows and neural networks(i.e. RNNs) to initial state.
 *  @return IPWIN_RET_SUCCESS (0) or IPWIN_RET_NODATA (-1), IPWIN_RET_ERROR (-2), IPWIN_RET_STREAMEND (-3)
 *  int AUDIO_soft_reset(void);
-* 
+*
 *  @description: Initializes buffers to initial state.
 *  @return IPWIN_RET_SUCCESS (0) or IPWIN_RET_NODATA (-1), IPWIN_RET_ERROR (-2), IPWIN_RET_STREAMEND (-3)
 *  int AUDIO_init(void);
-* 
-* 
+*
+*
 * Disclaimer:
 *   The generated code relies on the optimizations done by the C compiler.
 *   For example many for-loops of length 1 must be removed by the optimizer.
 *   This can only be done if the functions are inlined and simplified.
 *   Check disassembly if unsure.
 *   tl;dr Compile using gcc with -O3 or -Ofast
-* 
+*
 * Notes:
 * 	-> This code was generated with DEEPCRAFT™ Model Converter using:
 * 		ml-coretools 3.1.0.9404.
@@ -53,7 +51,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "mtb_ml_model.h"
-#define AUDIO_API_USER_DEFINED
+#define AUDIO_API_FUNCTION
 
 typedef int8_t q7_t;         // 8-bit fractional data type in Q1.7 format.
 typedef int16_t q15_t;       // 16-bit fractional data type in Q1.15 format.
@@ -62,7 +60,7 @@ typedef int64_t q63_t;       // 64-bit fractional data type in Q1.63 format.
 typedef float timestamp_t;
 
 // Model GUID (16 bytes)
-#define AUDIO_MODEL_ID {0x66, 0x23, 0x92, 0xe0, 0x6d, 0x52, 0x13, 0x45, 0xae, 0xa9, 0x3f, 0x3c, 0xda, 0xdb, 0xa9, 0xed}
+#define AUDIO_MODEL_ID {0x77, 0x7d, 0xea, 0xa8, 0xac, 0x2b, 0x94, 0x4a, 0xb4, 0x1f, 0x20, 0xbc, 0x63, 0x29, 0x01, 0x56}
 
 
 // First nibble is bit encoding, second nibble is number of bytes
@@ -88,7 +86,7 @@ typedef float timestamp_t;
 
 
 #define AUDIO_COMPUTE_INPUTS (1)
-#define AUDIO_COMPUTE_OUTPUTS (2)
+#define AUDIO_COMPUTE_OUTPUTS (1)
 #define AUDIO_COMPUTE_IN_TYPE float
 #define AUDIO_COMPUTE_IN_TYPE_ID IMAGINET_TYPES_FLOAT32
 #define AUDIO_COMPUTE_OUT_TYPE float
@@ -103,35 +101,23 @@ typedef float timestamp_t;
 #define AUDIO_DATA_IN_TYPE float
 #define AUDIO_DATA_IN_TYPE_ID IMAGINET_TYPES_FLOAT32
 #define AUDIO_DATA_IN_SHIFT 0
-#define AUDIO_DATA_IN_OFFSET 0
-#define AUDIO_DATA_IN_SCALE 1
+#define AUDIO_DATA_IN_OFFSET 127
+#define AUDIO_DATA_IN_SCALE 0.26804056763648987
 #define AUDIO_DATA_IN_SYMBOLS { }
 
-// aux_logits [5] (20 bytes)
-#define AUDIO_AUX_LOGITS_RANK (1)
-#define AUDIO_AUX_LOGITS_SHAPE ((int[]){5})
-#define AUDIO_AUX_LOGITS_COUNT (5)
-#define AUDIO_AUX_LOGITS_BYTES (20)
-#define AUDIO_AUX_LOGITS_TYPE float
-#define AUDIO_AUX_LOGITS_TYPE_ID IMAGINET_TYPES_FLOAT32
-#define AUDIO_AUX_LOGITS_SHIFT 0
-#define AUDIO_AUX_LOGITS_OFFSET 0
-#define AUDIO_AUX_LOGITS_SCALE 1
-#define AUDIO_AUX_LOGITS_SYMBOLS { }
+// data_out [2] (8 bytes)
+#define AUDIO_DATA_OUT_RANK (1)
+#define AUDIO_DATA_OUT_SHAPE ((int[]){2})
+#define AUDIO_DATA_OUT_COUNT (2)
+#define AUDIO_DATA_OUT_BYTES (8)
+#define AUDIO_DATA_OUT_TYPE float
+#define AUDIO_DATA_OUT_TYPE_ID IMAGINET_TYPES_FLOAT32
+#define AUDIO_DATA_OUT_SHIFT 0
+#define AUDIO_DATA_OUT_OFFSET 0
+#define AUDIO_DATA_OUT_SCALE 1
+#define AUDIO_DATA_OUT_SYMBOLS { }
 
-// binary_logits [2] (8 bytes)
-#define AUDIO_BINARY_LOGITS_RANK (1)
-#define AUDIO_BINARY_LOGITS_SHAPE ((int[]){2})
-#define AUDIO_BINARY_LOGITS_COUNT (2)
-#define AUDIO_BINARY_LOGITS_BYTES (8)
-#define AUDIO_BINARY_LOGITS_TYPE float
-#define AUDIO_BINARY_LOGITS_TYPE_ID IMAGINET_TYPES_FLOAT32
-#define AUDIO_BINARY_LOGITS_SHIFT 0
-#define AUDIO_BINARY_LOGITS_OFFSET 0
-#define AUDIO_BINARY_LOGITS_SCALE 1
-#define AUDIO_BINARY_LOGITS_SYMBOLS { }
-
-#define AUDIO_KEY_MAX (7)
+#define AUDIO_KEY_MAX (6)
 
 // Return codes
 #define AUDIO_RET_SUCCESS 0
@@ -145,7 +131,7 @@ typedef float timestamp_t;
 #define IPWIN_RET_STREAMEND -3
 
 // Exported methods
-int AUDIO_compute(const float *restrict data_in, float *restrict aux_logits, float *restrict binary_logits);
+void AUDIO_compute(const float *restrict data_in, float *restrict data_out);
 void AUDIO_finalize(void);
 int AUDIO_soft_reset(void);
 int AUDIO_init(void);
@@ -177,19 +163,17 @@ extern mtb_ml_model_t* AUDIO_mtb_models[AUDIO_MAX_MTB_MODELS];
 
 // Profiling regions
 #ifdef AUDIO_PROFILING
-    #define AUDIO_REGIONS_COUNT 4
+    #define AUDIO_REGIONS_COUNT 2
     #define AUDIO_REGIONS_NAMES {\
-    	"SET INPUT 0",\
-    	"INVOKE HZ2MIX_BOARDSPEECHSILVER_WARM_BW1_0",\
-    	"GET OUTPUT 0",\
-    	"GET OUTPUT 1",\
+        "HZ2MIX_BOARDSPEECHSILVER_TC15M_PTQ_FLOAT",\
+        "DEQUANTIZE",\
     }
 #else
     #define AUDIO_REGIONS_COUNT 0
     #define AUDIO_REGIONS_NAMES {}
 #endif
 // Call macros — invoke any exported function via a void* array
-#define AUDIO_COMPUTE_PTR(a) AUDIO_compute((const float *)(a)[0], (float *)(a)[1], (float *)(a)[2])
+#define AUDIO_COMPUTE_PTR(a) AUDIO_compute((const float *)(a)[0], (float *)(a)[1])
 #define AUDIO_FINALIZE_PTR(a) AUDIO_finalize()
 #define AUDIO_SOFT_RESET_PTR(a) AUDIO_soft_reset()
 #define AUDIO_INIT_PTR(a) AUDIO_init()

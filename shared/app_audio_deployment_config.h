@@ -47,8 +47,8 @@
 #define APP_AUDIO_3W_E2_PEAK_PREVIEW_INPUT_SHAPE      "[3,40,101]"
 #define APP_AUDIO_3W_E2_PEAK_PREVIEW_COUGH_THRESHOLD  (0.95f)
 
-#define APP_AUDIO_HZ2_0_B0_MODEL_NAME       "audio_hz2mix_bssilver_bw1_1w"
-#define APP_AUDIO_HZ2_0_B0_MODEL_VERSION    "hz2mix-boardspeechsilver-warm-bw1.0"
+#define APP_AUDIO_HZ2_0_B0_MODEL_NAME       "hz2mix_boardspeechsilver_tc15M_ptq_float"
+#define APP_AUDIO_HZ2_0_B0_MODEL_VERSION    "hz2mix-boardspeechsilver-tc15M-int8-qcomparison-ptq_float"
 #define APP_AUDIO_HZ2_0_B0_FRONTEND_NAME    "board_htk_no_norm_v1"
 #define APP_AUDIO_HZ2_0_B0_CLASS_ORDER      "non_cough,cough"
 #define APP_AUDIO_HZ2_0_B0_INPUT_SHAPE      "1x1x40x94"
@@ -134,11 +134,11 @@
     "audio_test_vectors_hz2_0_b0.h"
 #define APP_AUDIO_ACTIVE_MODEL_API_PREFIX "AUDIO"
 #define APP_AUDIO_ACTIVE_MODEL_INIT() AUDIO_init()
+#define APP_AUDIO_ACTIVE_MODEL_COMPUTE(input, output) AUDIO_compute((input), (output))
 #define APP_AUDIO_ACTIVE_MODEL_SOFT_RESET() AUDIO_soft_reset()
 #define APP_AUDIO_ACTIVE_MODEL_FINALIZE() AUDIO_finalize()
 #define APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS AUDIO_RET_SUCCESS
-#define APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT AUDIO_BINARY_LOGITS_COUNT
-#define APP_AUDIO_ACTIVE_MODEL_AUX_OUT_COUNT AUDIO_AUX_LOGITS_COUNT
+#define APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT AUDIO_DATA_OUT_COUNT
 #else
 #define APP_AUDIO_ACTIVE_MODEL_NAME       APP_AUDIO_V2_MODEL_NAME
 #define APP_AUDIO_ACTIVE_MODEL_VERSION    APP_AUDIO_V2_MODEL_VERSION

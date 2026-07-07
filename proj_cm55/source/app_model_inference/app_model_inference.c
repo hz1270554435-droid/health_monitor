@@ -17,6 +17,27 @@
 #define APP_MODEL_INPUT_DUMP_WINDOWS            (3u)
 #endif
 
+#ifndef APP_MODEL_FORWARD_TRACE_ENABLE
+#define APP_MODEL_FORWARD_TRACE_ENABLE          (0u)
+#endif
+
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+#define APP_MODEL_FORWARD_TRACE_SEQUENCE_BASE   (0xA7000000UL)
+#define APP_MODEL_FORWARD_TRACE_STAGE_TASK_ALIVE      (0x01u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_INPUT_TAKEN     (0x10u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_RUN_BEGIN       (0x20u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_INIT_BEGIN      (0x30u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_INIT_DONE       (0x31u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_INIT_ERROR      (0x3fu)
+#define APP_MODEL_FORWARD_TRACE_STAGE_RESET_BEGIN     (0x40u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_RESET_DONE      (0x41u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_RESET_ERROR     (0x4fu)
+#define APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_BEGIN   (0x50u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_DONE    (0x51u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_RUN_DONE        (0x60u)
+#define APP_MODEL_FORWARD_TRACE_STAGE_PUBLISH_BEGIN   (0x70u)
+#endif
+
 #if (APP_MODEL_INPUT_DUMP_ENABLE) && (APP_MODEL_INFERENCE_MAX_SCORES < 14u)
 #error "APP_MODEL_INPUT_DUMP_ENABLE requires at least 14 score slots"
 #endif
@@ -135,6 +156,11 @@ static void app_model_inference_check_ipc_payload(
 #endif
 static float app_model_inference_softmax_cough_prob(float output0,
                                                     float output1);
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+static bool app_model_inference_publish_forward_trace(uint32_t stage,
+                                                      uint32_t input_sequence,
+                                                      float detail);
+#endif
 static uint32_t app_model_inference_now_ms(void);
 
 cy_rslt_t app_model_inference_task_init(void)
@@ -160,6 +186,10 @@ void app_model_inference_task(void *pvParameters)
 {
     (void)pvParameters;
 
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    bool forward_trace_task_alive_published = false;
+#endif
+
 #if (APP_MODEL_SMOKE_TEST_ENABLE)
     /* 第一阶段 baseline：先用 PC 生成的 Log-Mel 测试向量直接跑 active model API。
      * 该测试不依赖实时 MIC 前处理，便于确认模型代码、ML runtime 和 CM55 链路已经部署成功。
@@ -175,6 +205,17 @@ void app_model_inference_task(void *pvParameters)
     {
         app_model_audio_feature_desc_t desc;
 
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+        if (!forward_trace_task_alive_published)
+        {
+            forward_trace_task_alive_published =
+                app_model_inference_publish_forward_trace(
+                    APP_MODEL_FORWARD_TRACE_STAGE_TASK_ALIVE,
+                    0u,
+                    (float)APP_AUDIO_MODEL_SELECT);
+        }
+#endif
+
         if (app_model_inference_try_take_input(&desc,
                                                model_input_payload,
                                                sizeof(model_input_payload)))
@@ -185,12 +226,30 @@ void app_model_inference_task(void *pvParameters)
             uint32_t elapsed_ms;
 
             memset(&result, 0, sizeof(result));
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+            (void)app_model_inference_publish_forward_trace(
+                APP_MODEL_FORWARD_TRACE_STAGE_RUN_BEGIN,
+                desc.sequence,
+                0.0f);
+#endif
             status = app_model_inference_run_model(&desc,
                                                    model_input_payload,
                                                    &result);
             elapsed_ms = app_model_inference_now_ms() - start_ms;
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+            (void)app_model_inference_publish_forward_trace(
+                APP_MODEL_FORWARD_TRACE_STAGE_RUN_DONE,
+                desc.sequence,
+                (float)status);
+#endif
 
             result.status = (uint8_t)status;
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+            (void)app_model_inference_publish_forward_trace(
+                APP_MODEL_FORWARD_TRACE_STAGE_PUBLISH_BEGIN,
+                desc.sequence,
+                (float)elapsed_ms);
+#endif
             app_model_inference_publish_result(&desc, &result, elapsed_ms);
 
             model_inference_stats.inference_runs++;
@@ -212,6 +271,45 @@ void app_model_inference_get_stats(app_model_inference_stats_t *stats)
         *stats = model_inference_stats;
     }
 }
+
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+static bool app_model_inference_publish_forward_trace(uint32_t stage,
+                                                      uint32_t input_sequence,
+                                                      float detail)
+{
+    volatile app_model_shared_region_t *shared = APP_MODEL_SHARED_REGION;
+    app_model_inference_result_t result;
+
+    APP_MODEL_SHARED_INVALIDATE_CACHE((void *)shared, sizeof(*shared));
+    if ((APP_MODEL_SHARED_MAGIC != shared->magic) ||
+        (APP_MODEL_SHARED_VERSION != shared->version))
+    {
+        return false;
+    }
+
+    /* Diagnostic-only marker: class_count=0 and MODEL_NOT_READY prevent the
+     * CM33 product path from treating scores[] as live cough logits/probability.
+     */
+    memset(&result, 0, sizeof(result));
+    result.input_sequence = input_sequence;
+    result.timestamp_ms = app_model_inference_now_ms();
+    result.inference_time_ms = 0u;
+    result.class_count = 0u;
+    result.status = (uint8_t)APP_MODEL_INFERENCE_STATUS_MODEL_NOT_READY;
+    result.scores[0] = (float)stage;
+    result.scores[1] = detail;
+
+    shared->result_state = APP_MODEL_SHARED_RESULT_WRITING;
+    shared->result = result;
+    shared->result_sequence = APP_MODEL_FORWARD_TRACE_SEQUENCE_BASE |
+                              (stage & 0x0000ffffu);
+    __DMB();
+    shared->result_state = APP_MODEL_SHARED_RESULT_READY;
+    APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
+
+    return true;
+}
+#endif
 
 static bool app_model_inference_try_take_input(
     app_model_audio_feature_desc_t *desc,
@@ -291,6 +389,12 @@ static bool app_model_inference_try_take_input(
     APP_MODEL_SHARED_CLEAN_CACHE((void *)shared, sizeof(*shared));
 
     model_inference_stats.inputs_consumed++;
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    (void)app_model_inference_publish_forward_trace(
+        APP_MODEL_FORWARD_TRACE_STAGE_INPUT_TAKEN,
+        desc->sequence,
+        (float)payload_bytes);
+#endif
     return true;
 }
 
@@ -493,9 +597,6 @@ static app_model_inference_status_t app_model_inference_run_model(
      * 已验证过的 active model compute API。
      */
     float output[APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT] = { 0.0f, 0.0f };
-#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
-    float aux_logits[APP_AUDIO_ACTIVE_MODEL_AUX_OUT_COUNT] = { 0.0f };
-#endif
 
     /* 任何一个关键输入为空，都说明调用链路不完整，直接按非法输入处理。 */
     if ((NULL == desc) || (NULL == payload) || (NULL == result))
@@ -533,19 +634,63 @@ static app_model_inference_status_t app_model_inference_run_model(
     /* 模型运行时只做一次初始化；成功后通过静态标志避免每帧重复初始化。 */
     if (!model_runtime_initialized)
     {
-        if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_INIT())
+        int init_ret;
+
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+        (void)app_model_inference_publish_forward_trace(
+            APP_MODEL_FORWARD_TRACE_STAGE_INIT_BEGIN,
+            desc->sequence,
+            0.0f);
+#endif
+        init_ret = APP_AUDIO_ACTIVE_MODEL_INIT();
+        if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != init_ret)
         {
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+            (void)app_model_inference_publish_forward_trace(
+                APP_MODEL_FORWARD_TRACE_STAGE_INIT_ERROR,
+                desc->sequence,
+                (float)init_ret);
+#endif
             return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
         }
         model_runtime_initialized = true;
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+        (void)app_model_inference_publish_forward_trace(
+            APP_MODEL_FORWARD_TRACE_STAGE_INIT_DONE,
+            desc->sequence,
+            (float)init_ret);
+#endif
     }
 
     /* 每次推理前执行 soft reset，确保模型内部状态回到已知初始状态，
      * 避免上一次窗口残留状态影响当前这一帧结果。
      */
-    if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != APP_AUDIO_ACTIVE_MODEL_SOFT_RESET())
     {
-        return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
+        int reset_ret;
+
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+        (void)app_model_inference_publish_forward_trace(
+            APP_MODEL_FORWARD_TRACE_STAGE_RESET_BEGIN,
+            desc->sequence,
+            0.0f);
+#endif
+        reset_ret = APP_AUDIO_ACTIVE_MODEL_SOFT_RESET();
+        if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS != reset_ret)
+        {
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+            (void)app_model_inference_publish_forward_trace(
+                APP_MODEL_FORWARD_TRACE_STAGE_RESET_ERROR,
+                desc->sequence,
+                (float)reset_ret);
+#endif
+            return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
+        }
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+        (void)app_model_inference_publish_forward_trace(
+            APP_MODEL_FORWARD_TRACE_STAGE_RESET_DONE,
+            desc->sequence,
+            (float)reset_ret);
+#endif
     }
 
 #if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_3W_E2_PEAK_PREVIEW)
@@ -622,7 +767,19 @@ static app_model_inference_status_t app_model_inference_run_model(
     }
 
     app_model_inference_selector6_compose_input(model_input_payload_3w);
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    (void)app_model_inference_publish_forward_trace(
+        APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_BEGIN,
+        desc->sequence,
+        (float)APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT);
+#endif
     APP_AUDIO_ACTIVE_MODEL_COMPUTE(model_input_payload_3w, output);
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    (void)app_model_inference_publish_forward_trace(
+        APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_DONE,
+        desc->sequence,
+        0.0f);
+#endif
 
     app_model_inference_selector6_fill_result(desc,
                                               result,
@@ -641,15 +798,19 @@ static app_model_inference_status_t app_model_inference_run_model(
     app_model_inference_fill_input_stats(desc, payload, result);
 #endif
 
-#if (APP_AUDIO_MODEL_SELECT == APP_AUDIO_MODEL_SELECT_HZ2_0_B0_CLEANLINE)
-    if (APP_AUDIO_ACTIVE_MODEL_RET_SUCCESS !=
-        AUDIO_compute(payload, aux_logits, output))
-    {
-        return APP_MODEL_INFERENCE_STATUS_MODEL_ERROR;
-    }
-#else
     /* 真正调用导入后的模型计算入口。 */
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    (void)app_model_inference_publish_forward_trace(
+        APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_BEGIN,
+        desc->sequence,
+        (float)APP_AUDIO_ACTIVE_MODEL_DATA_OUT_COUNT);
+#endif
     APP_AUDIO_ACTIVE_MODEL_COMPUTE(payload, output);
+#if (APP_MODEL_FORWARD_TRACE_ENABLE)
+    (void)app_model_inference_publish_forward_trace(
+        APP_MODEL_FORWARD_TRACE_STAGE_COMPUTE_DONE,
+        desc->sequence,
+        0.0f);
 #endif
 
     /* 把模型原始输出与辅助调试字段统一封装进共享结果结构。 */
