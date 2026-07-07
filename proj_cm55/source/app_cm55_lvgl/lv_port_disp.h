@@ -3,7 +3,7 @@
  * LVGL display port for PSoC Edge E84 — Waveshare 4.3" DSI LCD (832×480 RGB565)
  *
  * Bridges LVGL flush callback to the existing GFXSS display controller via
- * double-buffered framebuffers with 180° hardware rotation.
+ * double-buffered framebuffers with software 180° rotation in the flush path.
  */
 
 #ifndef LV_PORT_DISP_H

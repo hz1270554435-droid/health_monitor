@@ -173,6 +173,9 @@ endif
 else
 CY_IGNORE+=source/app_cm55_lvgl
 CY_IGNORE+=$(SEARCH_lvgl)
+# SEARCH_lvgl may be empty before library discovery resolves the fallback path;
+# keep the disabled-LVGL profile from compiling LVGL sources without lv_conf.h.
+CY_IGNORE+=../../mtb_shared/lvgl/v9.2.0
 endif
 
 ifeq ($(APP_CM55_INFERENCE_ENABLE),1)
@@ -187,6 +190,9 @@ endif
 
 # Like COMPONENTS, but disable optional code that was enabled by default.
 DISABLE_COMPONENTS=
+ifneq ($(APP_DISPLAY_LVGL_ENABLE),1)
+DISABLE_COMPONENTS+=MW_LVGL
+endif
 ifneq ($(APP_CM55_INFERENCE_ENABLE),1)
 DISABLE_COMPONENTS+=MW_ML_MIDDLEWARE MW_ML_TFLITE_MICRO
 endif

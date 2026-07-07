@@ -5,6 +5,7 @@
 *******************************************************************************/
 
 #include "app_cm55_display_bringup.h"
+#include "app_cm55_display_rotation.h"
 
 #include "app_build_config.h"
 #include "app_display_diag.h"
@@ -1082,25 +1083,10 @@ static void draw_live_frame(uint16_t *fb)
 
 #endif /* APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE */
 
-static void flip_framebuffer_180(uint16_t *fb)
-{
-    uint32_t total = CM55_DISP_HOR_RES * CM55_DISP_VER_RES;
-    uint32_t i = 0U;
-    uint32_t j = total - 1U;
-
-    while (i < j)
-    {
-        uint16_t tmp = fb[i];
-        fb[i] = fb[j];
-        fb[j] = tmp;
-        ++i;
-        --j;
-    }
-}
-
 static uint32_t set_framebuffer(uint16_t *fb)
 {
-    flip_framebuffer_180(fb);
+    app_cm55_display_rotate_180_rgb565_inplace(fb,
+                                                CM55_DISP_HOR_RES * CM55_DISP_VER_RES);
     Cy_GFXSS_Set_FrameBuffer(GFXSS, (uint32_t *)fb, &gfx_context);
     if (0U == ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000U)))
     {

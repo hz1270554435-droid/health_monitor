@@ -3,11 +3,12 @@
  * LVGL display port for PSoC Edge E84 — Waveshare 4.3" DSI LCD (832×480 RGB565)
  *
  * Bridges LVGL's flush callback to the GFXSS display controller using the
- * existing double-buffered framebuffers.  The 180° rotation flip is applied
+ * existing double-buffered framebuffers.  A software 180° rotation is applied
  * in the flush path so the physical panel orientation matches the UI.
  */
 
 #include "lv_port_disp.h"
+#include "app_cm55_display_rotation.h"
 #include "lvgl.h"
 #include "cy_graphics.h"
 #include "FreeRTOS.h"
@@ -33,23 +34,6 @@ static GFXSS_Type *s_gfxss;
 static cy_stc_gfx_context_t *s_gfx_ctx;
 
 /* ------------------------------------------------------------------ */
-/* 180° flip                                                          */
-/* ------------------------------------------------------------------ */
-static void flip_180(uint16_t *fb, uint32_t len)
-{
-    uint32_t i = 0U;
-    uint32_t j = len - 1U;
-    while (i < j)
-    {
-        uint16_t tmp = fb[i];
-        fb[i] = fb[j];
-        fb[j] = tmp;
-        i++;
-        j--;
-    }
-}
-
-/* ------------------------------------------------------------------ */
 /* LVGL flush callback                                                */
 /* ------------------------------------------------------------------ */
 static void disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
@@ -58,8 +42,8 @@ static void disp_flush(lv_display_t *disp, const lv_area_t *area, uint8_t *px_ma
 
     uint16_t *fb = (uint16_t *)px_map;
 
-    /* 180° flip for physical panel orientation */
-    flip_180(fb, DISP_HOR_RES * DISP_VER_RES);
+    /* 180° full-frame rotation for physical panel orientation. */
+    app_cm55_display_rotate_180_rgb565_inplace(fb, DISP_HOR_RES * DISP_VER_RES);
 
     /* Point the display controller at this buffer */
     Cy_GFXSS_Set_FrameBuffer(s_gfxss, (uint32_t *)fb, s_gfx_ctx);
@@ -109,7 +93,8 @@ void lv_port_disp_init(TaskHandle_t dc_task_handle,
                            DISP_HOR_RES * DISP_VER_RES * BYTE_PER_PIXEL,
                            LV_DISPLAY_RENDER_MODE_FULL);
 
-    /* NOTE: 180° rotation is handled manually in disp_flush() via flip_180().
-     * We do NOT use lv_display_set_rotation() because it requires a scratch
-     * buffer (~800 KB) that doesn't fit in gfx_mem. */
+    /* NOTE: 180° rotation is handled manually in disp_flush() over the full
+     * stride-aligned framebuffer.  We do NOT use lv_display_set_rotation()
+     * because it requires a scratch buffer (~800 KB) that doesn't fit in
+     * gfx_mem. */
 }
