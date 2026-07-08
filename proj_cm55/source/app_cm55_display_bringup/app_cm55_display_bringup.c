@@ -25,6 +25,9 @@
 #if (APP_DISPLAY_LVGL_ENABLE)
 #include "lvgl.h"
 #include "lv_port_disp.h"
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+#include "lv_port_indev.h"
+#endif
 #include "ui_health_dashboard.h"
 #endif
 
@@ -35,6 +38,10 @@
 
 #ifndef APP_DISPLAY_LVGL_DATA_UPDATE_TICKS
 #define APP_DISPLAY_LVGL_DATA_UPDATE_TICKS (30U)
+#endif
+
+#ifndef APP_DISPLAY_LVGL_TOUCH_ENABLE
+#define APP_DISPLAY_LVGL_TOUCH_ENABLE (0U)
 #endif
 
 #if (APP_DISPLAY_LVGL_DATA_UPDATE_TICKS < 1)
@@ -1613,6 +1620,23 @@ static void cm55_gfx_task(void *arg)
     CM55_DISP_LOG("[CM55_DISP] step07 lvgl_init\r\n");
     lv_init();
     lv_port_disp_init(cm55_gfx_task_handle, GFXSS, &gfx_context);
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+    {
+        cy_rslt_t touch_status;
+
+        touch_status = lv_port_indev_init(CYBSP_I2C_CONTROLLER_HW,
+                                          &display_i2c_context);
+        if (CY_RSLT_SUCCESS != touch_status)
+        {
+            CM55_DISP_LOG("[CM55_DISP] touch_init disabled result=%ld\r\n",
+                          (long)touch_status);
+        }
+        else
+        {
+            CM55_DISP_LOG("[CM55_DISP] touch_init OK\r\n");
+        }
+    }
+#endif
     ui_health_dashboard_init();
     CM55_DISP_LOG("[CM55_DISP] step07 lvgl_init OK\r\n");
     CM55_DISP_DIAG(APP_DISPLAY_DIAG_STAGE_DISPLAY_READY, 0u, 0u);

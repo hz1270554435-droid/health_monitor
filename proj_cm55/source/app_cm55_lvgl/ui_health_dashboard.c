@@ -24,6 +24,9 @@
 #include "lvgl.h"
 #include "app_build_config.h"
 #include "app_display_cm55_shared.h"
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+#include "lv_port_indev.h"
+#endif
 #include "fonts/lv_font_simsun_16_e84.h"
 #include "fonts/lv_font_simsun_20_e84.h"
 #include "fonts/lv_font_simsun_28_e84.h"
@@ -37,6 +40,14 @@
 
 #ifndef APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS
 #define APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS (3000U)
+#endif
+
+#ifndef APP_DISPLAY_LVGL_TOUCH_ENABLE
+#define APP_DISPLAY_LVGL_TOUCH_ENABLE (0U)
+#endif
+
+#ifndef APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE
+#define APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE (0U)
 #endif
 
 #if (APP_DISPLAY_CM55_UART_LOG_ENABLE)
@@ -88,6 +99,24 @@
 #define FOOTER_Y           (OUTER_Y + OUTER_H - 52U)
 #define FOOTER_W           (OUTER_W - 64U)
 #define FOOTER_H           42U
+
+#define HISTORY_SAMPLE_PERIOD_MS (30U * 1000U)
+#define HISTORY_SAMPLE_COUNT     60U
+#define COUGH_RECENT_WINDOW_MS   (30U * 60U * 1000U)
+#define COUGH_EVENT_RING_COUNT   128U
+#define COUGH_NIGHT_BUCKET_COUNT 12U
+#define COUGH_NIGHT_BUCKET_MS    (60U * 60U * 1000U)
+
+#define DETAIL_TITLE_X      32
+#define DETAIL_TITLE_Y      24
+#define DETAIL_CURRENT_X    34
+#define DETAIL_CURRENT_Y    68
+#define DETAIL_CHART_X      32
+#define DETAIL_CHART_Y      154
+#define DETAIL_CHART_W      740
+#define DETAIL_CHART_H      200
+#define DETAIL_STAT_Y       374
+#define DETAIL_PAGE_DOT_Y   424
 
 /* ------------------------------------------------------------------ */
 /* Fonts                                                              */
@@ -154,6 +183,62 @@ static lv_obj_t *lbl_radar_presence;
 static lv_obj_t *lbl_trend;
 static lv_obj_t *lbl_diag;
 static lv_obj_t *dot_mic, *dot_radar, *dot_ble;
+
+typedef enum
+{
+    UI_PAGE_HOME = 0,
+    UI_PAGE_RR_DETAIL,
+    UI_PAGE_HR_DETAIL,
+    UI_PAGE_NIGHT,
+    UI_PAGE_COUNT
+} ui_page_t;
+
+typedef struct
+{
+    uint16_t values[HISTORY_SAMPLE_COUNT];
+    uint8_t count;
+    uint8_t head;
+    bool last_sample_valid;
+    uint32_t last_sample_ms;
+} metric_history_t;
+
+typedef struct
+{
+    lv_obj_t *root;
+    lv_obj_t *lbl_current;
+    lv_obj_t *lbl_state;
+    lv_obj_t *lbl_min;
+    lv_obj_t *lbl_max;
+    lv_obj_t *lbl_avg;
+    lv_obj_t *line;
+    lv_obj_t *empty;
+    lv_point_precise_t points[HISTORY_SAMPLE_COUNT];
+} metric_detail_widgets_t;
+
+static lv_obj_t *page_home;
+static lv_obj_t *page_rr_detail;
+static lv_obj_t *page_hr_detail;
+static lv_obj_t *page_night;
+static ui_page_t s_active_page;
+
+static metric_history_t s_rr_history;
+static metric_history_t s_hr_history;
+static metric_detail_widgets_t s_rr_detail;
+static metric_detail_widgets_t s_hr_detail;
+
+static lv_obj_t *lbl_night_total;
+static lv_obj_t *lbl_night_total_unit;
+static lv_obj_t *lbl_night_recent;
+static lv_obj_t *lbl_night_recent_unit;
+static lv_obj_t *lbl_night_empty;
+static lv_obj_t *night_bars[COUGH_NIGHT_BUCKET_COUNT];
+
+static uint32_t s_cough_recent_ts[COUGH_EVENT_RING_COUNT];
+static uint8_t s_cough_recent_count;
+static uint8_t s_cough_recent_head;
+static uint32_t s_cough_night_buckets[COUGH_NIGHT_BUCKET_COUNT];
+static bool s_cough_session_start_valid;
+static uint32_t s_cough_session_start_ms;
 
 /* Display-local state only: demo wake count is RAM-only and resets on reboot. */
 static bool s_cough_event_total_valid;
@@ -254,6 +339,607 @@ static void set_badge_pill(lv_obj_t *pill, const char *text,
         lv_obj_center(lbl);
     }
     lv_obj_set_width(pill, LV_SIZE_CONTENT);
+}
+
+static void show_page(ui_page_t page);
+static void page_gesture_cb(lv_event_t *e);
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+static void touch_swipe_cb(int32_t dir);
+#endif
+
+static void add_gesture_bubble_to_children(lv_obj_t *parent)
+{
+    uint32_t child_count = lv_obj_get_child_count(parent);
+
+    for (uint32_t i = 0; i < child_count; ++i)
+    {
+        lv_obj_t *child = lv_obj_get_child(parent, (int32_t)i);
+
+        if (NULL != child)
+        {
+            lv_obj_add_flag(child, LV_OBJ_FLAG_GESTURE_BUBBLE);
+            add_gesture_bubble_to_children(child);
+        }
+    }
+}
+
+static lv_obj_t *make_page_root(lv_obj_t *scr)
+{
+    lv_obj_t *root = lv_obj_create(scr);
+
+    lv_obj_set_size(root, OUTER_W, OUTER_H);
+    lv_obj_set_pos(root, OUTER_X, OUTER_Y);
+    lv_obj_set_style_bg_color(root, C_BG_DEEP, 0);
+    lv_obj_set_style_bg_opa(root, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_radius(root, OUTER_R, 0);
+    lv_obj_set_style_border_color(root, C_OUTER_BORDER, 0);
+    lv_obj_set_style_border_width(root, 1, 0);
+    lv_obj_set_style_pad_all(root, 0, 0);
+    lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(root, page_gesture_cb, LV_EVENT_GESTURE, NULL);
+    return root;
+}
+
+static void set_page_hidden(lv_obj_t *page, bool hidden)
+{
+    if (NULL == page)
+    {
+        return;
+    }
+
+    if (hidden)
+    {
+        lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+    }
+    else
+    {
+        lv_obj_remove_flag(page, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+static void show_page(ui_page_t page)
+{
+    if (page >= UI_PAGE_COUNT)
+    {
+        page = UI_PAGE_HOME;
+    }
+
+    s_active_page = page;
+    set_page_hidden(page_home, UI_PAGE_HOME != page);
+    set_page_hidden(page_rr_detail, UI_PAGE_RR_DETAIL != page);
+    set_page_hidden(page_hr_detail, UI_PAGE_HR_DETAIL != page);
+    set_page_hidden(page_night, UI_PAGE_NIGHT != page);
+}
+
+static void switch_page(int32_t delta)
+{
+    int32_t page = (int32_t)s_active_page + delta;
+
+    while (page < 0)
+    {
+        page += (int32_t)UI_PAGE_COUNT;
+    }
+    while (page >= (int32_t)UI_PAGE_COUNT)
+    {
+        page -= (int32_t)UI_PAGE_COUNT;
+    }
+
+    show_page((ui_page_t)page);
+}
+
+static void page_gesture_cb(lv_event_t *e)
+{
+    lv_indev_t *indev;
+    lv_dir_t dir;
+
+    if (LV_EVENT_GESTURE != lv_event_get_code(e))
+    {
+        return;
+    }
+
+    indev = lv_event_get_indev(e);
+    if (NULL == indev)
+    {
+        indev = lv_indev_active();
+    }
+    if (NULL == indev)
+    {
+        return;
+    }
+
+    dir = lv_indev_get_gesture_dir(indev);
+    if (LV_DIR_LEFT == dir)
+    {
+        switch_page(1);
+    }
+    else if (LV_DIR_RIGHT == dir)
+    {
+        switch_page(-1);
+    }
+}
+
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+static void touch_swipe_cb(int32_t dir)
+{
+    if (dir < 0)
+    {
+        switch_page(1);
+    }
+    else if (dir > 0)
+    {
+        switch_page(-1);
+    }
+}
+#endif
+
+static lv_obj_t *make_simple_label(lv_obj_t *parent,
+                                   const char *text,
+                                   const lv_font_t *font,
+                                   lv_color_t color,
+                                   lv_coord_t x,
+                                   lv_coord_t y)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_color(lbl, color, 0);
+    lv_obj_set_style_text_font(lbl, font, 0);
+    lv_obj_set_pos(lbl, x, y);
+    return lbl;
+}
+
+static void make_page_indicator(lv_obj_t *parent, const char *text)
+{
+    lv_obj_t *lbl = make_simple_label(parent, text, FONT_20, C_TEXT_DIM,
+                                      356, DETAIL_PAGE_DOT_Y);
+
+    lv_obj_set_style_text_align(lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(lbl, 96);
+}
+
+static lv_obj_t *make_chart_box(lv_obj_t *parent)
+{
+    lv_obj_t *box = lv_obj_create(parent);
+
+    lv_obj_set_size(box, DETAIL_CHART_W, DETAIL_CHART_H);
+    lv_obj_set_pos(box, DETAIL_CHART_X, DETAIL_CHART_Y);
+    lv_obj_set_style_bg_color(box, C_CARD_BG, 0);
+    lv_obj_set_style_bg_opa(box, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(box, 8, 0);
+    lv_obj_set_style_border_color(box, C_CARD_BORDER, 0);
+    lv_obj_set_style_border_width(box, 1, 0);
+    lv_obj_set_style_pad_all(box, 0, 0);
+    lv_obj_clear_flag(box, LV_OBJ_FLAG_SCROLLABLE);
+    return box;
+}
+
+static void make_chart_grid(lv_obj_t *box)
+{
+    for (uint32_t i = 1; i < 4; ++i)
+    {
+        lv_obj_t *line = lv_obj_create(box);
+        lv_coord_t y = (lv_coord_t)((DETAIL_CHART_H * i) / 4U);
+
+        lv_obj_set_size(line, DETAIL_CHART_W - 36, 1);
+        lv_obj_set_pos(line, 18, y);
+        lv_obj_set_style_bg_color(line, C_CARD_BORDER, 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_60, 0);
+        lv_obj_set_style_border_width(line, 0, 0);
+        lv_obj_set_style_pad_all(line, 0, 0);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    for (uint32_t i = 1; i < 4; ++i)
+    {
+        lv_obj_t *line = lv_obj_create(box);
+        lv_coord_t x = (lv_coord_t)((DETAIL_CHART_W * i) / 4U);
+
+        lv_obj_set_size(line, 1, DETAIL_CHART_H - 28);
+        lv_obj_set_pos(line, x, 14);
+        lv_obj_set_style_bg_color(line, C_CARD_BORDER, 0);
+        lv_obj_set_style_bg_opa(line, LV_OPA_40, 0);
+        lv_obj_set_style_border_width(line, 0, 0);
+        lv_obj_set_style_pad_all(line, 0, 0);
+        lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
+    }
+}
+
+static void create_metric_detail_page(lv_obj_t *scr,
+                                      metric_detail_widgets_t *page,
+                                      const char *title,
+                                      const char *page_mark,
+                                      lv_color_t accent)
+{
+    lv_obj_t *chart_box;
+
+    page->root = make_page_root(scr);
+    make_simple_label(page->root, title, FONT_28, C_TEXT,
+                      DETAIL_TITLE_X, DETAIL_TITLE_Y);
+    make_simple_label(page->root, "当前", FONT_20, C_TEXT_DIM,
+                      DETAIL_CURRENT_X, DETAIL_CURRENT_Y + 10);
+    page->lbl_current = make_simple_label(page->root, "--",
+                                          FONT_48, accent,
+                                          DETAIL_CURRENT_X + 76,
+                                          DETAIL_CURRENT_Y);
+    make_simple_label(page->root, "bpm", FONT_UNIT, C_TEXT,
+                      DETAIL_CURRENT_X + 214, DETAIL_CURRENT_Y + 18);
+    page->lbl_state = make_simple_label(page->root, "等待数据",
+                                        FONT_20, C_TEXT_DIM,
+                                        DETAIL_CURRENT_X,
+                                        DETAIL_CURRENT_Y + 66);
+
+    chart_box = make_chart_box(page->root);
+    make_chart_grid(chart_box);
+    page->line = lv_line_create(chart_box);
+    lv_obj_set_size(page->line, DETAIL_CHART_W - 32, DETAIL_CHART_H - 28);
+    lv_obj_set_pos(page->line, 16, 12);
+    lv_obj_set_style_line_color(page->line, accent, 0);
+    lv_obj_set_style_line_width(page->line, 4, 0);
+    lv_obj_set_style_line_rounded(page->line, true, 0);
+
+    page->empty = make_simple_label(chart_box, "等待数据", FONT_20,
+                                    C_TEXT_DIM, 316, 92);
+
+    page->lbl_min = make_simple_label(page->root, "Min --", FONT_28,
+                                      C_TEXT, 42, DETAIL_STAT_Y);
+    page->lbl_max = make_simple_label(page->root, "Max --", FONT_28,
+                                      C_TEXT, 302, DETAIL_STAT_Y);
+    page->lbl_avg = make_simple_label(page->root, "Avg --", FONT_28,
+                                      C_TEXT, 562, DETAIL_STAT_Y);
+    make_page_indicator(page->root, page_mark);
+
+    add_gesture_bubble_to_children(page->root);
+}
+
+static void create_night_page(lv_obj_t *scr)
+{
+    lv_obj_t *chart_box;
+    const lv_coord_t gap = 10;
+    const lv_coord_t bar_w =
+        (DETAIL_CHART_W - 32 - ((lv_coord_t)COUGH_NIGHT_BUCKET_COUNT - 1) * gap) /
+        (lv_coord_t)COUGH_NIGHT_BUCKET_COUNT;
+
+    page_night = make_page_root(scr);
+    make_simple_label(page_night, "整夜", FONT_28, C_TEXT,
+                      DETAIL_TITLE_X, DETAIL_TITLE_Y);
+    make_simple_label(page_night, "整夜咳嗽", FONT_20, C_TEXT_DIM,
+                      DETAIL_CURRENT_X, DETAIL_CURRENT_Y + 4);
+    lbl_night_total = make_simple_label(page_night, "--",
+                                        FONT_48, C_AMBER,
+                                        DETAIL_CURRENT_X,
+                                        DETAIL_CURRENT_Y + 32);
+    lbl_night_total_unit = make_simple_label(page_night, "次", FONT_28,
+                                             C_TEXT,
+                                             DETAIL_CURRENT_X + 126,
+                                             DETAIL_CURRENT_Y + 48);
+
+    make_simple_label(page_night, "最近30min", FONT_20, C_TEXT_DIM,
+                      450, DETAIL_CURRENT_Y + 4);
+    lbl_night_recent = make_simple_label(page_night, "--",
+                                         FONT_48, C_TEXT,
+                                         450, DETAIL_CURRENT_Y + 32);
+    lbl_night_recent_unit = make_simple_label(page_night, "次", FONT_28,
+                                              C_TEXT,
+                                              576, DETAIL_CURRENT_Y + 48);
+
+    chart_box = make_chart_box(page_night);
+    make_chart_grid(chart_box);
+    make_simple_label(chart_box, "整夜咳嗽", FONT_20, C_TEXT_DIM, 18, 12);
+    for (uint32_t i = 0; i < COUGH_NIGHT_BUCKET_COUNT; ++i)
+    {
+        night_bars[i] = lv_obj_create(chart_box);
+        lv_obj_set_size(night_bars[i], bar_w, 2);
+        lv_obj_set_pos(night_bars[i],
+                       16 + (lv_coord_t)i * (bar_w + gap),
+                       DETAIL_CHART_H - 16);
+        lv_obj_set_style_bg_color(night_bars[i], C_AMBER, 0);
+        lv_obj_set_style_bg_opa(night_bars[i], LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(night_bars[i], 4, 0);
+        lv_obj_set_style_border_width(night_bars[i], 0, 0);
+        lv_obj_set_style_pad_all(night_bars[i], 0, 0);
+        lv_obj_clear_flag(night_bars[i], LV_OBJ_FLAG_SCROLLABLE);
+    }
+
+    lbl_night_empty = make_simple_label(chart_box, "暂无咳嗽事件", FONT_20,
+                                        C_TEXT_DIM, 292, 92);
+    make_simple_label(page_night, "0h", FONT_16, C_TEXT_DIM,
+                      DETAIL_CHART_X + 16, DETAIL_STAT_Y);
+    make_simple_label(page_night, "6h", FONT_16, C_TEXT_DIM,
+                      DETAIL_CHART_X + 360, DETAIL_STAT_Y);
+    make_simple_label(page_night, "12h", FONT_16, C_TEXT_DIM,
+                      DETAIL_CHART_X + 700, DETAIL_STAT_Y);
+    make_page_indicator(page_night, "4/4");
+
+    add_gesture_bubble_to_children(page_night);
+}
+
+static uint32_t elapsed_ms(uint32_t now_ms, uint32_t then_ms)
+{
+    return (uint32_t)(now_ms - then_ms);
+}
+
+static void metric_history_push(metric_history_t *history, uint16_t value_x10)
+{
+    history->values[history->head] = value_x10;
+    history->head = (uint8_t)((history->head + 1U) % HISTORY_SAMPLE_COUNT);
+    if (history->count < HISTORY_SAMPLE_COUNT)
+    {
+        history->count++;
+    }
+}
+
+static void metric_history_update(metric_history_t *history,
+                                  uint16_t value_x10,
+                                  uint32_t now_ms)
+{
+    if (0U == value_x10)
+    {
+        return;
+    }
+
+    if ((!history->last_sample_valid) ||
+        (elapsed_ms(now_ms, history->last_sample_ms) >= HISTORY_SAMPLE_PERIOD_MS))
+    {
+        metric_history_push(history, value_x10);
+        history->last_sample_ms = now_ms;
+        history->last_sample_valid = true;
+    }
+}
+
+static uint8_t metric_history_values(const metric_history_t *history,
+                                     uint16_t *out,
+                                     uint8_t out_count)
+{
+    uint8_t count = history->count;
+    uint8_t start;
+
+    if (count > out_count)
+    {
+        count = out_count;
+    }
+
+    start = (uint8_t)((history->head + HISTORY_SAMPLE_COUNT - count) %
+                      HISTORY_SAMPLE_COUNT);
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        out[i] = history->values[(start + i) % HISTORY_SAMPLE_COUNT];
+    }
+
+    return count;
+}
+
+static bool metric_history_stats(const metric_history_t *history,
+                                 uint16_t *min_x10,
+                                 uint16_t *max_x10,
+                                 uint16_t *avg_x10)
+{
+    uint16_t values[HISTORY_SAMPLE_COUNT];
+    uint32_t sum = 0;
+    uint8_t count = metric_history_values(history, values, HISTORY_SAMPLE_COUNT);
+
+    if (0U == count)
+    {
+        return false;
+    }
+
+    *min_x10 = values[0];
+    *max_x10 = values[0];
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        if (values[i] < *min_x10)
+        {
+            *min_x10 = values[i];
+        }
+        if (values[i] > *max_x10)
+        {
+            *max_x10 = values[i];
+        }
+        sum += values[i];
+    }
+
+    *avg_x10 = (uint16_t)((sum + ((uint32_t)count / 2U)) / count);
+    return true;
+}
+
+static void update_metric_detail(metric_detail_widgets_t *page,
+                                 const metric_history_t *history,
+                                 uint16_t current_x10)
+{
+    uint16_t values[HISTORY_SAMPLE_COUNT];
+    uint8_t count;
+    uint16_t min_x10 = 0;
+    uint16_t max_x10 = 0;
+    uint16_t avg_x10 = 0;
+    char buf[40];
+
+    if (0U != current_x10)
+    {
+        snprintf(buf, sizeof(buf), "%u",
+                 (unsigned int)((current_x10 + 5U) / 10U));
+        lv_label_set_text(page->lbl_state, "实时中");
+    }
+    else
+    {
+        snprintf(buf, sizeof(buf), "--");
+        lv_label_set_text(page->lbl_state, "等待数据");
+    }
+    lv_label_set_text(page->lbl_current, buf);
+
+    if (metric_history_stats(history, &min_x10, &max_x10, &avg_x10))
+    {
+        snprintf(buf, sizeof(buf), "Min %u",
+                 (unsigned int)((min_x10 + 5U) / 10U));
+        lv_label_set_text(page->lbl_min, buf);
+        snprintf(buf, sizeof(buf), "Max %u",
+                 (unsigned int)((max_x10 + 5U) / 10U));
+        lv_label_set_text(page->lbl_max, buf);
+        snprintf(buf, sizeof(buf), "Avg %u",
+                 (unsigned int)((avg_x10 + 5U) / 10U));
+        lv_label_set_text(page->lbl_avg, buf);
+    }
+    else
+    {
+        lv_label_set_text(page->lbl_min, "Min --");
+        lv_label_set_text(page->lbl_max, "Max --");
+        lv_label_set_text(page->lbl_avg, "Avg --");
+    }
+
+    count = metric_history_values(history, values, HISTORY_SAMPLE_COUNT);
+    if (0U == count)
+    {
+        lv_obj_add_flag(page->line, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(page->empty, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+
+    if (1U == count)
+    {
+        values[1] = values[0];
+        count = 2U;
+    }
+
+    if (max_x10 <= min_x10)
+    {
+        max_x10 = (uint16_t)(min_x10 + 10U);
+    }
+
+    for (uint8_t i = 0; i < count; ++i)
+    {
+        uint32_t x = ((uint32_t)i * (DETAIL_CHART_W - 34U)) /
+                     (uint32_t)(count - 1U);
+        uint32_t y = ((uint32_t)(max_x10 - values[i]) *
+                      (DETAIL_CHART_H - 34U)) /
+                     (uint32_t)(max_x10 - min_x10);
+
+        page->points[i].x = (lv_value_precise_t)x;
+        page->points[i].y = (lv_value_precise_t)y;
+    }
+
+    lv_line_set_points_mutable(page->line, page->points, count);
+    lv_obj_remove_flag(page->line, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(page->empty, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void cough_note_session_start(uint32_t now_ms)
+{
+    if (!s_cough_session_start_valid)
+    {
+        s_cough_session_start_ms = now_ms;
+        s_cough_session_start_valid = true;
+    }
+}
+
+static void cough_recent_push(uint32_t now_ms)
+{
+    s_cough_recent_ts[s_cough_recent_head] = now_ms;
+    s_cough_recent_head =
+        (uint8_t)((s_cough_recent_head + 1U) % COUGH_EVENT_RING_COUNT);
+    if (s_cough_recent_count < COUGH_EVENT_RING_COUNT)
+    {
+        s_cough_recent_count++;
+    }
+}
+
+static void cough_bucket_push(uint32_t now_ms)
+{
+    uint32_t bucket;
+
+    cough_note_session_start(now_ms);
+    bucket = elapsed_ms(now_ms, s_cough_session_start_ms) /
+             COUGH_NIGHT_BUCKET_MS;
+    if (bucket >= COUGH_NIGHT_BUCKET_COUNT)
+    {
+        bucket = COUGH_NIGHT_BUCKET_COUNT - 1U;
+    }
+    s_cough_night_buckets[bucket]++;
+}
+
+static void record_cough_events(uint32_t now_ms, uint32_t count)
+{
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        cough_recent_push(now_ms);
+        cough_bucket_push(now_ms);
+    }
+}
+
+static uint32_t cough_recent_count(uint32_t now_ms)
+{
+    uint32_t count = 0;
+    uint8_t ring_count = s_cough_recent_count;
+    uint8_t start =
+        (uint8_t)((s_cough_recent_head + COUGH_EVENT_RING_COUNT - ring_count) %
+                  COUGH_EVENT_RING_COUNT);
+
+    for (uint8_t i = 0; i < ring_count; ++i)
+    {
+        uint32_t ts = s_cough_recent_ts[(start + i) % COUGH_EVENT_RING_COUNT];
+
+        if (elapsed_ms(now_ms, ts) <= COUGH_RECENT_WINDOW_MS)
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+static void update_night_page(uint32_t total, uint32_t recent_30min)
+{
+    uint32_t max_bucket = 0;
+    const lv_coord_t gap = 10;
+    const lv_coord_t bar_w =
+        (DETAIL_CHART_W - 32 - ((lv_coord_t)COUGH_NIGHT_BUCKET_COUNT - 1) * gap) /
+        (lv_coord_t)COUGH_NIGHT_BUCKET_COUNT;
+    char buf[48];
+
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)total);
+    lv_label_set_text(lbl_night_total, buf);
+    lv_obj_align_to(lbl_night_total_unit, lbl_night_total,
+                    LV_ALIGN_OUT_RIGHT_MID, 8, 4);
+
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)recent_30min);
+    lv_label_set_text(lbl_night_recent, buf);
+    lv_obj_align_to(lbl_night_recent_unit, lbl_night_recent,
+                    LV_ALIGN_OUT_RIGHT_MID, 8, 4);
+
+    for (uint32_t i = 0; i < COUGH_NIGHT_BUCKET_COUNT; ++i)
+    {
+        if (s_cough_night_buckets[i] > max_bucket)
+        {
+            max_bucket = s_cough_night_buckets[i];
+        }
+    }
+
+    if (0U == max_bucket)
+    {
+        lv_obj_remove_flag(lbl_night_empty, LV_OBJ_FLAG_HIDDEN);
+        max_bucket = 1U;
+    }
+    else
+    {
+        lv_obj_add_flag(lbl_night_empty, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    for (uint32_t i = 0; i < COUGH_NIGHT_BUCKET_COUNT; ++i)
+    {
+        lv_coord_t h =
+            (lv_coord_t)((s_cough_night_buckets[i] * (DETAIL_CHART_H - 34U)) /
+                         max_bucket);
+        if (h < 2)
+        {
+            h = 2;
+        }
+
+        lv_obj_set_size(night_bars[i], bar_w, h);
+        lv_obj_set_pos(night_bars[i],
+                       16 + (lv_coord_t)i * (bar_w + gap),
+                       DETAIL_CHART_H - 16 - h);
+        lv_obj_set_style_bg_opa(night_bars[i],
+                                (s_cough_night_buckets[i] > 0U) ?
+                                LV_OPA_COVER : LV_OPA_30,
+                                0);
+    }
 }
 
 static void set_wake_capsule(void)
@@ -440,6 +1126,22 @@ static bool update_cough_event_latch(uint32_t last_cough_event_id,
                                      uint32_t now_ms)
 {
     bool new_event = false;
+    uint32_t new_event_count = 0;
+
+    if (!s_cough_event_total_valid)
+    {
+        s_last_cough_event_total = cough_event_count_total;
+        s_cough_event_total_valid = true;
+    }
+    else if (cough_event_count_total > s_last_cough_event_total)
+    {
+        new_event_count = cough_event_count_total - s_last_cough_event_total;
+        s_last_cough_event_total = cough_event_count_total;
+    }
+    else if (cough_event_count_total < s_last_cough_event_total)
+    {
+        s_last_cough_event_total = cough_event_count_total;
+    }
 
     if (0u != last_cough_event_id)
     {
@@ -455,23 +1157,16 @@ static bool update_cough_event_latch(uint32_t last_cough_event_id,
             new_event = true;
         }
     }
-    else if (!s_cough_event_total_valid)
+
+    if ((0U == new_event_count) && new_event)
     {
-        s_last_cough_event_total = cough_event_count_total;
-        s_cough_event_total_valid = true;
-    }
-    else if (cough_event_count_total > s_last_cough_event_total)
-    {
-        s_last_cough_event_total = cough_event_count_total;
-        new_event = true;
-    }
-    else if (cough_event_count_total < s_last_cough_event_total)
-    {
-        s_last_cough_event_total = cough_event_count_total;
+        new_event_count = 1U;
     }
 
-    if (new_event)
+    if (0U != new_event_count)
     {
+        new_event = true;
+        record_cough_events(now_ms, new_event_count);
         s_cough_event_hold_until_ms =
             now_ms + (uint32_t)APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS;
     }
@@ -480,7 +1175,7 @@ static bool update_cough_event_latch(uint32_t last_cough_event_id,
            ui_deadline_active(s_cough_event_hold_until_ms, now_ms);
 }
 
-static void update_cough_labels(uint16_t cough_5min,
+static void update_cough_labels(uint32_t cough_recent_30min,
                                 uint32_t cough_event_count_total,
                                 bool cough_event_active)
 {
@@ -489,8 +1184,8 @@ static void update_cough_labels(uint16_t cough_5min,
     snprintf(buf, sizeof(buf), "整夜: %lu 次",
              (unsigned long)cough_event_count_total);
     lv_label_set_text(lbl_cough_all, buf);
-    snprintf(buf, sizeof(buf), "最近5min: %u 次",
-             (unsigned int)cough_5min);
+    snprintf(buf, sizeof(buf), "最近30min: %lu 次",
+             (unsigned long)cough_recent_30min);
     lv_label_set_text(lbl_cough_half, buf);
 
     if (cough_event_active)
@@ -626,6 +1321,36 @@ static void set_snapshot_diag(const app_display_cm55_snapshot_t *snap)
     lv_label_set_text(lbl_diag, buf);
 }
 
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE && APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE)
+static void set_touch_diag(void)
+{
+    lv_port_indev_status_t status;
+    char buf[80];
+
+    lv_port_indev_get_status(&status);
+
+    snprintf(buf, sizeof(buf),
+             "TOUCH init=%lu r=%ld rd=%lu ok=%lu err=%lu",
+             status.initialized ? 1UL : 0UL,
+             (long)status.init_result,
+             (unsigned long)status.read_count,
+             (unsigned long)status.success_count,
+             (unsigned long)status.error_count);
+    lv_label_set_text(lbl_trend, buf);
+
+    snprintf(buf, sizeof(buf),
+             "ev=%lu tc=%lu press=%lu sw=%lu dir=%ld xy=%d,%d",
+             (unsigned long)status.last_event,
+             (unsigned long)status.last_touch_count,
+             (unsigned long)status.press_count,
+             (unsigned long)status.swipe_count,
+             (long)status.last_swipe_dir,
+             (int)status.last_x,
+             (int)status.last_y);
+    lv_label_set_text(lbl_diag, buf);
+}
+#endif
+
 #if (APP_DISPLAY_LVGL_SNAPSHOT_PROBE_ENABLE)
 static void run_snapshot_probe(uint32_t tick)
 {
@@ -717,8 +1442,6 @@ static void run_minimal_realtime(uint32_t tick)
     volatile app_display_cm55_snapshot_t *snap = APP_DISPLAY_CM55_SNAPSHOT;
     char buf[80];
 
-    (void)tick;
-
     uint32_t magic = snap->magic;
     uint32_t version = snap->version;
     uint32_t begin = snap->seq_begin;
@@ -738,6 +1461,9 @@ static void run_minimal_realtime(uint32_t tick)
     uint32_t ble_connected = snap->ble_connected;
     uint32_t wall_epoch_s = snap->wall_epoch_s;
     uint32_t wall_time_flags = snap->wall_time_flags;
+    uint32_t now_ms = (timestamp_ms > 0U) ? timestamp_ms : (tick * 1000U);
+    bool cough_event_active;
+    uint32_t cough_30min;
 
     if ((APP_DISPLAY_CM55_SNAPSHOT_MAGIC == magic) &&
         (APP_DISPLAY_CM55_SNAPSHOT_VERSION == version) &&
@@ -782,19 +1508,24 @@ static void run_minimal_realtime(uint32_t tick)
         set_badge_pill(lbl_hr_badge, "暂无数据", C_ROSE_DIM, C_ROSE);
     }
 
+    cough_note_session_start(now_ms);
+    metric_history_update(&s_rr_history, (uint16_t)rr, now_ms);
+    metric_history_update(&s_hr_history, (uint16_t)hr, now_ms);
+
     (void)cough_1min;
     (void)cough_prob;
-    (void)timestamp_ms;
-    (void)tick;
-    update_cough_labels((uint16_t)cough_5min,
+    (void)cough_5min;
+    cough_event_active = update_cough_event_latch(
+        last_cough_event_id,
+        cough_event_total,
+        ((DISPLAY_CM55_ALERT_COUGH_BURST == alert_code) &&
+         (0u != (flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
+         (0u != last_cough_event_id)),
+        now_ms);
+    cough_30min = cough_recent_count(now_ms);
+    update_cough_labels(cough_30min,
                         cough_event_total,
-                        update_cough_event_latch(
-                            last_cough_event_id,
-                            cough_event_total,
-                            ((DISPLAY_CM55_ALERT_COUGH_BURST == alert_code) &&
-                             (0u != (flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
-                             (0u != last_cough_event_id)),
-                            timestamp_ms));
+                        cough_event_active);
 
     if (dist > 0U)
     {
@@ -844,6 +1575,13 @@ static void run_minimal_realtime(uint32_t tick)
     lv_led_set_color(dot_mic, (flags & 0x01U) ? C_GREEN : C_TEXT_DIM);
     lv_led_set_color(dot_radar, (flags & 0x02U) ? C_GREEN : C_TEXT_DIM);
     lv_led_set_color(dot_ble, (0U != ble_connected) ? C_GREEN : C_TEXT_DIM);
+
+    update_metric_detail(&s_rr_detail, &s_rr_history, (uint16_t)rr);
+    update_metric_detail(&s_hr_detail, &s_hr_history, (uint16_t)hr);
+    update_night_page(cough_event_total, cough_30min);
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE && APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE)
+    set_touch_diag();
+#endif
 }
 #endif
 
@@ -868,6 +1606,8 @@ void ui_health_dashboard_init(void)
     lv_obj_set_style_border_width(outer, 1, 0);
     lv_obj_set_style_pad_all(outer, 0, 0);
     lv_obj_clear_flag(outer, LV_OBJ_FLAG_SCROLLABLE);
+    page_home = outer;
+    lv_obj_add_event_cb(page_home, page_gesture_cb, LV_EVENT_GESTURE, NULL);
 
     /* ---- Wake capsule ---- */
     lbl_subtitle = lv_label_create(outer);
@@ -1024,7 +1764,8 @@ void ui_health_dashboard_init(void)
     lv_obj_set_style_border_width(footer, 1, 0);
     lv_obj_set_style_pad_all(footer, 0, 0);
     lv_obj_clear_flag(footer, LV_OBJ_FLAG_SCROLLABLE);
-#if !(APP_DISPLAY_LVGL_FOOTER_DIAG_ENABLE)
+#if !(APP_DISPLAY_LVGL_FOOTER_DIAG_ENABLE || \
+      (APP_DISPLAY_LVGL_TOUCH_ENABLE && APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE))
     lv_obj_add_flag(footer, LV_OBJ_FLAG_HIDDEN);
 #endif
 
@@ -1069,6 +1810,19 @@ void ui_health_dashboard_init(void)
     lv_obj_align_to(lbl_ble, dot_radar, LV_ALIGN_OUT_RIGHT_MID, 14, 0);
     dot_ble = make_dot(footer, C_TEXT_DIM);
     lv_obj_align_to(dot_ble, lbl_ble, LV_ALIGN_OUT_RIGHT_MID, 6, 0);
+
+    add_gesture_bubble_to_children(page_home);
+    create_metric_detail_page(scr, &s_rr_detail,
+                              "呼吸 近30min", "2/4", C_CYAN);
+    page_rr_detail = s_rr_detail.root;
+    create_metric_detail_page(scr, &s_hr_detail,
+                              "心率 近30min", "3/4", C_ROSE);
+    page_hr_detail = s_hr_detail.root;
+    create_night_page(scr);
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE)
+    lv_port_indev_set_swipe_cb(touch_swipe_cb);
+#endif
+    show_page(UI_PAGE_HOME);
 }
 
 /* ------------------------------------------------------------------ */
@@ -1121,11 +1875,16 @@ void ui_health_dashboard_update(void)
     }
 
     char buf[48];
+    uint32_t cough_30min;
+    bool cough_event_active;
 
     /* ---- Wake capsule: RAM-only demo count from radar distance/presence ---- */
     uint32_t wake_now_ms = (snap.timestamp_ms > 0U) ?
                            snap.timestamp_ms :
                            (s_update_count * 1000U);
+    cough_note_session_start(wake_now_ms);
+    metric_history_update(&s_rr_history, snap.rr_bpm_x10, wake_now_ms);
+    metric_history_update(&s_hr_history, snap.hr_bpm_x10, wake_now_ms);
     update_wake_state(&snap, wake_now_ms);
     set_wake_capsule();
 
@@ -1158,15 +1917,17 @@ void ui_health_dashboard_update(void)
     }
 
     /* ---- 咳嗽 ---- */
-    update_cough_labels(snap.cough_count_5min,
+    cough_event_active = update_cough_event_latch(
+        snap.last_cough_event_id,
+        snap.cough_event_count_total,
+        ((DISPLAY_CM55_ALERT_COUGH_BURST == snap.alert_code) &&
+         (0u != (snap.flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
+         (0u != snap.last_cough_event_id)),
+        wake_now_ms);
+    cough_30min = cough_recent_count(wake_now_ms);
+    update_cough_labels(cough_30min,
                         snap.cough_event_count_total,
-                        update_cough_event_latch(
-                            snap.last_cough_event_id,
-                            snap.cough_event_count_total,
-                            ((DISPLAY_CM55_ALERT_COUGH_BURST == snap.alert_code) &&
-                             (0u != (snap.flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
-                             (0u != snap.last_cough_event_id)),
-                            wake_now_ms));
+                        cough_event_active);
 
     /* ---- 雷达 (integer display) ---- */
     if (snap.distance_cm > 0U) {
@@ -1196,4 +1957,11 @@ void ui_health_dashboard_update(void)
     lv_led_set_color(dot_mic, (snap.flags & 0x01U) ? C_GREEN : C_TEXT_DIM);
     lv_led_set_color(dot_radar, (snap.flags & 0x02U) ? C_GREEN : C_TEXT_DIM);
     lv_led_set_color(dot_ble, snap.ble_connected ? C_GREEN : C_TEXT_DIM);
+
+    update_metric_detail(&s_rr_detail, &s_rr_history, snap.rr_bpm_x10);
+    update_metric_detail(&s_hr_detail, &s_hr_history, snap.hr_bpm_x10);
+    update_night_page(snap.cough_event_count_total, cough_30min);
+#if (APP_DISPLAY_LVGL_TOUCH_ENABLE && APP_DISPLAY_LVGL_TOUCH_DIAG_ENABLE)
+    set_touch_diag();
+#endif
 }
