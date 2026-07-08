@@ -60,6 +60,15 @@ extern "C" {
 #define DISPLAY_CM55_HEALTH_SENSOR_LOST   (4u)
 #define DISPLAY_CM55_HEALTH_ERROR         (5u)
 
+/* Alert codes — must match e84_display_alert_t values. */
+#define DISPLAY_CM55_ALERT_NONE               (0u)
+#define DISPLAY_CM55_ALERT_COUGH_BURST        (1u)
+#define DISPLAY_CM55_ALERT_RESP_RATE_ABNORMAL (2u)
+#define DISPLAY_CM55_ALERT_HEART_RATE_ABNORMAL (3u)
+#define DISPLAY_CM55_ALERT_BREATHING_GAP      (4u)
+#define DISPLAY_CM55_ALERT_SENSOR_LOST        (5u)
+#define DISPLAY_CM55_ALERT_SYSTEM_ERROR       (6u)
+
 /* Radar source states — must match e84_display_radar_source_state_t values. */
 #define DISPLAY_CM55_RADAR_NORMAL         (0u)
 #define DISPLAY_CM55_RADAR_UNAVAILABLE    (1u)
@@ -132,8 +141,11 @@ typedef struct
     volatile uint32_t wall_epoch_s;       /* Unix epoch seconds, 0=N/A */
     volatile uint32_t wall_time_flags;    /* DISPLAY_CM55_TIME_FLAG_* */
 
+    /* Last APP_MONITOR_EVENT_CONFIRMED_COUGH event id mirrored to BLE. */
+    volatile uint32_t last_cough_event_id;
+
     /* Reserved for future use. */
-    volatile uint32_t reserved[5];
+    volatile uint32_t reserved[4];
 } app_display_cm55_snapshot_t;
 
 #define APP_DISPLAY_CM55_SNAPSHOT \

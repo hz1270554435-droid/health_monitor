@@ -5,7 +5,6 @@
 *******************************************************************************/
 
 #include "app_cm55_display_bringup.h"
-#include "app_cm55_display_rotation.h"
 
 #include "app_build_config.h"
 #include "app_display_diag.h"
@@ -32,6 +31,14 @@
 #include <string.h>
 
 #pragma GCC optimize ("no-tree-vectorize")
+
+#ifndef APP_DISPLAY_LVGL_DATA_UPDATE_TICKS
+#define APP_DISPLAY_LVGL_DATA_UPDATE_TICKS (30U)
+#endif
+
+#if (APP_DISPLAY_LVGL_DATA_UPDATE_TICKS < 1)
+#error "APP_DISPLAY_LVGL_DATA_UPDATE_TICKS must be >= 1"
+#endif
 
 #ifndef APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE
 #define APP_DISPLAY_PANEL_I2C_SUBDIAG_ENABLE (0u)
@@ -1075,10 +1082,25 @@ static void draw_live_frame(uint16_t *fb)
 
 #endif /* APP_DISPLAY_CM55_SNAPSHOT_BRIDGE_ENABLE */
 
+static void flip_framebuffer_180(uint16_t *fb)
+{
+    uint32_t total = CM55_DISP_HOR_RES * CM55_DISP_VER_RES;
+    uint32_t i = 0U;
+    uint32_t j = total - 1U;
+
+    while (i < j)
+    {
+        uint16_t tmp = fb[i];
+        fb[i] = fb[j];
+        fb[j] = tmp;
+        ++i;
+        --j;
+    }
+}
+
 static uint32_t set_framebuffer(uint16_t *fb)
 {
-    app_cm55_display_rotate_180_rgb565_inplace(fb,
-                                                CM55_DISP_HOR_RES * CM55_DISP_VER_RES);
+    flip_framebuffer_180(fb);
     Cy_GFXSS_Set_FrameBuffer(GFXSS, (uint32_t *)fb, &gfx_context);
     if (0U == ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(1000U)))
     {
@@ -1624,9 +1646,9 @@ static void cm55_gfx_task(void *arg)
     for (;;)
     {
 #if (APP_DISPLAY_LVGL_ENABLE)
-        /* LVGL mode: ~30 FPS timer handler + ~1 Hz data update */
+        /* LVGL mode: ~30 FPS timer handler + configurable data update. */
         lv_timer_handler();
-        if ((tick_count % 30U) == 0U)
+        if ((tick_count % APP_DISPLAY_LVGL_DATA_UPDATE_TICKS) == 0U)
         {
             ui_health_dashboard_update();
         }

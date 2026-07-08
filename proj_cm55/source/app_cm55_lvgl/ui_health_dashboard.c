@@ -35,6 +35,10 @@
 #define APP_DISPLAY_LVGL_TIMEZONE_OFFSET_S (8 * 60 * 60)
 #endif
 
+#ifndef APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS
+#define APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS (3000U)
+#endif
+
 #if (APP_DISPLAY_CM55_UART_LOG_ENABLE)
 #define LVGL_DASH_LOG(...)       \
     do                           \
@@ -152,8 +156,11 @@ static lv_obj_t *lbl_diag;
 static lv_obj_t *dot_mic, *dot_radar, *dot_ble;
 
 /* Display-local state only: demo wake count is RAM-only and resets on reboot. */
-static bool s_logged_total_valid;
-static uint32_t s_last_logged_total;
+static bool s_cough_event_total_valid;
+static uint32_t s_last_cough_event_total;
+static bool s_cough_event_id_valid;
+static uint32_t s_last_cough_event_id;
+static uint32_t s_cough_event_hold_until_ms;
 
 #define WAKE_FAR_DELTA_CM          (50U)
 #define WAKE_WINDOW_MS             (30U * 1000U)
@@ -422,12 +429,62 @@ static void update_clock_label(uint32_t epoch_s, uint32_t time_flags)
     }
 }
 
+static bool ui_deadline_active(uint32_t deadline_ms, uint32_t now_ms)
+{
+    return ((int32_t)(deadline_ms - now_ms) > 0);
+}
+
+static bool update_cough_event_latch(uint32_t last_cough_event_id,
+                                     uint32_t cough_event_count_total,
+                                     bool snapshot_cough_event_active,
+                                     uint32_t now_ms)
+{
+    bool new_event = false;
+
+    if (0u != last_cough_event_id)
+    {
+        if (!s_cough_event_id_valid)
+        {
+            s_last_cough_event_id = last_cough_event_id;
+            s_cough_event_id_valid = true;
+            new_event = snapshot_cough_event_active;
+        }
+        else if (last_cough_event_id != s_last_cough_event_id)
+        {
+            s_last_cough_event_id = last_cough_event_id;
+            new_event = true;
+        }
+    }
+    else if (!s_cough_event_total_valid)
+    {
+        s_last_cough_event_total = cough_event_count_total;
+        s_cough_event_total_valid = true;
+    }
+    else if (cough_event_count_total > s_last_cough_event_total)
+    {
+        s_last_cough_event_total = cough_event_count_total;
+        new_event = true;
+    }
+    else if (cough_event_count_total < s_last_cough_event_total)
+    {
+        s_last_cough_event_total = cough_event_count_total;
+    }
+
+    if (new_event)
+    {
+        s_cough_event_hold_until_ms =
+            now_ms + (uint32_t)APP_DISPLAY_LVGL_COUGH_EVENT_HOLD_MS;
+    }
+
+    return snapshot_cough_event_active ||
+           ui_deadline_active(s_cough_event_hold_until_ms, now_ms);
+}
+
 static void update_cough_labels(uint16_t cough_5min,
-                                uint32_t cough_event_count_total)
+                                uint32_t cough_event_count_total,
+                                bool cough_event_active)
 {
     char buf[48];
-    s_last_logged_total = cough_event_count_total;
-    s_logged_total_valid = true;
 
     snprintf(buf, sizeof(buf), "整夜: %lu 次",
              (unsigned long)cough_event_count_total);
@@ -436,7 +493,7 @@ static void update_cough_labels(uint16_t cough_5min,
              (unsigned int)cough_5min);
     lv_label_set_text(lbl_cough_half, buf);
 
-    if (cough_5min > 0U)
+    if (cough_event_active)
     {
         set_badge_pill(lbl_cough_badge, "检测到咳嗽", C_AMBER_DIM, C_AMBER);
     }
@@ -483,6 +540,7 @@ static void copy_snapshot_ui_fields(app_display_cm55_snapshot_t *out,
     out->cough_count_1min = snap->cough_count_1min;
     out->cough_count_5min = snap->cough_count_5min;
     out->cough_event_count_total = snap->cough_event_count_total;
+    out->last_cough_event_id = snap->last_cough_event_id;
     out->fusion_confidence = snap->fusion_confidence;
     out->ble_connected = snap->ble_connected;
     out->wall_epoch_s = snap->wall_epoch_s;
@@ -674,6 +732,8 @@ static void run_minimal_realtime(uint32_t tick)
     uint32_t cough_1min = snap->cough_count_1min;
     uint32_t cough_5min = snap->cough_count_5min;
     uint32_t cough_event_total = snap->cough_event_count_total;
+    uint32_t last_cough_event_id = snap->last_cough_event_id;
+    uint32_t alert_code = snap->alert_code;
     uint32_t flags = snap->flags;
     uint32_t ble_connected = snap->ble_connected;
     uint32_t wall_epoch_s = snap->wall_epoch_s;
@@ -726,7 +786,15 @@ static void run_minimal_realtime(uint32_t tick)
     (void)cough_prob;
     (void)timestamp_ms;
     (void)tick;
-    update_cough_labels((uint16_t)cough_5min, cough_event_total);
+    update_cough_labels((uint16_t)cough_5min,
+                        cough_event_total,
+                        update_cough_event_latch(
+                            last_cough_event_id,
+                            cough_event_total,
+                            ((DISPLAY_CM55_ALERT_COUGH_BURST == alert_code) &&
+                             (0u != (flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
+                             (0u != last_cough_event_id)),
+                            timestamp_ms));
 
     if (dist > 0U)
     {
@@ -1091,7 +1159,14 @@ void ui_health_dashboard_update(void)
 
     /* ---- 咳嗽 ---- */
     update_cough_labels(snap.cough_count_5min,
-                        snap.cough_event_count_total);
+                        snap.cough_event_count_total,
+                        update_cough_event_latch(
+                            snap.last_cough_event_id,
+                            snap.cough_event_count_total,
+                            ((DISPLAY_CM55_ALERT_COUGH_BURST == snap.alert_code) &&
+                             (0u != (snap.flags & DISPLAY_CM55_FLAG_ALERT_LATCHED)) &&
+                             (0u != snap.last_cough_event_id)),
+                            wake_now_ms));
 
     /* ---- 雷达 (integer display) ---- */
     if (snap.distance_cm > 0U) {
